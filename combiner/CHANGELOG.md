@@ -42,6 +42,10 @@ tagged `vX.Y.Z`.
 - With `oauth.public_url` set, the `-32042` URL elicitation hands clients the
   combiner's short link, so the user lands on that page first; without it, the
   provider URL as before.
+- `open_widget`: its description now leads with the one argument it needs and
+  an example (`{"uri": "ui://svg-mcp/widget"}`), and a call without `uri`
+  answers with the widgets actually available and an example call, instead
+  of a validation error. Models were calling it with no arguments.
 - A URL-elicitation error raised inside a tool now reaches the client as
   `-32042` (fastmcp masks MCP errors raised by tools into tool errors).
 

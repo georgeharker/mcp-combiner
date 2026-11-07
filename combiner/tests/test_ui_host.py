@@ -30,11 +30,13 @@ import pytest
 from conftest import (
     CombinerHandle,
     ProcFactory,
+    http_mock_entry,
     stdio_mock_entry,
     write_servers_config,
     write_tools_spec,
 )
 from fastmcp import Client
+from fastmcp.exceptions import ToolError
 
 from mcp_combiner.runtime import CLIENT_CONNECT_MODE
 
@@ -492,3 +494,24 @@ class TestStage2Hold:
             s = await probe.call_tool("combiner__ui_sessions", {"chat_id": token})
             doc = json.loads(_result_text(s))
             assert doc["sessions"][0]["completed"] == "timeout"
+
+
+@pytest.mark.e2e
+async def test_open_widget_without_a_uri_lists_the_widgets(
+    procs: ProcFactory, tmp_path: Path
+) -> None:
+    """A model that calls open_widget with no arguments learns what to pass
+    instead of getting a bare validation error."""
+    mock = await procs.start_http_mock("mockup")
+    config = write_servers_config(tmp_path / "servers.json", {"mockup": http_mock_entry(mock.port)})
+    combiner = await procs.start_combiner(config)
+    await combiner.wait_server_state("mockup", ("ready",))
+    async with Client(f"{combiner.mcp_url}/ow-noargs-01", mode=CLIENT_CONNECT_MODE) as client:
+        tool = next(t for t in await client.list_tools() if t.name == "open_widget")
+        assert '{"uri": "ui://' in (tool.description or "").split("\n\n")[0]
+        assert tool.input_schema.get("required", []) == []
+        with pytest.raises(ToolError) as caught:
+            await client.call_tool("open_widget", {})
+    message = str(caught.value)
+    assert 'e.g. {"uri": "ui://' in message
+    assert "ui://mockup/mock/widget" in message

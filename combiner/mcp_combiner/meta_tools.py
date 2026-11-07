@@ -86,15 +86,19 @@ def register_meta_tools(
     @combiner.tool()
     async def open_widget(
         ctx: Context,
-        uri: str,
+        uri: str | None = None,
         hold: bool = True,
         hold_timeout_s: float | None = None,
     ) -> ToolResult:
-        """Open an interactive widget (an mcp-app ``ui://`` resource) hosted by the
-        combiner's UI host. Reads the widget markup, opens it in the browser for
-        the user, and -- with the default ``hold=True`` -- keeps THIS call in
-        flight while the user interacts, folding their recorded widget actions
-        into this result (combiner__ui_messages retrieves the detail).
+        """Open an interactive widget by its ``ui://`` URI — call with
+        ``{"uri": "ui://svg-mcp/widget"}``; ``uri`` is the one argument you need.
+        Called without it, this lists the widgets available.
+
+        Opens the widget (an mcp-app ``ui://`` resource, hosted by the combiner's
+        UI host) in the browser for the user, and -- with the default
+        ``hold=True`` -- keeps THIS call in flight while the user interacts,
+        folding their recorded widget actions into this result
+        (combiner__ui_messages retrieves the detail).
 
         Args:
             uri: the widget resource URI, either the namespaced form from
@@ -111,6 +115,20 @@ def register_meta_tools(
 
         from mcp_combiner import nvim_proxy
         from mcp_combiner.ui_host.holder import hold_for_widget
+
+        if not uri:
+            widgets = sorted(
+                str(r.uri) for r in await ctx.list_resources() if str(r.uri).startswith("ui://")
+            )
+            if not widgets:
+                raise ToolError(
+                    "open_widget needs a widget URI (uri), and no ui:// widgets are "
+                    "available right now."
+                )
+            raise ToolError(
+                "open_widget needs a widget URI, e.g. "
+                f'{{"uri": "{widgets[0]}"}}. Available: {", ".join(widgets)}'
+            )
 
         def _url_for(namespaced: str) -> str:
             host = RUNTIME.ui_host
