@@ -268,6 +268,9 @@ def drop_server_providers(combiner: FastMCP, server_name: str) -> int:
     Returns the number actually removed from ``combiner.providers``.
     """
     recorded = _registry(combiner).pop(server_name, [])
+    from mcp_combiner.notifications import forget_resource_set
+
+    forget_resource_set(server_name)
     unrecorded = [
         p
         for p in combiner.providers

@@ -79,6 +79,8 @@ from mcp.server.subscriptions import (
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 from pydantic import PrivateAttr
 
+from mcp_combiner.runtime import downstream_connection
+
 if TYPE_CHECKING:
     from starlette.requests import Request
     from starlette.responses import JSONResponse, RedirectResponse
@@ -204,6 +206,8 @@ class MockState:
     # broadcast notifications/tools/list_changed (same pattern as the
     # combiner's _active_sessions WeakSet).
     sessions: weakref.WeakSet[Any] = field(default_factory=weakref.WeakSet)
+    #: each handshake client's Connection (notifications between requests).
+    connections: weakref.WeakSet[Any] = field(default_factory=weakref.WeakSet)
     # 2026 era: change events go out on subscriptions/listen streams; the
     # resource URIs each open stream watches, for tests to observe.
     listen_bus: InMemorySubscriptionBus = field(default_factory=InMemorySubscriptionBus)
@@ -236,9 +240,9 @@ class MockState:
 
     async def notify_resource_updated(self, uri: str) -> None:
         """Push resources/updated for *uri* in both eras."""
-        for session in list(self.sessions):
+        for connection in list(self.connections):
             with contextlib.suppress(Exception):
-                await session.send_resource_updated(uri)
+                await connection.send_resource_updated(uri)
         await self.listen_bus.publish(ResourceUpdated(uri=uri))
 
     def snapshot(self) -> dict[str, Any]:
@@ -284,7 +288,13 @@ class _SessionTrackingMiddleware(Middleware):
     ) -> Any:
         if context.fastmcp_context is not None:
             with contextlib.suppress(RuntimeError, AttributeError):
-                self._state.sessions.add(context.fastmcp_context.session)
+                session = context.fastmcp_context.session
+                self._state.sessions.add(session)
+                # The per-client Connection outlives this request's ServerSession
+                # (mcp 2): notifications sent between requests must go through it.
+                connection = downstream_connection(session)
+                if connection is not None:
+                    self._state.connections.add(connection)
         return await call_next(context)
 
 

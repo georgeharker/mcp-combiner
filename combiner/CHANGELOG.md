@@ -46,6 +46,16 @@ tagged `vX.Y.Z`.
   an example (`{"uri": "ui://svg-mcp/widget"}`), and a call without `uri`
   answers with the widgets actually available and an example call, instead
   of a validation error. Models were calling it with no arguments.
+- **Resource changes from server lifecycle** publish
+  `notifications/resources/list_changed` (handshake clients and 2026 listen
+  streams). A server's resources appear and vanish as it comes up, is enabled,
+  restarted, reconnected or authorized, or is disabled or removed, and no
+  upstream says so; each tools prime now also records the server's resource
+  and template URIs and notifies only when that set changed (as the tools
+  slice does), and an unmount notifies if the server had any. Upstream-sent
+  `resources/list_changed` / `resources/updated` were already forwarded.
+- Mock server: notifications sent between requests go through each client's
+  `Connection` (the per-request `ServerSession` can't reach them in mcp 2).
 - A URL-elicitation error raised inside a tool now reaches the client as
   `-32042` (fastmcp masks MCP errors raised by tools into tool errors).
 

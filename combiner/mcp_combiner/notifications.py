@@ -56,6 +56,7 @@ emits.  Only the long-lived-session paths deliver reliably:
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import weakref
@@ -419,3 +420,62 @@ def forwarding_factory(factory: Any, server_name: str, *, per_chat: bool) -> Any
         )
 
     return wrapped
+
+
+# ── resource-set changes from server lifecycle ─────────────────────
+#
+# An upstream that emits notifications/resources/list_changed is forwarded by
+# _ResourceNotifyHandler. But a server's resources also appear and vanish with
+# its lifecycle — it comes up, is enabled or authorized, is disabled or
+# removed — and nothing upstream says so. Each prime (the same started->ready
+# path tools take) records the server's resource set; a change publishes
+# resources/list_changed, deduplicated like the tools slice.
+
+_resource_sets: dict[str, frozenset[str]] = {}
+
+
+async def record_resource_set(name: str, providers: list[Any]) -> None:
+    """Record *name*'s resource and template URIs (as clients see them, via
+    its mounted *providers*); publish ``resources/list_changed`` if they changed."""
+    uris: set[str] = set()
+    try:
+        for provider in providers:
+            uris.update(str(r.uri) for r in await provider.list_resources())
+            uris.update(str(t.uri_template) for t in await provider.list_resource_templates())
+    except Exception:
+        logger.debug("Listing resources of '%s' failed; set unchanged", name, exc_info=True)
+        return
+    current = frozenset(uris)
+    if _resource_sets.get(name, frozenset()) == current:
+        _resource_sets[name] = current
+        return
+    _resource_sets[name] = current
+    logger.info("Resources of '%s' changed (%d now) — notifying", name, len(current))
+    await notify_resource_list_changed()
+
+
+def forget_resource_set(name: str) -> None:
+    """*name* was unmounted: its resources are gone from every listing."""
+    if _resource_sets.pop(name, frozenset()):
+        logger.info("Resources of '%s' removed — notifying", name)
+        try:
+            task = asyncio.get_running_loop().create_task(notify_resource_list_changed())
+        except RuntimeError:
+            return  # no loop (tests, shutdown)
+        RUNTIME.notification_tasks.add(task)
+        task.add_done_callback(RUNTIME.notification_tasks.discard)
+
+
+async def notify_resource_list_changed() -> None:
+    """``notifications/resources/list_changed`` to every client: listen
+    streams (2026) and handshake-era connections."""
+    await HUB.publish(ResourcesListChanged())
+    for connection in RUNTIME.sessions.connections():
+        try:
+            await connection.send_resource_list_changed()
+        except Exception:
+            logger.debug("Failed to notify a session of a resource change", exc_info=True)
+
+
+def reset_resource_sets() -> None:
+    _resource_sets.clear()

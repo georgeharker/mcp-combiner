@@ -459,6 +459,7 @@ async def prime_server_tools(
                     name,
                     timeout,
                 )
+                await _record_resources(name, providers)
                 return PrimeOutcome.EMPTY
             await asyncio.sleep(interval)
             continue
@@ -477,7 +478,15 @@ async def prime_server_tools(
                 name,
                 len(filtered),
             )
+        await _record_resources(name, providers)
         return PrimeOutcome.READY
+
+
+async def _record_resources(name: str, providers: list[Any]) -> None:
+    """The prime's resource-set step (notifications.record_resource_set)."""
+    from mcp_combiner.notifications import record_resource_set
+
+    await record_resource_set(name, providers)
 
 
 def spawn_prime(combiner: FastMCP, name: str) -> asyncio.Task[PrimeOutcome]:
