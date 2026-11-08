@@ -726,6 +726,23 @@ async def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_hash_password(args: argparse.Namespace) -> int:
+    """Prompt twice, print the scrypt hash for web_auth.password_hash."""
+    import getpass
+
+    from mcp_combiner.webauth import hash_password
+
+    first = getpass.getpass("Web password: ")
+    if not first:
+        print("error: empty password", file=sys.stderr)
+        return 2
+    if getpass.getpass("Again: ") != first:
+        print("error: the passwords don't match", file=sys.stderr)
+        return 2
+    print(hash_password(first))
+    return 0
+
+
 async def cmd_health(args: argparse.Namespace) -> int:
     code, health = await _rest(args, "GET", "/health")
     _emit(args, health)
@@ -968,6 +985,12 @@ def add_ctl_parsers(subparsers: "argparse._SubParsersAction[argparse.ArgumentPar
     p = subparsers.add_parser("status", help="Show combiner + per-server status")
     _common(p)
     p.set_defaults(func=cmd_status)
+
+    p = subparsers.add_parser(
+        "hash-password",
+        help="Hash a web_auth password for servers.json (web_auth.password_hash)",
+    )
+    p.set_defaults(func=cmd_hash_password)
 
     p = subparsers.add_parser("health", help="Dump the raw /health payload")
     _common(p)

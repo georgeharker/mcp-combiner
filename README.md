@@ -965,6 +965,34 @@ loopback), `loopback`, or an explicit `http://host[:port]`.
 machine. Braces can't appear in a real host name, so a host that happens to be
 called `auto` is never mistaken for it.
 
+### Web login for widgets and resources (`web_auth`)
+
+The bearer token protects `/mcp` and the control routes, but browsers can't
+send it. When the combiner listens beyond this machine (a tailnet bind), its
+widget pages (`/ui/<token>/…`) and the widget relay (port + 1) — which can
+return resource contents — can require a password:
+
+```sh
+mcp-combiner hash-password          # prompts twice, prints a scrypt hash
+```
+
+```json
+"web_auth": {"mode": "password", "password_hash": "scrypt$…"}
+```
+
+| Who | Asked for the password |
+|---|---|
+| MCP clients | never (they use the bearer) |
+| a browser on this machine (any of its own addresses) | never |
+| a widget link the combiner handed an MCP client (it carries a short-lived ticket) | never — the first open sets the session |
+| any other browser | once per `session_days` (default 30) |
+
+The OAuth pages and `/health` stay open. Options: `session_days`, `tickets`
+(default true), `exempt_local` (default true). `MCP_COMBINER_WEB_PASSWORD_HASH`
+overrides the hash. The session is an HTTP-only cookie signed with a key kept
+beside the OAuth tokens (`web-auth.key`); delete it to sign everyone out.
+`/auth/logout` signs one browser out. Login attempts are rate-limited.
+
 ### Inbound authentication (locking down `/mcp`)
 
 The above is backend auth (combiner → upstream servers). Separately, the combiner's

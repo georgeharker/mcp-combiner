@@ -137,8 +137,12 @@ def register_meta_tools(
             token = nvim_proxy.token_for_session(ctx.session_id)
             if not token:
                 return ""
-            return f"{host.config.base_origin}/ui/{token}/?resource=" + urllib.parse.quote(
-                namespaced, safe=""
+            from mcp_combiner.webgate import ticket_query
+
+            return (
+                f"{host.config.base_origin}/ui/{token}/?resource="
+                + urllib.parse.quote(namespaced, safe="")
+                + ticket_query(token)
             )
 
         target = uri

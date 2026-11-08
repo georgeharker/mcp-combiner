@@ -912,6 +912,44 @@ class IsolationConfig(BaseModel):
         )
 
 
+WEB_PASSWORD_HASH_ENV = "MCP_COMBINER_WEB_PASSWORD_HASH"
+
+
+class WebAuthConfig(BaseModel):
+    """Browser login for the widget pages and relay (``"web_auth"``; see
+    mcp_combiner.webauth). Off by default."""
+
+    mode: Literal["off", "password"] = "off"
+    #: ``mcp-combiner hash-password`` output; ``$MCP_COMBINER_WEB_PASSWORD_HASH`` wins.
+    password_hash: str | None = None
+    session_days: float = 30.0
+    #: widget URLs handed to bearer-authenticated MCP clients carry a login ticket.
+    tickets: bool = True
+    #: requests from this machine's own addresses skip the login.
+    exempt_local: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> WebAuthConfig:
+        mode = data.get("mode", "off")
+        if mode not in ("off", "password"):
+            raise ValueError(f"web_auth.mode must be 'off' or 'password'; got {mode!r}")
+        password_hash = os.environ.get(WEB_PASSWORD_HASH_ENV) or data.get("password_hash")
+        if mode == "password" and not (
+            isinstance(password_hash, str) and password_hash.startswith("scrypt$")
+        ):
+            raise ValueError(
+                "web_auth.mode 'password' needs web_auth.password_hash "
+                f"(or {WEB_PASSWORD_HASH_ENV}) — run `mcp-combiner hash-password`"
+            )
+        return cls(
+            mode=mode,
+            password_hash=password_hash,
+            session_days=float(data.get("session_days", 30.0)),
+            tickets=bool(data.get("tickets", True)),
+            exempt_local=bool(data.get("exempt_local", True)),
+        )
+
+
 class BindConfig(BaseModel):
     """The process bind (``"bind": {"host": ...}`` in servers.json).
 
@@ -977,6 +1015,7 @@ class CombinerConfig(BaseModel):
     isolation: IsolationConfig = Field(default_factory=IsolationConfig)
     validation: ValidationConfig = Field(default_factory=ValidationConfig)
     bind: BindConfig = Field(default_factory=BindConfig)
+    web_auth: WebAuthConfig = Field(default_factory=WebAuthConfig)
     permissions: PermissionPolicy | None = None
     """Global tool-call permission policy applied to every server, unless a
     server overrides it.  ``None`` (default) means **off** — no gate, identical
@@ -1073,12 +1112,15 @@ class CombinerConfig(BaseModel):
         permissions = PermissionPolicy.from_dict(raw.get("permissions"))
 
         bind = BindConfig(**raw["bind"]) if isinstance(raw.get("bind"), dict) else BindConfig()
+        raw_web_auth = raw.get("web_auth")
+        web_auth = WebAuthConfig.from_dict(raw_web_auth if isinstance(raw_web_auth, dict) else {})
 
         return cls(
             servers=servers,
             shared_servers=shared_servers,
             external_servers=external_servers,
             bind=bind,
+            web_auth=web_auth,
             oauth=oauth,
             isolation=isolation,
             validation=validation,

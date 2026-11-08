@@ -58,4 +58,10 @@ def get_relay_app(options: object) -> Starlette:
     if host is None:
         raise RuntimeError("UI host not attached — create_app never ran?")
     relay: Starlette = host.build_relay_app()
+    if RUNTIME.web_signer is not None:
+        from mcp_combiner.webgate import WebAuthGate
+
+        # Another origin: no login page here; the cookie (per host, not port)
+        # comes from logging in on the main port.
+        relay.add_middleware(WebAuthGate, is_gated=lambda _path: True)
     return relay

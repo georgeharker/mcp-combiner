@@ -80,6 +80,11 @@ code {
   text-decoration: none; font-weight: 650; font-size: 17px;
 }
 .button[aria-disabled="true"] { opacity: .45; pointer-events: none; }
+button.button { border: 0; cursor: pointer; font: inherit; font-weight: 650; }
+.field {
+  display: block; width: 100%; margin-top: 18px; padding: 13px 14px; border-radius: 12px;
+  border: 1px solid var(--line); background: var(--bg); color: var(--text); font: inherit;
+}
 .meta { font-size: 14px; color: var(--muted); text-align: center; margin: 0; }
 .warning { color: var(--warn); margin: 12px 0 0; }
 .account {
@@ -112,7 +117,7 @@ def _page(title: str, body: str, status: int = 200, script: str = "") -> HTMLRes
         "X-Frame-Options": "DENY",
         "Content-Security-Policy": (
             "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
-            "img-src data:; frame-ancestors 'none'"
+            "img-src data:; form-action 'self'; frame-ancestors 'none'"
         ),
     }
     return HTMLResponse(document, status_code=status, headers=headers)
@@ -218,3 +223,24 @@ def failed_page(server: str, reason: str, status: int) -> HTMLResponse:
 def _duration(seconds: int) -> str:
     minutes, rest = divmod(seconds, 60)
     return f"{minutes} min {rest:02d} s" if minutes else f"{rest} s"
+
+
+def login_page(next_path: str, error: str | None = None, status: int = 200) -> HTMLResponse:
+    """web_auth's login (mcp_combiner.webgate): one password field."""
+    problem = (
+        f'<div class="status warn"><span class="dot"></span>{html.escape(error)}</div>'
+        if error
+        else ""
+    )
+    body = (
+        f"{problem}<h1>Sign in</h1>"
+        "<p>Enter the combiner's web password to open widgets and resources from this "
+        "browser. You'll stay signed in here for a while.</p>"
+        '<form method="post" action="/auth/login">'
+        f'<input type="hidden" name="next" value="{html.escape(next_path, quote=True)}">'
+        '<input class="field" type="password" name="password" autocomplete="current-password" '
+        'placeholder="Password" required autofocus aria-label="Password">'
+        '<button class="button" type="submit">Sign in</button>'
+        "</form>"
+    )
+    return _page("Sign in", body, status=status)

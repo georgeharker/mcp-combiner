@@ -17,6 +17,13 @@ tagged `vX.Y.Z`.
 
 ### Added
 
+- **Web login for widget pages and the relay (`web_auth`)**: optional password
+  login (`mode: password`, scrypt hash from `mcp-combiner hash-password`) for
+  `/ui/*` and the widget relay. A 30-day signed, HTTP-only session cookie
+  (`session_days`); widget URLs handed to bearer-authenticated MCP clients
+  carry a short-lived ticket that logs the browser in without a prompt;
+  requests from this machine's own addresses are exempt; rate-limited login
+  page in the authorization-page style; OAuth pages and `/health` stay open.
 - **`combiner__authorize_server(server_name)`** — an always-mounted meta tool
   that starts OAuth authorization for any configured OAuth upstream (never
   authorized, revoked, link expired) and fails with the authorization link:

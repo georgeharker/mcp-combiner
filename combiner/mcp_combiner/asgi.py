@@ -430,6 +430,14 @@ def create_app(options: ServeOptions | None = None) -> Starlette:
     from mcp_combiner.era import pin_handshake_era
 
     pin_handshake_era(combiner)
+    combiner_config = RUNTIME.config
+    if combiner_config is not None and combiner_config.web_auth.mode == "password":
+        from mcp_combiner.webauth import Signer
+        from mcp_combiner.webgate import register_login_routes
+
+        key_path = combiner_config.oauth.token_dir_path.parent / "web-auth.key"
+        RUNTIME.web_signer = Signer.load_or_create(key_path)
+        register_login_routes(combiner)
     app = combiner.http_app(
         path="/mcp",
         stateless_http=False,
@@ -446,7 +454,12 @@ def create_app(options: ServeOptions | None = None) -> Starlette:
         app.add_middleware(
             BearerAuthMiddleware, token=options.auth_token, is_protected=combiner_protected_path
         )
-        logger.info("auth: inbound bearer required on /mcp, /sessions, /handover")
+        logger.info("auth: inbound bearer required on /mcp, /sessions, /neovim, /handover")
+    if RUNTIME.web_signer is not None:
+        from mcp_combiner.webgate import WebAuthGate, ui_path
+
+        app.add_middleware(WebAuthGate, is_gated=ui_path, login_origin="")
+        logger.info("web_auth: password login required for widget pages from other machines")
     # The UI host's loopback clients read this to present the same bearer on
     # their /mcp/<token> calls (the middleware does not exempt loopback).
 

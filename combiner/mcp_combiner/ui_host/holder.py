@@ -108,7 +108,11 @@ async def hold_for_widget(
     session.publish("tool-input", {"name": tool_name, "arguments": {}})
     session.publish("tool-result", _tool_result_payload(result))
 
-    url = f"{host.config.base_origin}/ui/{token}/?resource={quote(uri, safe='')}"
+    from mcp_combiner.webgate import ticket_query
+
+    url = f"{host.config.base_origin}/ui/{token}/?resource={quote(uri, safe='')}" + ticket_query(
+        token
+    )
     ctx = getattr(context, "fastmcp_context", None)
     if ctx is not None:
         try:

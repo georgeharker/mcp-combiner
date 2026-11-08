@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from mcp_combiner.config import CombinerConfig
     from mcp_combiner.connections import ConnectionManager
     from mcp_combiner.ui_host import UiHost
+    from mcp_combiner.webauth import Signer
 
 
 #: Protocol era every client the combiner opens speaks (fastmcp 4 ``Client(mode=)``):
@@ -392,6 +393,9 @@ class CombinerRuntime:
     # The port the combiner serves on, set by create_app before the config is
     # loaded (oauth.public_url "auto" without a port defaults to it).
     serve_port: int | None = None
+    # web_auth (mcp_combiner.webauth): signs session cookies and widget-URL
+    # tickets; None when web_auth is off.
+    web_signer: Signer | None = None
     conn_manager: ConnectionManager | None = None
     proc_manager: BackingProcessManager | None = None
 
