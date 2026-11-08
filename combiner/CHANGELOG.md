@@ -6,6 +6,15 @@ tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+### Security
+
+- With an inbound bearer token set, `/neovim/*` (Neovim instance
+  registration and chat-token binding) now requires it, like `/sessions*` and
+  `/handover*`. It was reachable without the token, so anyone who could reach
+  the combiner's address (e.g. its tailnet bind) could re-route a chat's
+  `neovim_*` tools. The Neovim plugin already sends the bearer on these calls.
+  `/health` stays open.
+
 ### Added
 
 - **`combiner__authorize_server(server_name)`** — an always-mounted meta tool

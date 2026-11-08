@@ -39,6 +39,8 @@ def _app(
             Route("/sessions/map", ok, methods=["GET"]),
             Route("/sessions/token/{tok}/filter", ok, methods=["GET", "POST", "DELETE"]),
             Route("/handover/prepare", ok, methods=["POST"]),
+            Route("/neovim/bind", ok, methods=["POST"]),
+            Route("/neovim/instances", ok, methods=["POST"]),
         ]
     )
     if token:
@@ -94,9 +96,14 @@ def test_control_routes_are_gated() -> None:
     assert client.get("/sessions/map").status_code == 401
     assert client.post("/sessions/token/abc/filter").status_code == 401
     assert client.post("/handover/prepare").status_code == 401
+    # Neovim instance registration / token binding re-route a chat's neovim_*
+    # tools: control routes like the rest.
+    assert client.post("/neovim/bind").status_code == 401
+    assert client.post("/neovim/instances").status_code == 401
     auth = {"Authorization": f"Bearer {TOKEN}"}
     assert client.get("/sessions/map", headers=auth).status_code == 200
     assert client.post("/handover/prepare", headers=auth).status_code == 200
+    assert client.post("/neovim/bind", headers=auth).status_code == 200
 
 
 def test_health_stays_open() -> None:
@@ -124,6 +131,8 @@ def test_no_token_leaves_endpoint_open() -> None:
         ("/sessions/token/abc/filter", True),
         ("/handover", True),
         ("/handover/prepare", True),
+        ("/neovim/bind", True),
+        ("/neovim/instances", True),
         ("/health", False),
         ("/", False),
         ("/other", False),

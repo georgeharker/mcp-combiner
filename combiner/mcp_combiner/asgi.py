@@ -135,10 +135,11 @@ def combiner_protected_path(path: str) -> bool:
     """The combiner's protected surface for :class:`BearerAuthMiddleware`.
 
     Gates the ``/mcp`` tool endpoint AND the control routes that mutate session
-    state or arm a handover (``/sessions*``, ``/handover*``) — those manipulate
-    the running server and must not be reachable unauthenticated once a token is
-    set. ``/health`` stays OPEN: it carries no state and liveness probes / ops /
-    the Neovim host poll it without a bearer.
+    state, bind Neovim instances or arm a handover (``/sessions*``,
+    ``/neovim*``, ``/handover*``) — those manipulate the running server and must
+    not be reachable unauthenticated once a token is set. ``/health`` stays
+    OPEN: it carries no state and liveness probes / ops / the Neovim host poll
+    it without a bearer.
 
     Widening here has a corollary: the combiner's OWN control callers must now
     present the token — the ``mcp-combiner`` ctl (``_auth_headers`` in ctl.py) and
@@ -151,6 +152,7 @@ def combiner_protected_path(path: str) -> bool:
         or path.startswith("/mcp/")
         or path == "/sessions"
         or path.startswith("/sessions/")
+        or path.startswith("/neovim/")
         or path.startswith("/handover")
     )
 
