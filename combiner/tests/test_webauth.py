@@ -110,6 +110,7 @@ class TestTicketLedger:
         ledger.redeem({"j": "old", "exp": time.time() - 1}, 1)
         ledger.redeem({"j": "new", "exp": time.time() + 60}, 1)
         assert list(ledger._uses) == ["new"]
+        assert not ledger.redeem({"j": "old", "exp": time.time() - 1}, 1)  # pruned, still refused
 
 
 class TestLimiter:

@@ -238,6 +238,10 @@ class TicketLedger:
         if not isinstance(jti, str) or not jti or not isinstance(exp, (int, float)):
             return False
         now = time.time()
+        if exp < now:
+            # Signer.verify already refuses these; checked here too so the
+            # ledger alone never re-admits a ticket whose entry was pruned.
+            return False
         for key in [k for k, (_, e) in self._uses.items() if e < now]:
             del self._uses[key]
         used, _ = self._uses.get(jti, (0, exp))
