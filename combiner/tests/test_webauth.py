@@ -74,11 +74,31 @@ class TestThisMachine:
             webauth.reset_local_addresses()
 
 
-def test_password_mode_needs_a_hash(tmp_path: Path) -> None:
+def _password_config(tmp_path: Path, **web_auth: object) -> Path:
     path = tmp_path / "servers.json"
-    path.write_text(json.dumps({"servers": {}, "web_auth": {"mode": "password"}}))
-    with pytest.raises(ValueError, match="hash-password"):
-        CombinerConfig.load(str(path))
+    path.write_text(json.dumps({"servers": {}, "web_auth": {"mode": "password", **web_auth}}))
+    return path
+
+
+def test_password_mode_needs_a_password(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MCP_COMBINER_WEB_PASSWORD", raising=False)
+    monkeypatch.delenv("MCP_COMBINER_WEB_PASSWORD_HASH", raising=False)
+    with pytest.raises(ValueError, match="MCP_COMBINER_WEB_PASSWORD"):
+        CombinerConfig.load(str(_password_config(tmp_path)))
+
+
+def test_a_raw_password_from_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("MCP_COMBINER_WEB_PASSWORD_HASH", raising=False)
+    monkeypatch.setenv("MCP_COMBINER_WEB_PASSWORD", PASSWORD)
+    stored = CombinerConfig.load(str(_password_config(tmp_path))).web_auth.password_hash
+    assert stored is not None and webauth.verify_password(PASSWORD, stored)
+    assert not webauth.verify_password("wrong", stored)
+    # A configured hash wins over the raw password.
+    other = webauth.hash_password("the artifact")
+    config = CombinerConfig.load(str(_password_config(tmp_path, password_hash=other)))
+    assert config.web_auth.password_hash == other
 
 
 # ── end to end ─────────────────────────────────────────────────────

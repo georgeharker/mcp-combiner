@@ -24,6 +24,9 @@ tagged `vX.Y.Z`.
   carry a short-lived ticket that logs the browser in without a prompt;
   requests from this machine's own addresses are exempt; rate-limited login
   page in the authorization-page style; the OAuth callback and `/health` stay open.
+  The password can instead come raw from `MCP_COMBINER_WEB_PASSWORD` (e.g. a
+  1Password `op run` reference), hashed in memory at startup; a configured hash
+  wins if both are set.
 - **OAuth authorization page says more, and is gated by `web_auth`**: the
   short link's page now shows why authorization is needed (first sign-in or an
   expired/revoked one), the provider host, the requested scopes, which client

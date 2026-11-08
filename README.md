@@ -995,7 +995,12 @@ proxy (`tailscale serve`), the browser's address comes from
 `X-Forwarded-For`, trusted from loopback only, so proxied browsers don't count
 as this machine. Options: `session_days`, `tickets`
 (default true), `exempt_local` (default true). `MCP_COMBINER_WEB_PASSWORD_HASH`
-overrides the hash. The session is an HTTP-only cookie signed with a key kept
+overrides the hash. Or skip the hash and give the password itself in
+`MCP_COMBINER_WEB_PASSWORD`, e.g. from a vault at launch
+(`op run -- mcp-combiner …` with `MCP_COMBINER_WEB_PASSWORD=op://vault/item/field`):
+it's hashed in memory at startup, so changing it in the vault takes effect on
+the next restart without signing anyone out. A configured hash wins if both
+are set. The session is an HTTP-only cookie signed with a key kept
 beside the OAuth tokens (`web-auth.key`); delete it to sign everyone out.
 `/auth/logout` signs one browser out. Login attempts are rate-limited.
 

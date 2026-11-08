@@ -913,6 +913,8 @@ class IsolationConfig(BaseModel):
 
 
 WEB_PASSWORD_HASH_ENV = "MCP_COMBINER_WEB_PASSWORD_HASH"
+#: The raw password (e.g. injected by ``op run`` from a vault), hashed at load.
+WEB_PASSWORD_ENV = "MCP_COMBINER_WEB_PASSWORD"
 
 
 class WebAuthConfig(BaseModel):
@@ -934,12 +936,21 @@ class WebAuthConfig(BaseModel):
         if mode not in ("off", "password"):
             raise ValueError(f"web_auth.mode must be 'off' or 'password'; got {mode!r}")
         password_hash = os.environ.get(WEB_PASSWORD_HASH_ENV) or data.get("password_hash")
+        raw_password = os.environ.get(WEB_PASSWORD_ENV)
+        if mode == "password" and not password_hash and raw_password:
+            # Hashed here with a fresh salt each load: the vault stays the only
+            # source of the password, and sessions don't depend on it (they're
+            # signed with web-auth.key), so a restart signs nobody out.
+            from mcp_combiner.webauth import hash_password
+
+            password_hash = hash_password(raw_password)
         if mode == "password" and not (
             isinstance(password_hash, str) and password_hash.startswith("scrypt$")
         ):
             raise ValueError(
-                "web_auth.mode 'password' needs web_auth.password_hash "
-                f"(or {WEB_PASSWORD_HASH_ENV}) — run `mcp-combiner hash-password`"
+                "web_auth.mode 'password' needs a password: "
+                f"${WEB_PASSWORD_ENV}, or a hash in web_auth.password_hash / "
+                f"${WEB_PASSWORD_HASH_ENV} (`mcp-combiner hash-password`)"
             )
         return cls(
             mode=mode,
