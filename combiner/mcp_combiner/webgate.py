@@ -39,6 +39,64 @@ def _ticket_subject(request: Request) -> str | None:
     return request.query_params.get("pt")
 
 
+def client_address(request: Request) -> str | None:
+    """The browser's address — already the proxied browser's when a local
+    reverse proxy forwarded the request (uvicorn's proxy headers, set in
+    __main__)."""
+    return request.client.host if request.client else None
+
+
+def enabled() -> bool:
+    config = RUNTIME.config
+    return (
+        config is not None and RUNTIME.web_signer is not None and config.web_auth.mode == "password"
+    )
+
+
+def admitted(request: Request) -> bool:
+    """Off, from this machine, or signed in (a valid session cookie)."""
+    config = RUNTIME.config
+    signer = RUNTIME.web_signer
+    if config is None or signer is None or config.web_auth.mode != "password":
+        return True
+    if config.web_auth.exempt_local and webauth.is_local(client_address(request)):
+        return True
+    return signer.verify(request.cookies.get(webauth.COOKIE, ""), "s") is not None
+
+
+def ticket_redirect(request: Request, subject: str | None) -> Response | None:
+    """A request carrying a valid ticket for *subject*: set the session and
+    redirect to the same URL without the ticket."""
+    signer = RUNTIME.web_signer
+    ticket = request.query_params.get(webauth.TICKET_PARAM)
+    if signer is None or not ticket or subject is None:
+        return None
+    claims = signer.verify(ticket, "t")
+    if claims is None or claims.get("sub") != subject:
+        return None
+    query = [(k, v) for k, v in request.query_params.multi_items() if k != webauth.TICKET_PARAM]
+    clean = request.url.path + (f"?{urlencode(query)}" if query else "")
+    response = RedirectResponse(clean, status_code=303)
+    set_session_cookie(response, request)
+    return response
+
+
+async def check_password(request: Request) -> str | None:
+    """Check a posted login form. ``None`` on success, else the problem to show."""
+    config = RUNTIME.config
+    client = client_address(request) or "?"
+    if webauth.too_many_failures(client):
+        return "Too many attempts — wait a minute and try again."
+    form = await request.form()
+    password = form.get("password")
+    stored = config.web_auth.password_hash if config is not None else None
+    if not isinstance(password, str) or not webauth.verify_password(password, stored or ""):
+        webauth.record_failure(client)
+        logger.warning("web_auth: failed login from %s", client)
+        return "That password isn't right."
+    return None
+
+
 def _secure(request: Request) -> bool:
     return (
         request.url.scheme == "https"
@@ -75,29 +133,11 @@ class WebAuthGate(BaseHTTPMiddleware):
     async def dispatch(
         self, request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
-        config = RUNTIME.config
-        signer = RUNTIME.web_signer
-        if (
-            config is None
-            or signer is None
-            or config.web_auth.mode != "password"
-            or not self._is_gated(request.url.path)
-        ):
+        if not self._is_gated(request.url.path) or admitted(request):
             return await call_next(request)
-        client = request.client.host if request.client else None
-        if config.web_auth.exempt_local and webauth.is_local(client):
-            return await call_next(request)
-        if signer.verify(request.cookies.get(webauth.COOKIE, ""), "s") is not None:
-            return await call_next(request)
-        ticket = request.query_params.get(webauth.TICKET_PARAM)
-        if ticket:
-            claims = signer.verify(ticket, "t")
-            if claims is not None and claims.get("sub") == _ticket_subject(request):
-                query = [(k, v) for k, v in request.query_params.multi_items() if k != "t"]
-                clean = request.url.path + (f"?{urlencode(query)}" if query else "")
-                response = RedirectResponse(clean, status_code=303)
-                set_session_cookie(response, request)
-                return response
+        redirect = ticket_redirect(request, _ticket_subject(request))
+        if redirect is not None:
+            return redirect
         accepts_html = "text/html" in request.headers.get("accept", "")
         if self._login_origin is not None and request.method == "GET" and accepts_html:
             target = request.url.path + (f"?{request.url.query}" if request.url.query else "")
@@ -123,18 +163,11 @@ def register_login_routes(combiner: FastMCP) -> None:
         target = _safe_next(request.query_params.get("next"))
         if request.method == "GET":
             return authpages.login_page(target)
-        client = request.client.host if request.client else "?"
-        if webauth.too_many_failures(client):
-            return authpages.login_page(
-                target, error="Too many attempts — wait a minute and try again.", status=429
-            )
+        problem = await check_password(request)
+        if problem is not None:
+            status = 429 if problem.startswith("Too many") else 401
+            return authpages.login_page(target, error=problem, status=status)
         form = await request.form()
-        password = form.get("password")
-        stored = config.web_auth.password_hash or ""
-        if not isinstance(password, str) or not webauth.verify_password(password, stored):
-            webauth.record_failure(client)
-            logger.warning("web_auth: failed login from %s", client)
-            return authpages.login_page(target, error="That password isn't right.", status=401)
         response = RedirectResponse(_safe_next(str(form.get("next") or target)), status_code=303)
         set_session_cookie(response, request)
         return response

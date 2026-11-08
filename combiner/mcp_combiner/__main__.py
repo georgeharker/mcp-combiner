@@ -18,6 +18,7 @@ import logging
 import signal
 import sys
 import types
+from typing import Any
 
 # Serve mode looks up this machine's tailnet name/address (bind 'auto',
 # advertise, oauth.public_url) — slow on some platforms. Start it now, so it
@@ -346,7 +347,9 @@ def _serve(args: argparse.Namespace) -> None:
     from mcp_combiner.ui_host import get_relay_app
 
     if relay_sockets:
-        relay = uvicorn.Server(uvicorn.Config(get_relay_app(options), log_level="warning"))
+        relay = uvicorn.Server(
+            uvicorn.Config(get_relay_app(options), log_level="warning", **_PROXY_HEADERS)
+        )
         relay_thread = threading.Thread(
             target=lambda: relay.run(sockets=relay_sockets),
             daemon=True,
@@ -357,6 +360,7 @@ def _serve(args: argparse.Namespace) -> None:
     config = uvicorn.Config(
         app,
         log_level="info",
+        **_PROXY_HEADERS,
         # From the raw parsed args — ServeOptions doesn't carry the ssl fields
         ssl_certfile=getattr(args, "ssl_certfile", None),
         ssl_keyfile=getattr(args, "ssl_keyfile", None),
@@ -373,6 +377,13 @@ def _serve(args: argparse.Namespace) -> None:
         timeout_graceful_shutdown=2,
     )
     uvicorn.Server(config).run(sockets=main_sockets)
+
+
+#: A local reverse proxy (``tailscale serve``) connects from loopback and names
+#: the browser in X-Forwarded-For; uvicorn substitutes it into the client
+#: address. web_auth's this-machine exemption depends on it: without it every
+#: proxied browser would look local. Trusted from loopback only.
+_PROXY_HEADERS: dict[str, Any] = {"proxy_headers": True, "forwarded_allow_ips": "127.0.0.1,::1"}
 
 
 def main() -> None:

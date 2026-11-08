@@ -287,7 +287,11 @@ def register_meta_tools(
                 f"Couldn't start authorization for '{server_name}' "
                 f"(state: {conn_manager.lifecycle_state(server_name)}); see the combiner log"
             )
-        raise authprompt.prompt_error(pending, _connection_of(ctx))
+        from mcp_combiner import nvim_proxy
+
+        raise authprompt.prompt_error(
+            pending, _connection_of(ctx), nvim_proxy.token_for_session(ctx.session_id)
+        )
 
     @combiner.tool()
     async def combiner__enable_server(server_name: str) -> str:

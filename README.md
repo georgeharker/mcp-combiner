@@ -987,7 +987,13 @@ mcp-combiner hash-password          # prompts twice, prints a scrypt hash
 | a widget link the combiner handed an MCP client (it carries a short-lived ticket) | never — the first open sets the session |
 | any other browser | once per `session_days` (default 30) |
 
-The OAuth pages and `/health` stay open. Options: `session_days`, `tickets`
+The OAuth authorization page (`/oauth/authorize/<id>`) is gated the same way —
+the link in a client's prompt carries a ticket, and a bare link asks for the
+password on the page itself (it works through a proxy that exposes only
+`/oauth`). The OAuth callback and `/health` stay open. Behind a local reverse
+proxy (`tailscale serve`), the browser's address comes from
+`X-Forwarded-For`, trusted from loopback only, so proxied browsers don't count
+as this machine. Options: `session_days`, `tickets`
 (default true), `exempt_local` (default true). `MCP_COMBINER_WEB_PASSWORD_HASH`
 overrides the hash. The session is an HTTP-only cookie signed with a key kept
 beside the OAuth tokens (`web-auth.key`); delete it to sign everyone out.

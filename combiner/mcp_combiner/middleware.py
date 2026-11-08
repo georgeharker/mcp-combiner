@@ -494,7 +494,9 @@ class ToolProcessingMiddleware(Middleware):
                 await conns.reauthorize(call_server)
                 pending = authprompt.pending_for(call_server)
             if pending is not None:
-                raise authprompt.prompt_error(pending, _connection_of(context.fastmcp_context))
+                raise authprompt.prompt_error(
+                    pending, _connection_of(context.fastmcp_context), _chat_token()
+                )
 
         # Input schema gate: a call whose arguments don't match the schema the
         # client was shown fails here, before any permission prompt or
@@ -559,7 +561,7 @@ class ToolProcessingMiddleware(Middleware):
             pending = authprompt.pending_for(call_server) if call_server else None
             if pending is not None:
                 raise authprompt.prompt_error(
-                    pending, _connection_of(context.fastmcp_context)
+                    pending, _connection_of(context.fastmcp_context), _chat_token()
                 ) from e
             raise
         except AuthenticationError as e:
@@ -570,7 +572,7 @@ class ToolProcessingMiddleware(Middleware):
             pending = authprompt.pending_for(call_server) if call_server else None
             if pending is not None:
                 raise authprompt.prompt_error(
-                    pending, _connection_of(context.fastmcp_context)
+                    pending, _connection_of(context.fastmcp_context), _chat_token()
                 ) from e
             logger.warning("Tool '%s' blocked by auth failure: %s", tool_name, e)
             raise ToolError(
@@ -587,7 +589,7 @@ class ToolProcessingMiddleware(Middleware):
             pending = authprompt.pending_for(server_name) if server_name else None
             if pending is not None:
                 raise authprompt.prompt_error(
-                    pending, _connection_of(context.fastmcp_context)
+                    pending, _connection_of(context.fastmcp_context), _chat_token()
                 ) from e
 
             # Check for rate limiting (429) — transient, caller should retry

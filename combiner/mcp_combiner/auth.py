@@ -359,7 +359,9 @@ class _RefreshTokenOAuth(OAuth):
             validate_authorization_response_iss(iss, self.context.oauth_metadata)
             return await self._exchange_code(code, verifier)
 
+        renewal = await self.context.storage.get_tokens() is not None
         pending = authprompt.PendingAuthorization(
+            renewal=renewal,
             server=self.server_name,
             url=url,
             state=state,

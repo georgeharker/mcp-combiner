@@ -23,7 +23,16 @@ tagged `vX.Y.Z`.
   (`session_days`); widget URLs handed to bearer-authenticated MCP clients
   carry a short-lived ticket that logs the browser in without a prompt;
   requests from this machine's own addresses are exempt; rate-limited login
-  page in the authorization-page style; OAuth pages and `/health` stay open.
+  page in the authorization-page style; the OAuth callback and `/health` stay open.
+- **OAuth authorization page says more, and is gated by `web_auth`**: the
+  short link's page now shows why authorization is needed (first sign-in or an
+  expired/revoked one), the provider host, the requested scopes, which client
+  and chat asked, and when. With `web_auth` on, the page and `?go=1` need a
+  session: links handed to clients carry a ticket, this machine is exempt, and
+  anyone else signs in with a password form on the page itself (so it works
+  behind a proxy that exposes only `/oauth`).
+- Uvicorn's proxy headers are set explicitly (`X-Forwarded-For` trusted from
+  loopback only), on both the main port and the relay.
 - **`combiner__authorize_server(server_name)`** — an always-mounted meta tool
   that starts OAuth authorization for any configured OAuth upstream (never
   authorized, revoked, link expired) and fails with the authorization link:

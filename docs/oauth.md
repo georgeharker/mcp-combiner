@@ -71,6 +71,19 @@ Tailscale recipe and Google's `https` requirement are in the README's "OAuth
 options" section. `{oauth_redirect}` in a server's own config expands to that
 callback URL.
 
+The link handed out is the combiner's short link,
+`<public_url>/oauth/authorize/<id>`: a page naming the server, why it needs
+authorizing (first sign-in, or an expired/revoked one), the provider host it
+leads to, the scopes requested, which client and chat asked, and the expected
+account (`login_hint`), with an expiry countdown. `?go=1` skips the page.
+
+With `web_auth` on (README, "Web login"), the page is gated too: a leaked link
+mustn't let someone else bind *their* account to your combiner. Links handed to
+clients carry a short-lived ticket (no prompt); this machine is exempt; anyone
+else gets a password form on the page itself, posting back to it — because a
+proxy such as `tailscale serve --set-path /oauth` may expose nothing else. The
+callback stays open; its `state` binds it to the pending authorization.
+
 ## Token Storage
 
 ### Location

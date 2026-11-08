@@ -48,6 +48,23 @@ logger = logging.getLogger("mcp-combiner")
 CodeExchange = Callable[[str, str | None], Awaitable[str | None]]
 
 
+@dataclass(frozen=True)
+class Requester:
+    """A client that was handed an authorization (shown on the short link's page)."""
+
+    client: str | None
+    chat: str | None
+
+    @classmethod
+    def of(cls, connection: Connection | None, chat: str | None) -> Requester | None:
+        params = connection.client_params if connection is not None else None
+        info = params.client_info if params is not None else None
+        client = (info.title or info.name) if info is not None else None
+        if client is None and chat is None:
+            return None
+        return cls(client=client, chat=chat)
+
+
 @dataclass
 class PendingAuthorization:
     """One outstanding authorization the user has to complete."""
@@ -67,6 +84,17 @@ class PendingAuthorization:
     callback_task: asyncio.Task[None] | None = None
     #: the account to sign in with (auth.oauth.login_hint), when configured.
     login_hint: str | None = None
+    #: tokens were stored before: the sign-in expired or was revoked.
+    renewal: bool = False
+    #: when the authorization started (wall clock, for the page).
+    started_at: float = field(default_factory=time.time)
+    #: who was asked to authorize: client names and chat tokens, first-seen order.
+    requested_by: list[Requester] = field(default_factory=list)
+
+    def note_requester(self, connection: Connection | None, chat: str | None) -> None:
+        requester = Requester.of(connection, chat)
+        if requester is not None and requester not in self.requested_by:
+            self.requested_by.append(requester)
 
     def expired(self) -> bool:
         return time.monotonic() >= self.expires_at
@@ -106,7 +134,7 @@ def pending_by_elicitation(elicitation_id: str) -> PendingAuthorization | None:
     return None
 
 
-def short_link(pending: PendingAuthorization) -> str:
+def short_link(pending: PendingAuthorization, *, ticket: bool = False) -> str:
     """A short URL on the combiner that redirects to *pending*'s authorization URL.
 
     The real URL runs to ~400 characters (PKCE challenge, state, scopes) and
@@ -122,14 +150,28 @@ def short_link(pending: PendingAuthorization) -> str:
     base = (config.oauth.public_url if config is not None else None) or RUNTIME.local_origin
     if base is None:
         return pending.url
-    return f"{base}/oauth/authorize/{pending.elicitation_id}"
+    link = f"{base}/oauth/authorize/{pending.elicitation_id}"
+    if ticket:
+        # Handed to a bearer-authenticated client: let its user past web_auth.
+        from mcp_combiner.webgate import ticket_query
+
+        query = ticket_query(oauth_ticket_subject(pending.elicitation_id))
+        link += "?" + query[1:] if query else ""
+    return link
+
+
+def oauth_ticket_subject(elicitation_id: str) -> str:
+    """What a web_auth ticket for the short link names."""
+    return f"oauth:{elicitation_id}"
 
 
 def _elicitation_url(pending: PendingAuthorization) -> str:
     from mcp_combiner.runtime import RUNTIME
 
     config = RUNTIME.config
-    return short_link(pending) if config is not None and config.oauth.public_url else pending.url
+    if config is not None and config.oauth.public_url:
+        return short_link(pending, ticket=True)
+    return pending.url
 
 
 def pending_for(server: str) -> PendingAuthorization | None:
@@ -231,7 +273,9 @@ def supports_url_elicitation(connection: Connection) -> bool:
     return elicitation is not None and elicitation.url is not None
 
 
-def prompt_error(pending: PendingAuthorization, connection: Connection | None) -> Exception:
+def prompt_error(
+    pending: PendingAuthorization, connection: Connection | None, chat: str | None = None
+) -> Exception:
     """The error a tool call routed to *pending*'s server fails with.
 
     A client that supports URL elicitation gets ``-32042`` with the URL (shown
@@ -242,6 +286,7 @@ def prompt_error(pending: PendingAuthorization, connection: Connection | None) -
     the provider; without it, the provider URL itself (the short link would be a
     loopback address no other device can open).
     """
+    pending.note_requester(connection, chat)
     if not pending.elicit:
         return ToolError(
             f"Server '{pending.server}' is waiting for authorization in a browser on "
@@ -265,7 +310,7 @@ def prompt_error(pending: PendingAuthorization, connection: Connection | None) -
     return ToolError(
         f"Server '{pending.server}' needs authorization"
         + (f" (sign in as {pending.login_hint})" if pending.login_hint else "")
-        + f". Open {short_link(pending)} to authorize, then retry."
+        + f". Open {short_link(pending, ticket=True)} to authorize, then retry."
     )
 
 

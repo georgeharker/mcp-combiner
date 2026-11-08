@@ -41,7 +41,7 @@ from fastmcp.client.transports.http import StreamableHttpTransport
 from fastmcp.exceptions import ToolError
 from mcp.shared.exceptions import MCPError, UrlElicitationRequiredError
 
-from mcp_combiner import authpages, authprompt
+from mcp_combiner import authpages, authprompt, webauth
 from mcp_combiner.auth import (
     _RefreshTokenOAuth,
     authorizes_out_of_band,
@@ -409,6 +409,7 @@ class TestCombinerPublicUrlFlow:
         tmp_path: Path,
         env: dict[str, str] | None = None,
         protocol: str | None = None,
+        web_auth: dict[str, Any] | None = None,
     ) -> str:
         port = free_port_pair()
         entry: dict[str, Any] = {"url": mock.mcp_url, "transport": "http", "auth": "oauth"}
@@ -422,6 +423,7 @@ class TestCombinerPublicUrlFlow:
                 "prompt": "elicit",
                 "token_dir": str(tmp_path / "tokens"),
             },
+            web_auth=web_auth,
         )
         combiner = await procs.start_combiner(
             config,
@@ -634,8 +636,110 @@ class TestCombinerPublicUrlFlow:
 
             second_url, second_id = await _link(client)
             assert second_id != first_id
+            async with httpx2.AsyncClient() as http:
+                renewal = await http.get(second_url)
+            assert "has expired or was revoked" in renewal.text
             assert (await _follow_as_user(second_url)).status_code == 200
             assert await poll_until(lambda: _echo(client), timeout=30.0) == "Echo: hi"
+
+    async def test_the_page_says_who_asked_and_where_it_leads(
+        self, procs: ProcFactory, oauth_mock: OAuthMockFactory, tmp_path: Path
+    ) -> None:
+        mock = await oauth_mock()
+        mcp_url = await self._start(procs, mock, tmp_path)
+        async with Client(
+            f"{mcp_url}/page-chat-0001",
+            elicitation_handler=_never_elicit,
+            mode=CLIENT_CONNECT_MODE,
+            client_info=mt.Implementation(name="pi", title="Pi agent", version="1"),
+        ) as client:
+            with pytest.raises(MCPError) as caught:
+                await client.call_tool("mock_echo", {"message": "hi"})
+        assert isinstance(caught.value.error.data, dict)
+        (elicitation,) = caught.value.error.data["elicitations"]
+        assert "?t=" not in elicitation["url"]  # web_auth off: no ticket
+        async with httpx2.AsyncClient() as http:
+            page = (await http.get(elicitation["url"])).text
+        assert "<dt>Signs in at</dt><dd>127.0.0.1</dd>" in page
+        assert "Pi agent" in page and "chat page-cha…" in page
+        assert "needs your permission to connect" in page  # first sign-in
+
+    async def test_web_auth_gates_the_page_and_tickets_open_it(
+        self, procs: ProcFactory, oauth_mock: OAuthMockFactory, tmp_path: Path
+    ) -> None:
+        mock = await oauth_mock()
+        password = "open sesame"
+        mcp_url = await self._start(
+            procs,
+            mock,
+            tmp_path,
+            web_auth={
+                "mode": "password",
+                "password_hash": webauth.hash_password(password),
+                "exempt_local": False,
+            },
+        )
+        async with Client(
+            mcp_url, elicitation_handler=_never_elicit, mode=CLIENT_CONNECT_MODE
+        ) as client:
+            with pytest.raises(MCPError) as caught:
+                await client.call_tool("mock_echo", {"message": "hi"})
+        assert isinstance(caught.value.error.data, dict)
+        (elicitation,) = caught.value.error.data["elicitations"]
+        ticketed = elicitation["url"]
+        assert "?t=" in ticketed
+        bare = ticketed.split("?", 1)[0]
+
+        async with httpx2.AsyncClient() as http:
+            # A leaked bare link: a sign-in form, and no way on to the provider.
+            locked = await http.get(bare)
+            assert locked.status_code == 401
+            assert 'type="password"' in locked.text and "Authorize <code>mock</code>" in locked.text
+            assert _AUTHORIZE_BUTTON.search(locked.text) is None
+            assert "/oauth/authorize?" not in locked.text
+            assert (await http.get(bare + "?go=1")).status_code == 401
+            # Another link's ticket doesn't open this one.
+            foreign = ticketed.split("t=", 1)[0] + "t=" + "x.y"
+            assert (await http.get(foreign)).status_code == 401
+            wrong = await http.post(bare, data={"password": "nope"})
+            assert wrong.status_code == 401 and "That password isn" in wrong.text
+
+        async with httpx2.AsyncClient() as http:
+            signed_in = await http.post(bare, data={"password": password})
+            assert signed_in.status_code == 303
+            assert webauth.COOKIE in signed_in.headers["set-cookie"]
+            page = await http.get(bare)
+            assert page.status_code == 200 and _AUTHORIZE_BUTTON.search(page.text)
+
+        # The ticketed link from the client opens straight through (no prompt)
+        # and the authorization completes.
+        done = await _follow_as_user(ticketed)
+        assert done.status_code == 200 and "is connected" in done.text
+
+    async def test_a_proxied_request_is_not_this_machine(
+        self, procs: ProcFactory, oauth_mock: OAuthMockFactory, tmp_path: Path
+    ) -> None:
+        """tailscale serve connects from loopback; X-Forwarded-For names the
+        real browser, which must not inherit the loopback exemption."""
+        mock = await oauth_mock()
+        mcp_url = await self._start(
+            procs,
+            mock,
+            tmp_path,
+            web_auth={"mode": "password", "password_hash": webauth.hash_password("pw")},
+        )
+        async with Client(mcp_url, mode=CLIENT_CONNECT_MODE) as client:
+            with pytest.raises(ToolError) as caught:
+                await client.call_tool("mock_echo", {"message": "hi"})
+        short = next(w for w in str(caught.value).split() if "/oauth/authorize/" in w)
+        bare = short.split("?", 1)[0]
+        async with httpx2.AsyncClient() as http:
+            assert (await http.get(bare)).status_code == 200  # this machine
+            proxied = await http.get(bare, headers={"x-forwarded-for": "100.64.9.9"})
+            assert proxied.status_code == 401
+            # ...unless the forwarded browser is this machine too.
+            own = await http.get(bare, headers={"x-forwarded-for": "127.0.0.1"})
+            assert own.status_code == 200
 
 
 @pytest.mark.e2e
@@ -800,6 +904,36 @@ class TestAuthorizeServerTool:
         # The provider signs that account in and names it: the completion page says so.
         done = await _follow_as_user(elicitation["url"])
         assert "Signed in as <strong>george@example.com</strong>" in done.text
+
+
+class TestAuthorizePage:
+    def _page(self, pending: authprompt.PendingAuthorization, **kw: Any) -> str:
+        return bytes(authpages.authorize_page(pending, **kw).body).decode()
+
+    def test_names_provider_scopes_requesters_and_why(self) -> None:
+        pending = _pending("gws")
+        pending.url = (
+            "https://accounts.google.com/o/oauth2/auth?state=s1&scope="
+            "openid+https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fgmail.modify"
+        )
+        connection, _ = recording_connection(url_elicitation=True)
+        pending.note_requester(connection, "abcdef0123456789")
+        pending.note_requester(connection, "abcdef0123456789")  # once only
+        page = self._page(pending)
+        assert "<dt>Signs in at</dt><dd>accounts.google.com</dd>" in page
+        assert "openid<br>gmail.modify" in page
+        assert page.count("<dt>Asked by</dt>") == 1
+        assert "test" in page and "chat abcdef01…" in page
+        assert "needs your permission to connect" in page
+        pending.renewal = True
+        assert "has expired or was revoked" in self._page(pending)
+
+    def test_sign_in_variant_hides_the_way_on(self) -> None:
+        pending = _pending("gws")
+        page = self._page(pending, needs_sign_in=True, sign_in_error="That password isn't right.")
+        assert 'type="password"' in page and '<form method="post">' in page
+        assert html.escape(pending.url, quote=True) not in page
+        assert "isn&#x27;t right" in page
 
 
 class TestAuthorizedPage:

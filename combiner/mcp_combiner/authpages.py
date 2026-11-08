@@ -17,8 +17,15 @@ from __future__ import annotations
 
 import html
 import math
+import time
+from datetime import datetime
+from typing import TYPE_CHECKING
+from urllib.parse import parse_qs, urlsplit
 
 from starlette.responses import HTMLResponse
+
+if TYPE_CHECKING:
+    from mcp_combiner.authprompt import PendingAuthorization
 
 #: The combiner mark: several inputs converging on one hub, one output — what
 #: the combiner does with MCP servers. Inline, coloured by the page.
@@ -85,6 +92,13 @@ button.button { border: 0; cursor: pointer; font: inherit; font-weight: 650; }
   display: block; width: 100%; margin-top: 18px; padding: 13px 14px; border-radius: 12px;
   border: 1px solid var(--line); background: var(--bg); color: var(--text); font: inherit;
 }
+.details {
+  display: grid; grid-template-columns: max-content 1fr; gap: 6px 14px; margin: 16px 0 0;
+  padding: 12px 14px; border-radius: 12px; background: var(--bg); font-size: 14px;
+}
+.details dt { color: var(--muted); }
+.details dd { margin: 0; overflow-wrap: anywhere; }
+.dim { color: var(--muted); }
 .meta { font-size: 14px; color: var(--muted); text-align: center; margin: 0; }
 .warning { color: var(--warn); margin: 12px 0 0; }
 .account {
@@ -124,23 +138,48 @@ def _page(title: str, body: str, status: int = 200, script: str = "") -> HTMLRes
 
 
 def authorize_page(
-    server: str, provider_url: str, seconds_left: float, login_hint: str | None = None
+    pending: PendingAuthorization, *, sign_in_error: str | None = None, needs_sign_in: bool = False
 ) -> HTMLResponse:
-    """The short link's page: who is asking, which account, and the way on."""
-    name = html.escape(server)
-    seconds = max(0, math.floor(seconds_left))
+    """The short link's page: which server, why, who asked, where you're sent
+    and what it asks for — then the way on. With web_auth and no session, the
+    way on is a password form posting back here (this page may be the only
+    combiner path a proxy exposes)."""
+    name = html.escape(pending.server)
+    seconds = max(0, math.floor(pending.expires_at - time.monotonic()))
     account = (
-        f'<p class="account">Sign in as <strong>{html.escape(login_hint)}</strong></p>'
-        if login_hint
+        f'<p class="account">Sign in as <strong>{html.escape(pending.login_hint)}</strong></p>'
+        if pending.login_hint
         else ""
     )
+    why = (
+        f"Your saved sign-in for <strong>{name}</strong> has expired or was revoked, so the "
+        "combiner needs your permission again."
+        if pending.renewal
+        else f"Your MCP combiner needs your permission to connect to <strong>{name}</strong>."
+    )
+    if needs_sign_in:
+        problem = (
+            f'<div class="status warn"><span class="dot"></span>{html.escape(sign_in_error)}</div>'
+            if sign_in_error
+            else ""
+        )
+        way_on = (
+            f"{problem}"
+            '<form method="post"><input class="field" type="password" name="password" '
+            'autocomplete="current-password" placeholder="Combiner web password" required '
+            'autofocus aria-label="Combiner web password">'
+            '<button class="button" id="go" type="submit">Sign in to continue</button></form>'
+        )
+    else:
+        way_on = (
+            f'<a class="button" id="go" href="{html.escape(pending.url, quote=True)}" '
+            f'rel="noreferrer">Authorize {name}</a>'
+        )
     body = (
         f"<h1>Authorize <code>{name}</code></h1>"
-        f"<p>Your MCP combiner needs your permission to connect to <strong>{name}</strong>. "
-        "You'll sign in with the service and approve access; then you're sent back here.</p>"
-        f"{account}"
-        f'<a class="button" id="go" href="{html.escape(provider_url, quote=True)}" '
-        f'rel="noreferrer">Authorize {name}</a>'
+        f"<p>{why} You'll sign in with the service and approve access; then you're sent "
+        "back here.</p>"
+        f"{account}{_details(pending)}{way_on}"
         f'<p class="meta" id="left" data-seconds="{seconds}">'
         f"This link expires in {_duration(seconds)}.</p>"
     )
@@ -154,7 +193,7 @@ def authorize_page(
     var s = Math.max(0, Math.round((end - Date.now()) / 1000));
     if (s === 0) {
       left.textContent = "This link has expired. Ask for a new one from your app.";
-      go.setAttribute("aria-disabled", "true"); go.removeAttribute("href");
+      go.setAttribute("aria-disabled", "true"); go.removeAttribute("href"); go.disabled = true;
       return;
     }
     left.textContent = "This link expires in " + fmt(s) + ".";
@@ -163,7 +202,7 @@ def authorize_page(
   tick();
 })();
 </script>"""
-    return _page(f"Authorize {server}", body, script=script)
+    return _page(f"Authorize {pending.server}", body, script=script)
 
 
 def gone_page() -> HTMLResponse:
@@ -244,3 +283,28 @@ def login_page(next_path: str, error: str | None = None, status: int = 200) -> H
         "</form>"
     )
     return _page("Sign in", body, status=status)
+
+
+def _details(pending: PendingAuthorization) -> str:
+    """Where the user is sent, what it asks for, who asked and when."""
+    split = urlsplit(pending.url)
+    rows = [("Signs in at", html.escape(split.hostname or "?"))]
+    scopes = parse_qs(split.query).get("scope", [""])[0].split()
+    if scopes:
+        rows.append(("Access", "<br>".join(html.escape(_scope_label(s)) for s in scopes)))
+    for requester in pending.requested_by[:3]:
+        label = html.escape(requester.client or "an MCP client")
+        if requester.chat:
+            label += f' <span class="dim">chat {html.escape(requester.chat[:8])}…</span>'
+        rows.append(("Asked by", label))
+    started = datetime.fromtimestamp(pending.started_at).strftime("%H:%M")
+    rows.append(("Started", started))
+    cells = "".join(f"<dt>{k}</dt><dd>{v}</dd>" for k, v in rows)
+    return f'<dl class="details">{cells}</dl>'
+
+
+def _scope_label(scope: str) -> str:
+    """Google's scope URLs, shortened to their meaningful tail."""
+    if scope.startswith("https://www.googleapis.com/auth/"):
+        return scope.removeprefix("https://www.googleapis.com/auth/")
+    return scope

@@ -14,7 +14,6 @@ whose values are wire ``mcp-session-id``s — since fastmcp 4 the same ids
 from __future__ import annotations
 
 import logging
-import time
 from pathlib import Path
 from typing import Any
 
@@ -69,19 +68,42 @@ def register_routes(
     # the elicitation id is the secret.
     # The page names the server and offers the way on (authpages); ``?go=1``
     # skips it and redirects straight to the provider (scripts, old clients).
-    @combiner.custom_route("/oauth/authorize/{elicitation_id}", methods=["GET"])
+    # Under web_auth the page is gated (a leaked link must not let someone
+    # else bind their account): links handed to clients carry a ticket, this
+    # machine is exempt, anyone else signs in on the page itself — a POST
+    # back here — since a proxy may expose only /oauth.
+    @combiner.custom_route("/oauth/authorize/{elicitation_id}", methods=["GET", "POST"])
     async def oauth_authorize(request: Request) -> Response:
-        pending = authprompt.pending_by_elicitation(request.path_params["elicitation_id"])
+        from mcp_combiner import webgate
+
+        elicitation_id = request.path_params["elicitation_id"]
+        pending = authprompt.pending_by_elicitation(elicitation_id)
         if pending is None:
             return authpages.gone_page()
+        if not webgate.admitted(request):
+            redirect = webgate.ticket_redirect(
+                request, authprompt.oauth_ticket_subject(elicitation_id)
+            )
+            if redirect is not None:
+                return redirect
+            if request.method == "POST":
+                problem = await webgate.check_password(request)
+                if problem is None:
+                    response = RedirectResponse(request.url.path, status_code=303)
+                    webgate.set_session_cookie(response, request)
+                    return response
+                status = 429 if problem.startswith("Too many") else 401
+                page = authpages.authorize_page(pending, needs_sign_in=True, sign_in_error=problem)
+                page.status_code = status
+                return page
+            page = authpages.authorize_page(pending, needs_sign_in=True)
+            page.status_code = 401
+            return page
+        if request.method == "POST":
+            return RedirectResponse(request.url.path, status_code=303)
         if request.query_params.get("go"):
             return RedirectResponse(pending.url, status_code=302)
-        return authpages.authorize_page(
-            pending.server,
-            pending.url,
-            pending.expires_at - time.monotonic(),
-            login_hint=pending.login_hint,
-        )
+        return authpages.authorize_page(pending)
 
     @combiner.custom_route("/oauth/callback/{server}", methods=["GET"])
     async def oauth_callback(request: Request) -> HTMLResponse:
