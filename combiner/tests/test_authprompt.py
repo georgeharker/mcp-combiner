@@ -259,6 +259,12 @@ class TestComplete:
             await authprompt.complete(server, code, state, error)
         assert exchanged == []
 
+    def test_a_junk_link_id_is_unknown_not_an_error(self) -> None:
+        pending = _pending()
+        authprompt.publish(pending)
+        assert authprompt.pending_by_elicitation("é" * 4) is None
+        assert authprompt.pending_by_elicitation(pending.elicitation_id) is pending
+
     def test_expired_pending_is_dropped(self) -> None:
         authprompt.publish(_pending(ttl=-1.0))
         assert authprompt.pending_for("srv") is None
@@ -928,12 +934,29 @@ class TestAuthorizePage:
         pending.renewal = True
         assert "has expired or was revoked" in self._page(pending)
 
-    def test_sign_in_variant_hides_the_way_on(self) -> None:
+    def test_scripts_run_by_nonce_only(self) -> None:
+        page = authpages.authorize_page(_pending("gws"))
+        csp = page.headers["content-security-policy"]
+        nonce = re.search(r"script-src 'nonce-([^']+)'", csp)
+        assert nonce is not None and "unsafe-inline" not in csp.split("script-src", 1)[1]
+        tags = re.findall(r"<script[^>]*>", bytes(page.body).decode())
+        assert tags and all(f'nonce="{nonce.group(1)}"' in tag for tag in tags)
+        again = authpages.authorize_page(_pending("gws")).headers["content-security-policy"]
+        assert again != csp  # fresh per response
+
+    def test_sign_in_variant_hides_the_way_on_and_the_details(self) -> None:
         pending = _pending("gws")
+        pending.login_hint = "me@example.com"
+        connection, _ = recording_connection(url_elicitation=True)
+        pending.note_requester(connection, "abcdef0123456789")
         page = self._page(pending, needs_sign_in=True, sign_in_error="That password isn't right.")
         assert 'type="password"' in page and '<form method="post">' in page
         assert html.escape(pending.url, quote=True) not in page
         assert "isn&#x27;t right" in page
+        # Only what the bare link already says: no account, requesters, scopes.
+        for secret in ("me@example.com", "abcdef01", "Asked by", "Signs in at"):
+            assert secret not in page
+        assert "Authorize <code>gws</code>" in page
 
 
 class TestAuthorizedPage:

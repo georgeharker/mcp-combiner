@@ -3,7 +3,9 @@ mcp_combiner.webgate)."""
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -15,6 +17,7 @@ from conftest import CombinerHandle, ProcFactory, http_mock_entry
 from fastmcp import Client
 
 from mcp_combiner import webauth
+from mcp_combiner.__main__ import relay_config
 from mcp_combiner.config import CombinerConfig
 from mcp_combiner.runtime import CLIENT_CONNECT_MODE
 
@@ -59,25 +62,193 @@ class TestSigner:
         token = webauth.Signer.load_or_create(tmp_path / "key").session(1)
         assert webauth.Signer.load_or_create(tmp_path / "key").verify(token, "s") is not None
 
+    def test_tickets_carry_a_unique_id(self, tmp_path: Path) -> None:
+        signer = webauth.Signer.load_or_create(tmp_path / "key")
+        first, second = (signer.verify(signer.ticket("c"), "t") for _ in range(2))
+        assert first is not None and second is not None and first["j"] != second["j"]
+
+
+class TestKeyFile:
+    def test_refuses_a_key_others_can_read(self, tmp_path: Path) -> None:
+        path = tmp_path / "key"
+        webauth.Signer.load_or_create(path)
+        path.chmod(0o644)
+        with pytest.raises(webauth.KeyFileError, match="chmod 600"):
+            webauth.Signer.load_or_create(path)
+
+    def test_refuses_a_symlink(self, tmp_path: Path) -> None:
+        real = tmp_path / "real"
+        webauth.Signer.load_or_create(real)
+        (tmp_path / "link").symlink_to(real)
+        with pytest.raises(webauth.KeyFileError):
+            webauth.Signer.load_or_create(tmp_path / "link")
+
+    def test_refuses_a_truncated_key(self, tmp_path: Path) -> None:
+        path = tmp_path / "key"
+        path.write_bytes(b"short")
+        path.chmod(0o600)
+        with pytest.raises(webauth.KeyFileError, match="truncated"):
+            webauth.Signer.load_or_create(path)
+
+    def test_creation_leaves_no_temp_files(self, tmp_path: Path) -> None:
+        webauth.Signer.load_or_create(tmp_path / "key")
+        assert [p.name for p in tmp_path.iterdir()] == ["key"]
+
+
+class TestTicketLedger:
+    def test_uses_are_counted_per_ticket(self) -> None:
+        ledger = webauth.TicketLedger()
+        exp = time.time() + 60
+        one = {"j": "a", "exp": exp}
+        assert ledger.redeem(one, 1) and not ledger.redeem(one, 1)
+        two = {"j": "b", "exp": exp}
+        assert ledger.redeem(two, 2) and ledger.redeem(two, 2) and not ledger.redeem(two, 2)
+        assert not ledger.redeem({"exp": exp}, 5)  # no id: never redeemable
+
+    def test_expired_entries_are_dropped(self) -> None:
+        ledger = webauth.TicketLedger()
+        ledger.redeem({"j": "old", "exp": time.time() - 1}, 1)
+        ledger.redeem({"j": "new", "exp": time.time() + 60}, 1)
+        assert list(ledger._uses) == ["new"]
+
+
+class TestLimiter:
+    def test_concurrent_attempts_count_before_they_finish(self) -> None:
+        limiter = webauth.LoginLimiter(per_client=5, overall=100)
+        assert all(limiter.begin("1.2.3.4") for _ in range(5))
+        assert not limiter.begin("1.2.3.4")  # five still in flight
+        assert limiter.begin("5.6.7.8")  # another address has its own budget
+
+    def test_successes_free_the_slot_failures_keep_it(self) -> None:
+        limiter = webauth.LoginLimiter(per_client=2, overall=100)
+        for _ in range(3):
+            assert limiter.begin("a")
+            limiter.end("a", failed=False)
+        limiter.begin("a")
+        limiter.end("a", failed=True)
+        limiter.begin("a")
+        limiter.end("a", failed=True)
+        assert not limiter.begin("a")
+
+    def test_the_overall_budget_spans_addresses(self) -> None:
+        limiter = webauth.LoginLimiter(per_client=5, overall=3)
+        for client in ("a", "b", "c"):
+            assert limiter.begin(client)
+            limiter.end(client, failed=True)
+        assert not limiter.begin("d")
+
+    def test_bounded_and_pruned(self) -> None:
+        limiter = webauth.LoginLimiter(per_client=5, overall=10**6, max_clients=3, window_s=60)
+        for i in range(10):
+            limiter.begin(f"10.0.0.{i}")
+            limiter.end(f"10.0.0.{i}", failed=True)
+        assert limiter.tracked() == 3  # oldest evicted
+        limiter.window_s = 0.0
+        time.sleep(0.01)
+        limiter.begin("x")
+        limiter.end("x", failed=False)
+        assert limiter.tracked() == 0  # stale windows dropped, success adds nothing
+
 
 class TestThisMachine:
     def test_loopback_and_own_addresses(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(webauth, "_interface_addresses", lambda: {"192.168.1.20"})
-        monkeypatch.setattr("mcp_combiner.tailnet.tailnet_ip", lambda: "100.66.1.2")
+        monkeypatch.setattr("mcp_combiner.tailnet.fresh_tailnet_ip", lambda: "100.66.1.2")
         webauth.reset_local_addresses()
         try:
+            # Before the first refresh only loopback counts (fail closed).
+            assert webauth.is_local("127.0.0.1") and not webauth.is_local("192.168.1.20")
+            webauth.refresh_local_addresses()
             assert webauth.is_local("127.0.0.1") and webauth.is_local("::1")
             assert webauth.is_local("100.66.1.2") and webauth.is_local("192.168.1.20")
             assert webauth.is_local("::ffff:192.168.1.20")
             assert not webauth.is_local("100.66.9.9") and not webauth.is_local(None)
+            # A refresh follows the machine as its addresses change.
+            monkeypatch.setattr(webauth, "_interface_addresses", lambda: {"10.1.1.1"})
+            webauth.refresh_local_addresses()
+            assert webauth.is_local("10.1.1.1") and not webauth.is_local("192.168.1.20")
         finally:
             webauth.reset_local_addresses()
+
+    def test_parses_ifconfig_and_ip_output(self) -> None:
+        mac = (
+            "en0: flags=8863<UP>\n\tinet 192.168.1.5 netmask 0xffffff00\n"
+            "\tinet6 fe80::1%en0 prefixlen 64\n"
+        )
+        old_linux = "eth0  Link encap:Ethernet\n      inet addr:10.0.0.7  Bcast:10.0.0.255\n"
+        ip_o = (
+            "2: eth0    inet 172.17.0.2/16 brd 172.17.255.255 scope global eth0\n"
+            "3: eth0    inet6 fd00::2/64 scope global\n"
+        )
+        assert webauth.parse_addresses(mac) == {"192.168.1.5", "fe80::1%en0"}
+        assert webauth.parse_addresses(old_linux) == {"10.0.0.7"}
+        assert webauth.parse_addresses(ip_o) == {"172.17.0.2", "fd00::2"}
+
+
+class TestPasswordEnv:
+    def test_adopted_and_removed_from_the_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(webauth.PASSWORD_ENV, PASSWORD)
+        try:
+            webauth.adopt_password_env()
+            assert webauth.PASSWORD_ENV not in os.environ  # children won't inherit it
+            stored = webauth.env_password_hash()
+            assert stored is not None and webauth.verify_password(PASSWORD, stored)
+        finally:
+            webauth.reset_adopted_password()
 
 
 def _password_config(tmp_path: Path, **web_auth: object) -> Path:
     path = tmp_path / "servers.json"
     path.write_text(json.dumps({"servers": {}, "web_auth": {"mode": "password", **web_auth}}))
     return path
+
+
+@pytest.mark.parametrize(
+    ("web_auth", "message"),
+    [
+        ("password", "must be an object"),
+        (
+            {"mode": "password", "password_hash": "scrypt$x", "exempt_local": "false"},
+            "true or false",
+        ),
+        ({"mode": "password", "password_hash": "scrypt$x", "tickets": 1}, "true or false"),
+        ({"mode": "off", "exempt_locall": False}, "unknown setting"),
+        ({"mode": "password", "password_hash": "scrypt$x", "session_days": "30"}, "a number"),
+        ({"mode": "password", "password_hash": "scrypt$x", "session_days": 0}, "positive"),
+        ({"mode": "password", "password_hash": "scrypt$x", "ticket_uses": 0}, "whole number"),
+        ({"mode": "password", "password_hash": "scrypt$x", "ticket_uses": True}, "whole number"),
+    ],
+)
+def test_bad_settings_fail_the_load(tmp_path: Path, web_auth: object, message: str) -> None:
+    path = tmp_path / "servers.json"
+    path.write_text(json.dumps({"servers": {}, "web_auth": web_auth}))
+    with pytest.raises(ValueError, match=message):
+        CombinerConfig.load(str(path))
+
+
+def test_the_relay_gets_the_same_tls(tmp_path: Path) -> None:
+    import argparse
+
+    args = argparse.Namespace(ssl_certfile="/c.pem", ssl_keyfile="/k.pem")
+    config = relay_config(object(), args)
+    assert (config.ssl_certfile, config.ssl_keyfile) == ("/c.pem", "/k.pem")
+    assert config.proxy_headers and config.forwarded_allow_ips == "127.0.0.1,::1"
+
+
+def test_unset_auth_variables_are_logged(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from mcp_combiner.config import interpolate_value
+
+    monkeypatch.delenv("NOT_SET_ANYWHERE", raising=False)
+    with caplog.at_level("WARNING", logger="mcp-combiner"):
+        assert interpolate_value("Bearer ${NOT_SET_ANYWHERE}") == "Bearer "
+        assert interpolate_value("${NOT_SET_ANYWHERE:-x}") == "x"  # a default: quiet
+    assert [r.getMessage() for r in caplog.records] == [
+        "auth setting refers to ${NOT_SET_ANYWHERE}, which is not set"
+    ]
 
 
 def test_password_mode_needs_a_password(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -170,7 +341,11 @@ class TestLogin:
             relayed = await http.get(relay, params={"resource": WIDGET, "pt": "web-login-0001"})
             assert relayed.status_code != 401
 
-            await http.get(f"{combiner.base_url}/auth/logout")
+            # Sign-out is a POST; a GET only shows the button.
+            shown = await http.get(f"{combiner.base_url}/auth/logout")
+            assert shown.status_code == 200 and 'method="post"' in shown.text
+            assert (await http.get(page, headers=HTML)).status_code == 200
+            await http.post(f"{combiner.base_url}/auth/logout")
             assert (await http.get(page, headers=HTML)).status_code == 303
 
     async def test_next_is_same_origin_only(self, procs: ProcFactory, tmp_path: Path) -> None:
@@ -186,6 +361,36 @@ class TestLogin:
                     f"{combiner.base_url}/auth/login", data={"password": PASSWORD, "next": evil}
                 )
                 assert r.headers["location"] == "/"
+
+    async def test_concurrent_guesses_are_limited_and_dont_stall_the_server(
+        self, procs: ProcFactory, tmp_path: Path
+    ) -> None:
+        """Guesses fired at once count before any finishes; and the password
+        checks run off the event loop, so /health stays quick meanwhile."""
+        combiner = await _combiner(procs, tmp_path, exempt_local=False)
+        url = f"{combiner.base_url}/auth/login"
+        async with httpx2.AsyncClient(timeout=30.0) as http:
+
+            async def guess(source: str) -> int:
+                headers = {"x-forwarded-for": source}
+                return (await http.post(url, data={"password": "no"}, headers=headers)).status_code
+
+            async def health_times() -> list[float]:
+                times = []
+                for _ in range(10):
+                    start = time.monotonic()
+                    await http.get(f"{combiner.base_url}/health")
+                    times.append(time.monotonic() - start)
+                return times
+
+            same = await asyncio.gather(*(guess("100.64.1.1") for _ in range(20)))
+            assert same.count(401) <= 5 and same.count(429) >= 15
+            # 24 addresses x 1 guess: under the overall budget, all scrypt'd.
+            many, times = await asyncio.gather(
+                asyncio.gather(*(guess(f"100.64.2.{i}") for i in range(24))), health_times()
+            )
+            assert many == [401] * 24
+            assert max(times) < 0.3, times
 
     async def test_failures_are_rate_limited(self, procs: ProcFactory, tmp_path: Path) -> None:
         combiner = await _combiner(procs, tmp_path, exempt_local=False)
@@ -222,6 +427,11 @@ class TestLogin:
             assert (
                 await http.get(f"{combiner.base_url}{r.headers['location']}", headers=HTML)
             ).status_code == 200
+        # Used up (ticket_uses defaults to 1): a second browser gets the login.
+        async with httpx2.AsyncClient(timeout=10.0) as http:
+            again = await http.get(url, headers=HTML)
+            assert again.status_code == 303
+            assert again.headers["location"].startswith("/auth/login")
 
     async def test_a_ticket_for_another_chat_is_refused(
         self, procs: ProcFactory, tmp_path: Path

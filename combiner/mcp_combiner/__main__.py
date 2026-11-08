@@ -280,6 +280,10 @@ def _setup_logging(log_level: str, log_file: str | None) -> None:
 
 
 def _serve(args: argparse.Namespace) -> None:
+    from mcp_combiner.webauth import adopt_password_env
+
+    # Before anything spawns a child: keep the hash, drop the raw password.
+    adopt_password_env()
     options = ServeOptions(
         config=args.config,
         hosts=resolve_bind_hosts(args.host, args.config),
@@ -334,6 +338,13 @@ def _serve(args: argparse.Namespace) -> None:
 
     # Single worker - async handles concurrency
     app = create_app(options)
+    from mcp_combiner.runtime import RUNTIME
+
+    if exposed and options.auth_token is None and RUNTIME.web_signer is not None:
+        logging.getLogger("mcp-combiner").warning(
+            "web_auth: without an inbound bearer, anyone who can reach /mcp can get "
+            "widget and authorization links that skip the web password."
+        )
 
     # The UI host's sandbox relay: the SECOND origin (host+1) — it follows the
     # main bind so remote renderers (un-bien over the tailnet) reach BOTH origins;
@@ -347,9 +358,7 @@ def _serve(args: argparse.Namespace) -> None:
     from mcp_combiner.ui_host import get_relay_app
 
     if relay_sockets:
-        relay = uvicorn.Server(
-            uvicorn.Config(get_relay_app(options), log_level="warning", **_PROXY_HEADERS)
-        )
+        relay = uvicorn.Server(relay_config(get_relay_app(options), args))
         relay_thread = threading.Thread(
             target=lambda: relay.run(sockets=relay_sockets),
             daemon=True,
@@ -384,6 +393,19 @@ def _serve(args: argparse.Namespace) -> None:
 #: address. web_auth's this-machine exemption depends on it: without it every
 #: proxied browser would look local. Trusted from loopback only.
 _PROXY_HEADERS: dict[str, Any] = {"proxy_headers": True, "forwarded_allow_ips": "127.0.0.1,::1"}
+
+
+def relay_config(app: Any, args: argparse.Namespace) -> uvicorn.Config:
+    """The widget relay's server config. Same TLS as the main port: the page
+    builds the relay URL from its own scheme, so an https page asks for
+    ``https://host:port+1``."""
+    return uvicorn.Config(
+        app,
+        log_level="warning",
+        ssl_certfile=getattr(args, "ssl_certfile", None),
+        ssl_keyfile=getattr(args, "ssl_keyfile", None),
+        **_PROXY_HEADERS,
+    )
 
 
 def main() -> None:

@@ -969,40 +969,63 @@ called `auto` is never mistaken for it.
 
 The bearer token protects `/mcp` and the control routes, but browsers can't
 send it. When the combiner listens beyond this machine (a tailnet bind), its
-widget pages (`/ui/<token>/…`) and the widget relay (port + 1) — which can
-return resource contents — can require a password:
-
-```sh
-mcp-combiner hash-password          # prompts twice, prints a scrypt hash
-```
+widget pages (`/ui/<token>/…`), the widget relay (port + 1) — which can
+return resource contents — and the OAuth authorization page can require a
+password:
 
 ```json
-"web_auth": {"mode": "password", "password_hash": "scrypt$…"}
+"web_auth": {"mode": "password"}
 ```
+
+The password comes from the environment, so a vault can be its only source:
+
+```sh
+# e.g. 1Password: the env file holds a reference, `op run` resolves it at launch
+MCP_COMBINER_WEB_PASSWORD=op://vault/item/password
+op run --env-file combiner.env -- mcp-combiner --mcp --config servers.json
+```
+
+It's hashed in memory at startup and removed from the environment, so child
+processes (external and stdio servers) never see it. Changing it in the vault
+takes effect at the next restart, without signing anyone out. Or store a hash
+instead: `mcp-combiner hash-password` prints one for `web_auth.password_hash`
+(or `MCP_COMBINER_WEB_PASSWORD_HASH`); a hash wins if both are set.
 
 | Who | Asked for the password |
 |---|---|
 | MCP clients | never (they use the bearer) |
 | a browser on this machine (any of its own addresses) | never |
-| a widget link the combiner handed an MCP client (it carries a short-lived ticket) | never — the first open sets the session |
+| a link the combiner handed an MCP client (it carries a ticket) | never — opening it signs the browser in |
 | any other browser | once per `session_days` (default 30) |
 
-The OAuth authorization page (`/oauth/authorize/<id>`) is gated the same way —
-the link in a client's prompt carries a ticket, and a bare link asks for the
-password on the page itself (it works through a proxy that exposes only
-`/oauth`). The OAuth callback and `/health` stay open. Behind a local reverse
-proxy (`tailscale serve`), the browser's address comes from
-`X-Forwarded-For`, trusted from loopback only, so proxied browsers don't count
-as this machine. Options: `session_days`, `tickets`
-(default true), `exempt_local` (default true). `MCP_COMBINER_WEB_PASSWORD_HASH`
-overrides the hash. Or skip the hash and give the password itself in
-`MCP_COMBINER_WEB_PASSWORD`, e.g. from a vault at launch
-(`op run -- mcp-combiner …` with `MCP_COMBINER_WEB_PASSWORD=op://vault/item/field`):
-it's hashed in memory at startup, so changing it in the vault takes effect on
-the next restart without signing anyone out. A configured hash wins if both
-are set. The session is an HTTP-only cookie signed with a key kept
-beside the OAuth tokens (`web-auth.key`); delete it to sign everyone out.
-`/auth/logout` signs one browser out. Login attempts are rate-limited.
+- **Tickets** ride on widget and authorization links given to MCP clients.
+  One is good for 5 minutes and `ticket_uses` openings (default 1): after that
+  the link asks for the password. Apps that preview links (fetching them to
+  show a card) use a ticket up — set `ticket_uses: 2` if yours does.
+- **The authorization page** (`/oauth/authorize/<id>`) asks for the password on
+  the page itself, so it works through a proxy that exposes only `/oauth`.
+  Until you sign in it shows only the server name — not the account, scopes or
+  who asked. The OAuth callback and `/health` stay open.
+- **Guessing** is limited: 5 failed attempts a minute per address and 30 across
+  all addresses, then `429` for the rest of the minute. During such an attack
+  the form refuses everyone; this machine and ticket links still get in.
+- **Sessions** are an HTTP-only cookie signed with `web-auth.key`, kept beside
+  the OAuth tokens (owner-only; the combiner refuses a key others can read).
+  Delete it to sign every browser out; the sign-out page (`/auth/logout`) signs
+  out one.
+
+> [!WARNING]
+> **"This machine" is judged by where the connection comes from.** A local
+> reverse proxy must say who the real browser is: `X-Forwarded-For`, trusted
+> only from loopback. `tailscale serve` (HTTP/HTTPS) and nginx with
+> `proxy_set_header X-Forwarded-For` do. Anything that forwards raw
+> connections from this machine — `ssh -L`, `socat`, `tailscale serve --tcp`,
+> a proxy without that header — makes **every** browser look local and skip
+> the password. Behind one of those, set `"exempt_local": false`.
+
+Options: `mode` (`off`/`password`), `password_hash`, `session_days` (30),
+`tickets` (true), `ticket_uses` (1), `exempt_local` (true). Unknown keys and
+wrong types fail the config load rather than falling back.
 
 ### Inbound authentication (locking down `/mcp`)
 
@@ -1013,7 +1036,8 @@ client must present `Authorization: Bearer <token>`:
 
 - **Combiner**: `MCP_COMBINER_AUTH_TOKEN` env, or `--auth-token-file PATH` (the file
   wins). Unset ⇒ open (default; nothing changes). Gates `/mcp` **and** the control
-  routes that mutate the server (`/sessions*`, `/handover*`); `/health` stays open.
+  routes that mutate the server (`/sessions*`, `/neovim*`, `/handover*`); `/health`
+  stays open.
   A missing/wrong token gets a plain `401` — no OAuth challenge advertised. (The
   `mcp-combiner` ctl and the Neovim host present the token automatically.)
 - **Neovim**: set `combiner.auth_token` (or export `MCP_COMBINER_AUTH_TOKEN`) — it is

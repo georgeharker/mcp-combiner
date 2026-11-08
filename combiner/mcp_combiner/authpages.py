@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import html
 import math
+import secrets
 import time
 from datetime import datetime
 from typing import TYPE_CHECKING
@@ -115,6 +116,9 @@ button.button { border: 0; cursor: pointer; font: inherit; font-weight: 650; }
 
 
 def _page(title: str, body: str, status: int = 200, script: str = "") -> HTMLResponse:
+    # Scripts run under a per-response nonce, so nothing injected inline could.
+    nonce = secrets.token_urlsafe(16)
+    script = script.replace("<script>", f'<script nonce="{nonce}">')
     document = (
         "<!doctype html><html lang=en><head><meta charset=utf-8>"
         '<meta name=viewport content="width=device-width,initial-scale=1">'
@@ -130,7 +134,7 @@ def _page(title: str, body: str, status: int = 200, script: str = "") -> HTMLRes
         "Referrer-Policy": "no-referrer",
         "X-Frame-Options": "DENY",
         "Content-Security-Policy": (
-            "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+            f"default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-{nonce}'; "
             "img-src data:; form-action 'self'; frame-ancestors 'none'"
         ),
     }
@@ -146,10 +150,17 @@ def authorize_page(
     combiner path a proxy exposes)."""
     name = html.escape(pending.server)
     seconds = max(0, math.floor(pending.expires_at - time.monotonic()))
+    # Locked (no session yet): only what the bare link already says — the
+    # account, scopes, requesters and provider wait for the sign-in.
     account = (
         f'<p class="account">Sign in as <strong>{html.escape(pending.login_hint)}</strong></p>'
-        if pending.login_hint
+        if pending.login_hint and not needs_sign_in
         else ""
+    )
+    details = (
+        '<p class="meta">Sign in to see what is being requested.</p>'
+        if needs_sign_in
+        else _details(pending)
     )
     why = (
         f"Your saved sign-in for <strong>{name}</strong> has expired or was revoked, so the "
@@ -179,7 +190,7 @@ def authorize_page(
         f"<h1>Authorize <code>{name}</code></h1>"
         f"<p>{why} You'll sign in with the service and approve access; then you're sent "
         "back here.</p>"
-        f"{account}{_details(pending)}{way_on}"
+        f"{account}{details}{way_on}"
         f'<p class="meta" id="left" data-seconds="{seconds}">'
         f"This link expires in {_duration(seconds)}.</p>"
     )
@@ -308,3 +319,14 @@ def _scope_label(scope: str) -> str:
     if scope.startswith("https://www.googleapis.com/auth/"):
         return scope.removeprefix("https://www.googleapis.com/auth/")
     return scope
+
+
+def logout_page() -> HTMLResponse:
+    """Sign out is a POST (a cross-site GET can't do it): this is its button."""
+    body = (
+        "<h1>Sign out</h1>"
+        "<p>Sign this browser out of the combiner's widgets and authorization pages.</p>"
+        '<form method="post" action="/auth/logout">'
+        '<button class="button" type="submit">Sign out</button></form>'
+    )
+    return _page("Sign out", body)

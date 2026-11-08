@@ -438,6 +438,11 @@ def create_app(options: ServeOptions | None = None) -> Starlette:
         key_path = combiner_config.oauth.token_dir_path.parent / "web-auth.key"
         RUNTIME.web_signer = Signer.load_or_create(key_path)
         register_login_routes(combiner)
+        if combiner_config.web_auth.exempt_local:
+            from mcp_combiner.webauth import start_local_refresh
+
+            # "This machine" off the request path: now, then every minute.
+            start_local_refresh()
     app = combiner.http_app(
         path="/mcp",
         stateless_http=False,

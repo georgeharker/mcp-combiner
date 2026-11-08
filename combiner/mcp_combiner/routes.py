@@ -87,14 +87,15 @@ def register_routes(
             if redirect is not None:
                 return redirect
             if request.method == "POST":
-                problem = await webgate.check_password(request)
-                if problem is None:
+                refusal = await webgate.check_password(request)
+                if refusal is None:
                     response = RedirectResponse(request.url.path, status_code=303)
                     webgate.set_session_cookie(response, request)
                     return response
-                status = 429 if problem.startswith("Too many") else 401
-                page = authpages.authorize_page(pending, needs_sign_in=True, sign_in_error=problem)
-                page.status_code = status
+                page = authpages.authorize_page(
+                    pending, needs_sign_in=True, sign_in_error=refusal.message
+                )
+                page.status_code = refusal.status
                 return page
             page = authpages.authorize_page(pending, needs_sign_in=True)
             page.status_code = 401

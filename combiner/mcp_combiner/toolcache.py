@@ -483,10 +483,22 @@ async def prime_server_tools(
 
 
 async def _record_resources(name: str, providers: list[Any]) -> None:
-    """The prime's resource-set step (notifications.record_resource_set)."""
+    """The prime's resource-set step (notifications.record_resource_set),
+    bounded like a tools/list attempt: a hung resources/list must not hold the
+    server back from READY (enable/restart await the prime)."""
     from mcp_combiner.notifications import record_resource_set
 
-    await record_resource_set(name, providers)
+    try:
+        await asyncio.wait_for(
+            record_resource_set(name, providers), timeout=_LOCAL_TOOLS_READY_ATTEMPT
+        )
+    except TimeoutError:
+        logger.warning(
+            "prime: '%s' resources/list did not answer within %.0fs — resource "
+            "set unchanged, no notification",
+            name,
+            _LOCAL_TOOLS_READY_ATTEMPT,
+        )
 
 
 def spawn_prime(combiner: FastMCP, name: str) -> asyncio.Task[PrimeOutcome]:

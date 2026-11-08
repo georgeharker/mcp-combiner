@@ -11,7 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field
 
@@ -929,21 +929,50 @@ class WebAuthConfig(BaseModel):
     tickets: bool = True
     #: requests from this machine's own addresses skip the login.
     exempt_local: bool = True
+    #: how many times one ticket may be redeemed (a link previewer may use one).
+    ticket_uses: int = 1
+
+    #: Security settings: a typo or a wrong type must fail the load, never
+    #: quietly fall back to a weaker default.
+    KEYS: ClassVar[frozenset[str]] = frozenset(
+        {"mode", "password_hash", "session_days", "tickets", "exempt_local", "ticket_uses"}
+    )
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> WebAuthConfig:
+        unknown = sorted(set(data) - cls.KEYS)
+        if unknown:
+            raise ValueError(
+                f"web_auth: unknown setting(s) {', '.join(unknown)}; "
+                f"known: {', '.join(sorted(cls.KEYS))}"
+            )
         mode = data.get("mode", "off")
         if mode not in ("off", "password"):
             raise ValueError(f"web_auth.mode must be 'off' or 'password'; got {mode!r}")
+        for flag in ("tickets", "exempt_local"):
+            if flag in data and not isinstance(data[flag], bool):
+                raise ValueError(f"web_auth.{flag} must be true or false; got {data[flag]!r}")
+        session_days = data.get("session_days", 30.0)
+        if isinstance(session_days, bool) or not isinstance(session_days, (int, float)):
+            raise ValueError(f"web_auth.session_days must be a number; got {session_days!r}")
+        if session_days <= 0:
+            raise ValueError("web_auth.session_days must be positive")
+        ticket_uses = data.get("ticket_uses", 1)
+        if isinstance(ticket_uses, bool) or not isinstance(ticket_uses, int) or ticket_uses < 1:
+            raise ValueError(
+                f"web_auth.ticket_uses must be a whole number >= 1; got {ticket_uses!r}"
+            )
         password_hash = os.environ.get(WEB_PASSWORD_HASH_ENV) or data.get("password_hash")
-        raw_password = os.environ.get(WEB_PASSWORD_ENV)
-        if mode == "password" and not password_hash and raw_password:
-            # Hashed here with a fresh salt each load: the vault stays the only
-            # source of the password, and sessions don't depend on it (they're
-            # signed with web-auth.key), so a restart signs nobody out.
-            from mcp_combiner.webauth import hash_password
+        if password_hash is not None and not isinstance(password_hash, str):
+            raise ValueError("web_auth.password_hash must be a string")
+        if mode == "password" and not password_hash:
+            # The raw password (MCP_COMBINER_WEB_PASSWORD), hashed with a fresh
+            # salt: the vault stays the only source of the password, and
+            # sessions don't depend on it (they're signed with web-auth.key),
+            # so a restart signs nobody out.
+            from mcp_combiner.webauth import env_password_hash
 
-            password_hash = hash_password(raw_password)
+            password_hash = env_password_hash()
         if mode == "password" and not (
             isinstance(password_hash, str) and password_hash.startswith("scrypt$")
         ):
@@ -955,9 +984,10 @@ class WebAuthConfig(BaseModel):
         return cls(
             mode=mode,
             password_hash=password_hash,
-            session_days=float(data.get("session_days", 30.0)),
-            tickets=bool(data.get("tickets", True)),
-            exempt_local=bool(data.get("exempt_local", True)),
+            session_days=float(session_days),
+            tickets=data.get("tickets", True),
+            exempt_local=data.get("exempt_local", True),
+            ticket_uses=ticket_uses,
         )
 
 
@@ -1124,7 +1154,11 @@ class CombinerConfig(BaseModel):
 
         bind = BindConfig(**raw["bind"]) if isinstance(raw.get("bind"), dict) else BindConfig()
         raw_web_auth = raw.get("web_auth")
-        web_auth = WebAuthConfig.from_dict(raw_web_auth if isinstance(raw_web_auth, dict) else {})
+        if raw_web_auth is not None and not isinstance(raw_web_auth, dict):
+            raise ValueError(
+                f'web_auth must be an object, e.g. {{"mode": "password"}}; got {raw_web_auth!r}'
+            )
+        web_auth = WebAuthConfig.from_dict(raw_web_auth or {})
 
         return cls(
             servers=servers,
@@ -1270,7 +1304,15 @@ def _interpolate(value: str) -> str:
 
 def interpolate_value(value: str) -> str:
     """Public env interpolation for auth fields (oauth client_id/secret,
-    bearer tokens read at auth-build time — see auth.build_auth)."""
+    bearer tokens read at auth-build time — see auth.build_auth).
+
+    An unset variable without a default still becomes ``""`` (as elsewhere),
+    but is logged: an empty secret otherwise fails much later, obscurely.
+    """
+    for match in re.finditer(r"\$\{([^}]+)\}", value):
+        inner = match.group(1).removeprefix("env:")
+        if ":-" not in inner and inner not in os.environ:
+            logger.warning("auth setting refers to ${%s}, which is not set", inner)
     return _interpolate(value)
 
 

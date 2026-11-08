@@ -12,30 +12,39 @@ tagged `vX.Y.Z`.
   registration and chat-token binding) now requires it, like `/sessions*` and
   `/handover*`. It was reachable without the token, so anyone who could reach
   the combiner's address (e.g. its tailnet bind) could re-route a chat's
-  `neovim_*` tools. The Neovim plugin already sends the bearer on these calls.
-  `/health` stays open.
+  `neovim_*` tools. The Neovim plugin sends the bearer when it knows it
+  (`combiner.auth_token` or `MCP_COMBINER_AUTH_TOKEN` in Neovim's
+  environment); a combiner given only `--auth-token-file` will now refuse
+  Neovim's binds until Neovim has the token too. `/health` stays open.
 
 ### Added
 
-- **Web login for widget pages and the relay (`web_auth`)**: optional password
-  login (`mode: password`, scrypt hash from `mcp-combiner hash-password`) for
-  `/ui/*` and the widget relay. A 30-day signed, HTTP-only session cookie
-  (`session_days`); widget URLs handed to bearer-authenticated MCP clients
-  carry a short-lived ticket that logs the browser in without a prompt;
-  requests from this machine's own addresses are exempt; rate-limited login
-  page in the authorization-page style; the OAuth callback and `/health` stay open.
-  The password can instead come raw from `MCP_COMBINER_WEB_PASSWORD` (e.g. a
-  1Password `op run` reference), hashed in memory at startup; a configured hash
-  wins if both are set.
-- **OAuth authorization page says more, and is gated by `web_auth`**: the
-  short link's page now shows why authorization is needed (first sign-in or an
-  expired/revoked one), the provider host, the requested scopes, which client
-  and chat asked, and when. With `web_auth` on, the page and `?go=1` need a
-  session: links handed to clients carry a ticket, this machine is exempt, and
-  anyone else signs in with a password form on the page itself (so it works
-  behind a proxy that exposes only `/oauth`).
-- Uvicorn's proxy headers are set explicitly (`X-Forwarded-For` trusted from
-  loopback only), on both the main port and the relay.
+- **Web login (`web_auth`)** for the widget pages (`/ui/*`), the widget relay
+  and the OAuth authorization page. Off by default; `"web_auth": {"mode":
+  "password"}` turns it on.
+  - The password comes from `MCP_COMBINER_WEB_PASSWORD` (e.g. a 1Password
+    `op run` reference), hashed in memory at startup and removed from the
+    environment so child processes don't inherit it; or a scrypt hash in
+    `web_auth.password_hash` / `MCP_COMBINER_WEB_PASSWORD_HASH`
+    (`mcp-combiner hash-password` prints one), which wins if both are set.
+  - Signing in sets a 30-day (`session_days`) HTTP-only, SameSite=Lax cookie,
+    Secure under https, signed with `web-auth.key` beside the OAuth tokens.
+    The key is created owner-only and atomically; an existing key that others
+    can read, that another user owns, or that is a symlink is refused.
+  - Links handed to MCP clients (widget URLs, the authorization link) carry a
+    ticket: valid 5 minutes for `ticket_uses` openings (default 1), it signs
+    the browser in and redirects to the clean URL. `tickets: false` turns them
+    off.
+  - Requests from this machine's own addresses are exempt (`exempt_local`).
+    The address list is refreshed every minute in the background; until the
+    first refresh only loopback counts.
+  - Guessing is limited: 5 failures a minute per address and 30 across all
+    addresses, counted before the password check finishes; checks run off the
+    event loop, two at a time.
+  - Login and sign-out pages (`/auth/login`, `/auth/logout`; sign-out is a
+    POST). The OAuth callback and `/health` stay open.
+  - Settings are validated strictly: unknown keys, wrong types, or a
+    non-object `web_auth` fail the load.
 - **`combiner__authorize_server(server_name)`** — an always-mounted meta tool
   that starts OAuth authorization for any configured OAuth upstream (never
   authorized, revoked, link expired) and fails with the authorization link:
@@ -46,46 +55,58 @@ tagged `vX.Y.Z`.
   in. Unknown servers, non-OAuth servers, disabled servers and browser-only
   (`prompt: browser`) servers get an explanatory tool error; a connected server
   answers that it is.
+- **OAuth authorization pages** (`mcp_combiner/authpages.py`): the short link
+  `/oauth/authorize/<id>` shows a page naming the server, why it needs
+  authorizing (first sign-in, or an expired/revoked one), the provider host,
+  the requested scopes, which client and chat asked and when, the expected
+  account, and a live countdown to the link's expiry. The expired/used link,
+  authorized and failed pages share the style. Self-contained (inline CSS and
+  SVG), phone-sized, light and dark, served `no-store`, unframeable, with a
+  CSP whose scripts run only by per-response nonce.
+- **`auth.oauth.login_hint`** (per server, `${VAR}` allowed): the account to
+  sign in with. Sent to the provider as `login_hint` (Google and most OpenID
+  providers pre-select it) and shown on the authorization page, in the
+  `-32042` message and in the text fallback.
+- The "authorized" page names the account that signed in, when the provider
+  says (an `id_token` `email`), and warns if it isn't the `login_hint`.
+  Display only: the id_token isn't relied on for anything else.
 - `${VAR}` interpolation in a server's auth settings: OAuth `client_id`,
   `client_secret` and `client_metadata_url`, and bearer tokens, resolved when
-  the auth is built (as elsewhere in servers.json) — so secrets can come from
-  the environment, e.g. a container's injected env.
-- **Proper authorization pages** (`mcp_combiner/authpages.py`): the short link
-  `/oauth/authorize/<id>` shows a page — combiner logo, the server's name, what
-  happens next, an Authorize button on to the provider, and a live countdown to
-  the link's expiry (it disables itself when the link lapses) — instead of
-  redirecting at once (`?go=1` keeps the direct redirect). The expired/used
-  link, authorized, and failed pages get the same treatment. Self-contained
-  (inline CSS and SVG, no external fetches), phone-sized, light and dark,
-  served `no-store` with a strict CSP and no framing.
-- **`auth.oauth.login_hint`** (per server): the account to sign in with. Sent to
-  the provider as `login_hint` (Google and most OpenID providers pre-select it)
-  and shown on the authorization page ("Sign in as …"), in the `-32042`
-  message and in the text fallback — so two servers sharing one Google client
-  (e.g. two Workspace accounts) say which login each needs.
-- The "authorized" page names the account that signed in, when the provider
-  says (an `id_token` `email`, e.g. Google with the `openid`/`email` scopes),
-  and warns if it isn't the `login_hint`; otherwise it shows the requested
-  account. Display only: the id_token isn't relied on for anything else.
-- With `oauth.public_url` set, the `-32042` URL elicitation hands clients the
-  combiner's short link, so the user lands on that page first; without it, the
-  provider URL as before.
-- `open_widget`: its description now leads with the one argument it needs and
-  an example (`{"uri": "ui://svg-mcp/widget"}`), and a call without `uri`
-  answers with the widgets actually available and an example call, instead
-  of a validation error. Models were calling it with no arguments.
+  the auth is built — so secrets can come from the environment. An unset
+  variable without a default is logged.
 - **Resource changes from server lifecycle** publish
   `notifications/resources/list_changed` (handshake clients and 2026 listen
-  streams). A server's resources appear and vanish as it comes up, is enabled,
-  restarted, reconnected or authorized, or is disabled or removed, and no
-  upstream says so; each tools prime now also records the server's resource
-  and template URIs and notifies only when that set changed (as the tools
-  slice does), and an unmount notifies if the server had any. Upstream-sent
-  `resources/list_changed` / `resources/updated` were already forwarded.
-- Mock server: notifications sent between requests go through each client's
-  `Connection` (the per-request `ServerSession` can't reach them in mcp 2).
+  streams): a server's resources appear and vanish as it comes up, is enabled,
+  restarted, reconnected or authorized, or is disabled or removed. Each tools
+  prime records the server's resource and template URIs and notifies only
+  when that set changed; an unmount notifies if the server had any.
+- `--ssl-certfile` / `--ssl-keyfile` serve the combiner over TLS; the widget
+  relay uses the same certificate.
+
+### Changed
+
+- The short authorization link now opens a page with an Authorize button
+  instead of redirecting straight to the provider; `?go=1` keeps the direct
+  redirect for scripts.
+- With `oauth.public_url` set, the `-32042` URL elicitation hands clients the
+  combiner's short link rather than the provider URL.
+- `open_widget`'s `uri` is optional (a schema change): a call without it
+  answers with the widgets actually available and an example call. Its
+  description leads with the one argument it needs. Models were calling it
+  with no arguments.
+- A tools prime bounds the server's resources/list like a tools/list attempt
+  (5 s): a server whose resource listing hangs still becomes ready.
+- Uvicorn's proxy headers are set explicitly on the main port and the relay
+  (`X-Forwarded-For` trusted from loopback only).
+
+### Fixed
+
 - A URL-elicitation error raised inside a tool now reaches the client as
   `-32042` (fastmcp masks MCP errors raised by tools into tool errors).
+- A malformed (non-ASCII) authorization link id gets the "gone" page instead
+  of a server error.
+- Mock server: notifications sent between requests go through each client's
+  `Connection` (the per-request `ServerSession` can't reach them in mcp 2).
 
 ## [0.21.4] — 2026-11-05
 

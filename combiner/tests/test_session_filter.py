@@ -9,6 +9,7 @@ Tests the following combiner features:
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ import mcp.types as mt
 import pytest
 from fakes import ScriptedProvider
 from fastmcp import FastMCP
+from fastmcp.resources import Resource
 from fastmcp.server.middleware import MiddlewareContext
 from fastmcp.tools import Tool
 from fastmcp.tools.function_tool import FunctionTool
@@ -565,6 +567,14 @@ class TestStaleServerTools:
 # ── stdio/sharedserver started → ready lifecycle ───────────────────
 
 
+class _HungResourcesProvider(ScriptedProvider):
+    """Lists tools, but its resources/list never answers."""
+
+    async def _list_resources(self) -> Sequence[Resource]:
+        await asyncio.Event().wait()
+        return []
+
+
 class TestLocalToolsReady:
     """`prime_server_tools`: the started → ready transition attempt — invoke
     tools/list on the server's mounted provider and record the outcome in the
@@ -623,6 +633,33 @@ class TestLocalToolsReady:
             assert calls == [1]  # broadcast exactly once, after the list returned
         finally:
             self._cleanup("beta")
+
+    async def test_a_hung_resources_list_does_not_hold_back_ready(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The prime's resource step is bounded like a tools/list attempt: an
+        upstream that never answers resources/list still comes up READY."""
+        import asyncio
+
+        import mcp_combiner.server as srv
+        import mcp_combiner.toolcache as toolcache_mod
+        from mcp_combiner import mounts
+
+        monkeypatch.setattr(toolcache_mod, "invalidate_tool_cache", lambda: None)
+        monkeypatch.setattr(toolcache_mod, "_LOCAL_TOOLS_READY_ATTEMPT", 0.2)
+
+        async def list_tools() -> Sequence[Tool]:
+            return [TestStaleServerTools._tool("hung_one")]
+
+        combiner: FastMCP[Any] = FastMCP("prime-test")
+        mounts._registry(combiner)["hung"] = [_HungResourcesProvider(list_tools)]
+        try:
+            ok = await asyncio.wait_for(
+                srv.prime_server_tools(combiner, "hung", timeout=10.0, interval=0.0), timeout=5.0
+            )
+            assert ok is PrimeOutcome.READY
+        finally:
+            self._cleanup("hung")
 
     async def test_prime_timeout_no_store_no_invalidate(
         self, monkeypatch: pytest.MonkeyPatch

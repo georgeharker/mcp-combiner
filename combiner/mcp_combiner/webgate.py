@@ -9,8 +9,10 @@ and other requests get 401.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, urlencode
 
@@ -46,13 +48,6 @@ def client_address(request: Request) -> str | None:
     return request.client.host if request.client else None
 
 
-def enabled() -> bool:
-    config = RUNTIME.config
-    return (
-        config is not None and RUNTIME.web_signer is not None and config.web_auth.mode == "password"
-    )
-
-
 def admitted(request: Request) -> bool:
     """Off, from this machine, or signed in (a valid session cookie)."""
     config = RUNTIME.config
@@ -74,6 +69,11 @@ def ticket_redirect(request: Request, subject: str | None) -> Response | None:
     claims = signer.verify(ticket, "t")
     if claims is None or claims.get("sub") != subject:
         return None
+    config = RUNTIME.config
+    uses = config.web_auth.ticket_uses if config is not None else 1
+    if not webauth.TICKETS.redeem(claims, uses):
+        logger.info("web_auth: a used-up ticket was presented for %s", request.url.path)
+        return None
     query = [(k, v) for k, v in request.query_params.multi_items() if k != webauth.TICKET_PARAM]
     clean = request.url.path + (f"?{urlencode(query)}" if query else "")
     response = RedirectResponse(clean, status_code=303)
@@ -81,19 +81,44 @@ def ticket_redirect(request: Request, subject: str | None) -> Response | None:
     return response
 
 
-async def check_password(request: Request) -> str | None:
-    """Check a posted login form. ``None`` on success, else the problem to show."""
+@dataclass(frozen=True)
+class Refusal:
+    """Why a posted password was refused, and the status to answer with."""
+
+    message: str
+    status: int
+
+
+TOO_MANY = Refusal("Too many attempts — wait a minute and try again.", 429)
+WRONG = Refusal("That password isn't right.", 401)
+
+#: scrypt is ~30 ms of CPU and 16 MB: run it off the event loop, two at a time.
+_VERIFY_SLOTS = asyncio.Semaphore(2)
+
+
+async def check_password(request: Request) -> Refusal | None:
+    """Check a posted login form. ``None`` on success.
+
+    The attempt is reserved with the rate limiter BEFORE anything is awaited,
+    so concurrent guesses count at once (webauth.LoginLimiter).
+    """
     config = RUNTIME.config
     client = client_address(request) or "?"
-    if webauth.too_many_failures(client):
-        return "Too many attempts — wait a minute and try again."
-    form = await request.form()
-    password = form.get("password")
-    stored = config.web_auth.password_hash if config is not None else None
-    if not isinstance(password, str) or not webauth.verify_password(password, stored or ""):
-        webauth.record_failure(client)
+    if not webauth.LIMITER.begin(client):
+        return TOO_MANY
+    ok = False
+    try:
+        form = await request.form()
+        password = form.get("password")
+        stored = config.web_auth.password_hash if config is not None else None
+        if isinstance(password, str) and stored:
+            async with _VERIFY_SLOTS:
+                ok = await asyncio.to_thread(webauth.verify_password, password, stored)
+    finally:
+        webauth.LIMITER.end(client, failed=not ok)
+    if not ok:
         logger.warning("web_auth: failed login from %s", client)
-        return "That password isn't right."
+        return WRONG
     return None
 
 
@@ -164,17 +189,20 @@ def register_login_routes(combiner: FastMCP) -> None:
         target = _safe_next(request.query_params.get("next"))
         if request.method == "GET":
             return authpages.login_page(target)
-        problem = await check_password(request)
-        if problem is not None:
-            status = 429 if problem.startswith("Too many") else 401
-            return authpages.login_page(target, error=problem, status=status)
+        refusal = await check_password(request)
+        if refusal is not None:
+            return authpages.login_page(target, error=refusal.message, status=refusal.status)
         form = await request.form()
         response = RedirectResponse(_safe_next(str(form.get("next") or target)), status_code=303)
         set_session_cookie(response, request)
         return response
 
+    # POST only (a GET shows the button): another site can't sign you out by
+    # embedding the URL.
     @combiner.custom_route(webauth.LOGOUT_PATH, methods=["GET", "POST"])
     async def logout(request: Request) -> Response:
+        if request.method == "GET":
+            return authpages.logout_page()
         response = RedirectResponse(webauth.LOGIN_PATH, status_code=303)
         response.delete_cookie(webauth.COOKIE, path="/")
         return response

@@ -85,6 +85,12 @@ def tailnet_info() -> tuple[str | None, str | None]:
         return _info
 
 
+def fresh_tailnet_ip() -> str | None:
+    """The tailnet IPv4 asked for now, not the per-process cached one (web_auth
+    refreshes "this machine" periodically). ``None`` without tailscale."""
+    return _tailscale_status()[1] or _tailscale_ip()
+
+
 def prefetch_tailnet_info() -> None:
     """Start the lookup in the background, so it overlaps process startup.
     Nothing to start without a ``tailscale`` CLI: the fallback scan is cheap

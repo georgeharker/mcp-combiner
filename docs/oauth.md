@@ -79,8 +79,9 @@ account (`login_hint`), with an expiry countdown. `?go=1` skips the page.
 
 With `web_auth` on (README, "Web login"), the page is gated too: a leaked link
 mustn't let someone else bind *their* account to your combiner. Links handed to
-clients carry a short-lived ticket (no prompt); this machine is exempt; anyone
-else gets a password form on the page itself, posting back to it — because a
+clients carry a short-lived ticket (no prompt; `web_auth.ticket_uses` openings);
+this machine is exempt; anyone else gets a password form on the page itself,
+showing only the server name until they sign in, and posting back to it — because a
 proxy such as `tailscale serve --set-path /oauth` may expose nothing else. The
 callback stays open; its `state` binds it to the pending authorization.
 

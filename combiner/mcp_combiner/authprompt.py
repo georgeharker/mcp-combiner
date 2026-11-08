@@ -128,8 +128,10 @@ def set_on_authorized(hook: Callable[[str], Awaitable[None]] | None) -> None:
 
 def pending_by_elicitation(elicitation_id: str) -> PendingAuthorization | None:
     """The live pending authorization with *elicitation_id* (the short link's key)."""
+    # Bytes: compare_digest refuses non-ASCII str (a junk link would 500).
+    wanted = elicitation_id.encode()
     for pending in list(_pending.values()):
-        if secrets.compare_digest(pending.elicitation_id, elicitation_id):
+        if secrets.compare_digest(pending.elicitation_id.encode(), wanted):
             return pending_for(pending.server)
     return None
 
