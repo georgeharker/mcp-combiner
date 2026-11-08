@@ -20,6 +20,7 @@ Layout mirrors the state's two concerns:
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 import weakref
 from contextvars import ContextVar
@@ -409,6 +410,8 @@ class CombinerRuntime:
     # Unique per-process id surfaced via /health; a change signals a combiner
     # restart so clients re-register instances and token bindings.
     boot_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    #: wall-clock start, for the /status page's uptime.
+    started_at: float = field(default_factory=time.time)
     # What the last boot's handover restored (or why it was refused) — the LLM's
     # post-restart re-orientation receipt, surfaced by /health and combiner__status.
     handover_recovery: dict[str, Any] | None = None

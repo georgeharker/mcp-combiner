@@ -263,6 +263,11 @@ TICKETS = TicketLedger()
 #: lock on the request path; replaced whole by :func:`refresh_local_addresses`
 #: off it. Empty until the first refresh: only loopback counts as local then.
 _local: frozenset[str] = frozenset()
+#: Names that mean this machine in a ``Host`` header besides ``localhost`` and
+#: its addresses: the tailnet MagicDNS name (refreshed) and configured ones
+#: (oauth.public_url, the widget origin — :func:`set_local_names`).
+_local_names: frozenset[str] = frozenset()
+_configured_names: frozenset[str] = frozenset()
 _refresh_stop = threading.Event()
 _REFRESH_INTERVAL_S = 60.0
 
@@ -274,15 +279,24 @@ def local_addresses() -> frozenset[str]:
 def refresh_local_addresses() -> frozenset[str]:
     """Look the addresses up now (blocking: runs ``ifconfig``/``ip`` and
     ``tailscale``) and publish them."""
-    global _local
+    global _local, _local_names
     found = set(_interface_addresses())
-    from mcp_combiner.tailnet import fresh_tailnet_ip
+    from mcp_combiner.tailnet import fresh_tailnet_info
 
-    ip = fresh_tailnet_ip()
+    name, ip = fresh_tailnet_info()
     if ip:
         found.add(ip)
     _local = frozenset(_canonical(a) for a in found)
+    _local_names = _configured_names | ({name.lower().rstrip(".")} if name else set())
     return _local
+
+
+def set_local_names(names: set[str]) -> None:
+    """Host names that are this machine (``oauth.public_url``'s host, the
+    widget origin's host). Kept across refreshes."""
+    global _configured_names, _local_names
+    _configured_names = frozenset(n.lower().rstrip(".") for n in names if n)
+    _local_names = _local_names | _configured_names
 
 
 def start_local_refresh(interval_s: float = _REFRESH_INTERVAL_S) -> None:
@@ -307,8 +321,10 @@ def stop_local_refresh() -> None:
 
 
 def reset_local_addresses() -> None:
-    global _local
+    global _local, _local_names, _configured_names
     _local = frozenset()
+    _local_names = frozenset()
+    _configured_names = frozenset()
 
 
 def is_local(client_host: str | None) -> bool:
@@ -321,6 +337,38 @@ def is_local(client_host: str | None) -> bool:
     except ValueError:
         return False
     return canonical in _local
+
+
+def is_local_host(host_header: str | None) -> bool:
+    """Whether a ``Host`` header names this machine.
+
+    The other half of "this machine": a page that rebinds its own domain to
+    127.0.0.1 connects from loopback, but its requests still say
+    ``Host: attacker.example`` — they must not inherit the exemption.
+    """
+    hostname = host_name(host_header)
+    if hostname is None:
+        return False
+    if hostname == "localhost":
+        return True
+    try:
+        ip = ipaddress.ip_address(_canonical(hostname))
+    except ValueError:
+        return hostname in _local_names
+    return ip.is_loopback or str(ip) in _local
+
+
+def host_name(host_header: str | None) -> str | None:
+    """The host part of a ``Host`` header, lower-cased (``[::1]:9741`` → ``::1``)."""
+    if not host_header:
+        return None
+    host = host_header.strip().lower()
+    if host.startswith("["):
+        end = host.find("]")
+        return host[1:end] if end > 0 else None
+    if host.count(":") == 1:
+        host = host.split(":", 1)[0]
+    return host.rstrip(".") or None
 
 
 def _canonical(address: str) -> str:

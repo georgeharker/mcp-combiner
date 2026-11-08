@@ -154,7 +154,7 @@ class TestLimiter:
 class TestThisMachine:
     def test_loopback_and_own_addresses(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(webauth, "_interface_addresses", lambda: {"192.168.1.20"})
-        monkeypatch.setattr("mcp_combiner.tailnet.fresh_tailnet_ip", lambda: "100.66.1.2")
+        monkeypatch.setattr("mcp_combiner.tailnet.fresh_tailnet_info", lambda: (None, "100.66.1.2"))
         webauth.reset_local_addresses()
         try:
             # Before the first refresh only loopback counts (fail closed).
@@ -168,6 +168,41 @@ class TestThisMachine:
             monkeypatch.setattr(webauth, "_interface_addresses", lambda: {"10.1.1.1"})
             webauth.refresh_local_addresses()
             assert webauth.is_local("10.1.1.1") and not webauth.is_local("192.168.1.20")
+        finally:
+            webauth.reset_local_addresses()
+
+    def test_the_host_header_must_name_this_machine(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(webauth, "_interface_addresses", lambda: {"192.168.1.20"})
+        monkeypatch.setattr(
+            "mcp_combiner.tailnet.fresh_tailnet_info", lambda: ("box.tail.ts.net.", "100.66.1.2")
+        )
+        webauth.reset_local_addresses()
+        try:
+            webauth.set_local_names({"combiner.example.com"})
+            webauth.refresh_local_addresses()
+            mine: tuple[str, ...] = (
+                "localhost:9741",
+                "127.0.0.1:9741",
+                "[::1]:9741",
+                "192.168.1.20:9741",
+                "100.66.1.2",
+                "Box.Tail.TS.net:9741",
+                "combiner.example.com",
+            )
+            strangers: tuple[str | None, ...] = (
+                "attacker.example:9741",
+                "evil.localhost.example",
+                "10.9.9.9",
+                "",
+                None,
+            )
+            assert [h for h in mine if not webauth.is_local_host(h)] == []
+            assert [h for h in strangers if webauth.is_local_host(h)] == []
+            # Names configured after a refresh count at once, and survive the next one.
+            webauth.set_local_names({"later.example"})
+            assert webauth.is_local_host("later.example:443")
+            webauth.refresh_local_addresses()
+            assert webauth.is_local_host("later.example")
         finally:
             webauth.reset_local_addresses()
 
@@ -227,6 +262,35 @@ def test_bad_settings_fail_the_load(tmp_path: Path, web_auth: object, message: s
     path.write_text(json.dumps({"servers": {}, "web_auth": web_auth}))
     with pytest.raises(ValueError, match=message):
         CombinerConfig.load(str(path))
+
+
+class TestStatusPage:
+    @staticmethod
+    def _page(*, signed_in: bool = False) -> str:
+        from mcp_combiner import authpages
+
+        rows = [
+            authpages.StatusRow("github", "ready", tools=42),
+            authpages.StatusRow("gws", "auth_failed", authorize_path="/oauth/authorize/abc"),
+            authpages.StatusRow("<b>odd</b>", "unreachable"),
+            authpages.StatusRow("playwright", "disabled"),
+        ]
+        page = authpages.status_page(rows, version="0.22.1", uptime_s=7500.0, signed_in=signed_in)
+        return bytes(page.body).decode()
+
+    def test_states_counts_and_links(self) -> None:
+        page = self._page()
+        assert "1 of 3 servers up" in page  # disabled servers aren't counted
+        assert "Version 0.22.1 · up 2 h 5 min" in page
+        assert '<span class="dot ok"></span><span class="name">github</span>' in page
+        assert "ready · 42 tools" in page
+        assert '<a href="/oauth/authorize/abc">Authorize</a>' in page
+        assert '<span class="dot bad"></span>' in page and '<span class="dot off"></span>' in page
+        assert "<b>odd</b>" not in page and "&lt;b&gt;odd&lt;/b&gt;" in page
+        # disabled servers sort last
+        assert page.index("playwright") > page.index("odd")
+        assert "Sign out" not in page
+        assert "Sign out" in self._page(signed_in=True)
 
 
 def test_the_relay_gets_the_same_tls(tmp_path: Path) -> None:
@@ -295,6 +359,26 @@ async def _combiner(procs: ProcFactory, tmp_path: Path, *, exempt_local: bool) -
     combiner = await procs.start_combiner(config)
     await combiner.wait_server_state("mockup", ("ready",))
     return combiner
+
+
+async def _combiner_without_web_auth(procs: ProcFactory, tmp_path: Path) -> CombinerHandle:
+    mock = await procs.start_http_mock("mockup")
+    config = tmp_path / "servers.json"
+    config.write_text(
+        json.dumps(
+            {
+                "servers": {"mockup": http_mock_entry(mock.port)},
+                "oauth": {"token_dir": str(tmp_path / "tokens")},
+            }
+        )
+    )
+    combiner = await procs.start_combiner(config)
+    await combiner.wait_server_state("mockup", ("ready",))
+    return combiner
+
+
+REBOUND = {"host": "attacker.example:9741"}
+PROXIED = {"x-forwarded-for": "100.64.9.9"}
 
 
 def _widget_page(combiner: CombinerHandle, token: str) -> str:
@@ -456,8 +540,67 @@ class TestLogin:
             gone = await http.get(f"{combiner.base_url}/oauth/authorize/{'0' * 32}", headers=HTML)
             assert gone.status_code == 404 and "expired or was already used" in gone.text
 
+    async def test_a_rebinding_page_is_not_this_machine(
+        self, procs: ProcFactory, tmp_path: Path
+    ) -> None:
+        """Loopback, but Host names a stranger's domain: a DNS-rebinding page."""
+        combiner = await _combiner(procs, tmp_path, exempt_local=True)
+        async with httpx2.AsyncClient(timeout=10.0) as http:
+            r = await http.get(
+                _widget_page(combiner, "web-rebind-001"), headers={**HTML, **REBOUND}
+            )
+        assert r.status_code == 303 and r.headers["location"].startswith("/auth/login")
+
     async def test_this_machine_is_exempt(self, procs: ProcFactory, tmp_path: Path) -> None:
         combiner = await _combiner(procs, tmp_path, exempt_local=True)
         async with httpx2.AsyncClient(timeout=10.0) as http:
             r = await http.get(_widget_page(combiner, "web-local-0001"), headers=HTML)
         assert r.status_code == 200
+
+
+@pytest.mark.e2e
+class TestStatus:
+    async def test_without_web_auth_only_this_machine_sees_it(
+        self, procs: ProcFactory, tmp_path: Path
+    ) -> None:
+        combiner = await _combiner_without_web_auth(procs, tmp_path)
+        url = f"{combiner.base_url}/status"
+        async with httpx2.AsyncClient(timeout=10.0) as http:
+            page = await http.get(url)
+            assert page.status_code == 200
+            assert '<span class="name">mockup</span>' in page.text
+            assert "servers up" in page.text and "Sign out" not in page.text
+            assert page.headers["cache-control"] == "no-store"
+            assert (await http.get(url, headers=REBOUND)).status_code == 404
+            assert (await http.get(url, headers=PROXIED)).status_code == 404
+            assert (await http.post(url, data={"password": "x"})).status_code == 404
+
+    async def test_with_web_auth_sign_in_on_the_page(
+        self, procs: ProcFactory, tmp_path: Path
+    ) -> None:
+        combiner = await _combiner(procs, tmp_path, exempt_local=False)
+        url = f"{combiner.base_url}/status"
+        async with httpx2.AsyncClient(timeout=10.0) as http:
+            locked = await http.get(url)
+            assert locked.status_code == 401 and 'type="password"' in locked.text
+            assert "mockup" not in locked.text
+            wrong = await http.post(url, data={"action": "sign-in", "password": "no"})
+            assert wrong.status_code == 401 and "That password isn" in wrong.text
+            right = await http.post(url, data={"action": "sign-in", "password": PASSWORD})
+            assert right.status_code == 303 and webauth.COOKIE in right.headers["set-cookie"]
+            page = await http.get(url)
+            assert page.status_code == 200 and "mockup" in page.text and "Sign out" in page.text
+            out = await http.post(url, data={"action": "sign-out"})
+            assert out.status_code == 303
+            assert (await http.get(url)).status_code == 401
+
+    async def test_with_web_auth_this_machine_is_exempt_but_not_strangers(
+        self, procs: ProcFactory, tmp_path: Path
+    ) -> None:
+        combiner = await _combiner(procs, tmp_path, exempt_local=True)
+        url = f"{combiner.base_url}/status"
+        async with httpx2.AsyncClient(timeout=10.0) as http:
+            mine = await http.get(url)
+            assert mine.status_code == 200 and "Sign out" not in mine.text
+            assert (await http.get(url, headers=REBOUND)).status_code == 401
+            assert (await http.get(url, headers=PROXIED)).status_code == 401

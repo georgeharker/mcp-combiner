@@ -48,15 +48,35 @@ def client_address(request: Request) -> str | None:
     return request.client.host if request.client else None
 
 
+def from_this_machine(request: Request) -> bool:
+    """Connected from one of this machine's addresses AND addressed to one of
+    its names (a DNS-rebinding page fails the second)."""
+    return webauth.is_local(client_address(request)) and webauth.is_local_host(
+        request.headers.get("host")
+    )
+
+
+def signed_in(request: Request) -> bool:
+    signer = RUNTIME.web_signer
+    token = request.cookies.get(webauth.COOKIE, "")
+    return signer is not None and signer.verify(token, "s") is not None
+
+
+def web_auth_on() -> bool:
+    config = RUNTIME.config
+    return (
+        config is not None and RUNTIME.web_signer is not None and config.web_auth.mode == "password"
+    )
+
+
 def admitted(request: Request) -> bool:
     """Off, from this machine, or signed in (a valid session cookie)."""
     config = RUNTIME.config
-    signer = RUNTIME.web_signer
-    if config is None or signer is None or config.web_auth.mode != "password":
+    if config is None or not web_auth_on():
         return True
-    if config.web_auth.exempt_local and webauth.is_local(client_address(request)):
+    if config.web_auth.exempt_local and from_this_machine(request):
         return True
-    return signer.verify(request.cookies.get(webauth.COOKIE, ""), "s") is not None
+    return signed_in(request)
 
 
 def ticket_redirect(request: Request, subject: str | None) -> Response | None:

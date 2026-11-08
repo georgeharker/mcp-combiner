@@ -19,6 +19,7 @@ import html
 import math
 import secrets
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlsplit
@@ -30,33 +31,38 @@ if TYPE_CHECKING:
 
 #: The combiner mark: several inputs converging on one hub, one output — what
 #: the combiner does with MCP servers. Inline, coloured by the page.
-LOGO = """<svg class="mark" viewBox="0 0 64 64" role="img" aria-label="mcp-combiner">
-  <rect x="2" y="2" width="60" height="60" rx="16" fill="var(--accent)"/>
-  <g stroke="var(--on-accent)" stroke-width="3.5" stroke-linecap="round" fill="none">
-    <path d="M15 18 C24 18 25 32 32 32"/>
-    <path d="M15 32 H32"/>
-    <path d="M15 46 C24 46 25 32 32 32"/>
-    <path d="M32 32 H49"/>
-  </g>
-  <g fill="var(--on-accent)">
-    <circle cx="15" cy="18" r="4"/><circle cx="15" cy="32" r="4"/>
-    <circle cx="15" cy="46" r="4"/><circle cx="49" cy="32" r="4.5"/>
-  </g>
-  <circle cx="32" cy="32" r="7" fill="var(--on-accent)"/>
-  <circle cx="32" cy="32" r="3.2" fill="var(--accent)"/>
+#: The hub of docs/assets/logo.svg (the full logo is too wide for a page header).
+LOGO = """<svg class="mark" viewBox="258 98 84 84" role="img" aria-label="mcp-combiner">
+  <defs>
+    <linearGradient id="hubGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3A3B47"/><stop offset="1" stop-color="#141519"/>
+    </linearGradient>
+    <linearGradient id="hubBezel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.55"/>
+      <stop offset="0.4" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <path d="M284,100 H316 A24,24 0 0 1 340,124 V156 A24,24 0 0 1 316,180 H284
+    A24,24 0 0 1 260,156 V124 A24,24 0 0 1 284,100 Z" fill="url(#hubGrad)"/>
+  <ellipse cx="300" cy="120" rx="32" ry="13" fill="#ffffff" opacity="0.10"/>
+  <path d="M284,100 H316 A24,24 0 0 1 340,124 V156 A24,24 0 0 1 316,180 H284
+    A24,24 0 0 1 260,156 V124 A24,24 0 0 1 284,100 Z" fill="none"
+    stroke="url(#hubBezel)" stroke-width="2"/>
+  <circle cx="300" cy="140" r="15" fill="none" stroke="#ffffff" stroke-width="3"/>
+  <circle cx="300" cy="140" r="5" fill="#ffffff"/>
 </svg>"""
 
 _STYLE = """
 :root {
   --bg: #f4f5f7; --card: #ffffff; --text: #1d2330; --muted: #5d6676;
-  --accent: #3b5bdb; --on-accent: #ffffff; --line: #e3e6ec;
-  --ok: #2b8a3e; --warn: #c2410c;
+  --accent: #8636c3; --on-accent: #ffffff; --line: #e3e6ec;
+  --ok: #2b8a3e; --warn: #c2410c; --bad: #c92a2a; --off: #adb5bd;
 }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #11141a; --card: #1b2029; --text: #e8ebf1; --muted: #9aa3b2;
-    --accent: #6b8cff; --on-accent: #0f1320; --line: #2b313c;
-    --ok: #51cf66; --warn: #ff922b;
+    --accent: #b77ff0; --on-accent: #170b24; --line: #2b313c;
+    --ok: #51cf66; --warn: #ff922b; --bad: #ff6b6b; --off: #5c6370;
   }
 }
 * { box-sizing: border-box; }
@@ -112,6 +118,22 @@ button.button { border: 0; cursor: pointer; font: inherit; font-weight: 650; }
 .status.ok { color: var(--ok); }
 .status.warn { color: var(--warn); }
 .dot { width: 10px; height: 10px; border-radius: 50%; background: currentColor; }
+.servers { list-style: none; margin: 16px 0 0; padding: 0; }
+.servers li {
+  display: grid; grid-template-columns: 10px 1fr auto; align-items: center; gap: 10px;
+  padding: 9px 0; border-top: 1px solid var(--line); font-size: 15px;
+}
+.servers li:first-child { border-top: 0; }
+.servers .ok { color: var(--ok); } .servers .warn { color: var(--warn); }
+.servers .bad { color: var(--bad); } .servers .off { color: var(--off); }
+.servers .name { color: var(--text); font-weight: 600; }
+.servers .state { color: var(--muted); font-size: 13px; text-align: right; }
+.servers a { color: var(--accent); font-weight: 600; }
+.summary { color: var(--text); font-weight: 600; margin: 0 0 4px; }
+button.link {
+  background: none; border: 0; padding: 0; color: var(--accent); font: inherit;
+  font-size: 14px; cursor: pointer; text-decoration: underline;
+}
 """
 
 
@@ -330,3 +352,95 @@ def logout_page() -> HTMLResponse:
         '<button class="button" type="submit">Sign out</button></form>'
     )
     return _page("Sign out", body)
+
+
+@dataclass(frozen=True)
+class StatusRow:
+    """One server on the status page."""
+
+    name: str
+    state: str
+    tools: int | None = None
+    #: the short link's path, when an authorization is pending.
+    authorize_path: str | None = None
+
+
+#: lifecycle state → (dot class, label)
+_STATES = {
+    "ready": ("ok", "ready"),
+    "connected": ("ok", "connected"),
+    "started": ("warn", "starting"),
+    "connecting": ("warn", "connecting"),
+    "reconnecting": ("warn", "reconnecting"),
+    "auth_failed": ("warn", "needs authorization"),
+    "disconnected": ("bad", "disconnected"),
+    "unreachable": ("bad", "unreachable"),
+    "failed": ("bad", "failed"),
+    "disabled": ("off", "disabled"),
+}
+
+
+def status_page(
+    rows: list[StatusRow], *, version: str, uptime_s: float, signed_in: bool
+) -> HTMLResponse:
+    """The combiner at a glance (``/status``): every server's state, pending
+    authorizations, version and uptime. Refreshes itself every 20 s."""
+    healthy = sum(1 for r in rows if _STATES.get(r.state, ("warn", ""))[0] == "ok")
+    live = sum(1 for r in rows if r.state != "disabled")
+    items = []
+    for row in sorted(rows, key=lambda r: (r.state == "disabled", r.name.lower())):
+        tone, label = _STATES.get(row.state, ("warn", row.state))
+        detail = html.escape(label)
+        if row.tools:
+            detail += f" · {row.tools} tool{'s' if row.tools != 1 else ''}"
+        if row.authorize_path:
+            detail = f'<a href="{html.escape(row.authorize_path, quote=True)}">Authorize</a>'
+        items.append(
+            f'<li><span class="dot {tone}"></span>'
+            f'<span class="name">{html.escape(row.name)}</span>'
+            f'<span class="state">{detail}</span></li>'
+        )
+    sign_out = (
+        '<form method="post"><input type="hidden" name="action" value="sign-out">'
+        '<button class="link" type="submit">Sign out</button></form>'
+        if signed_in
+        else ""
+    )
+    body = (
+        "<h1>Status</h1>"
+        f'<p class="summary">{healthy} of {live} servers up</p>'
+        f'<p class="dim">Version {html.escape(version)} · up {_uptime(uptime_s)}</p>'
+        f'<ul class="servers">{"".join(items)}</ul>'
+        f'<div class="meta" style="margin-top:18px">{sign_out}</div>'
+    )
+    script = "<script>setTimeout(function () { location.reload(); }, 20000);</script>"
+    return _page("Status", body, script=script)
+
+
+def status_sign_in_page(error: str | None = None, status: int = 401) -> HTMLResponse:
+    """``/status`` before sign-in: the password form, posting back to itself
+    (a proxy may expose only ``/status``)."""
+    problem = (
+        f'<div class="status warn"><span class="dot"></span>{html.escape(error)}</div>'
+        if error
+        else ""
+    )
+    body = (
+        f"{problem}<h1>Status</h1>"
+        "<p>Sign in with the combiner's web password to see its servers.</p>"
+        '<form method="post"><input type="hidden" name="action" value="sign-in">'
+        '<input class="field" type="password" name="password" autocomplete="current-password" '
+        'placeholder="Password" required autofocus aria-label="Password">'
+        '<button class="button" type="submit">Sign in</button></form>'
+    )
+    return _page("Status", body, status=status)
+
+
+def _uptime(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"{minutes} min"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 48:
+        return f"{hours} h {minutes} min"
+    return f"{hours // 24} days"

@@ -1009,13 +1009,20 @@ instead: `mcp-combiner hash-password` prints one for `web_auth.password_hash`
 - **Guessing** is limited: 5 failed attempts a minute per address and 30 across
   all addresses, then `429` for the rest of the minute. During such an attack
   the form refuses everyone; this machine and ticket links still get in.
+- **The status page** (`/status`) shows every server's state and tool count,
+  pending authorizations with a link, the version and uptime — and is the
+  quickest check that the password works. It signs in on the page itself, so
+  `tailscale serve --set-path /status http://127.0.0.1:9741/status` exposes it.
+  Without `web_auth` it answers only this machine.
 - **Sessions** are an HTTP-only cookie signed with `web-auth.key`, kept beside
   the OAuth tokens (owner-only; the combiner refuses a key others can read).
   Delete it to sign every browser out; the sign-out page (`/auth/logout`) signs
   out one.
 
 > [!WARNING]
-> **"This machine" is judged by where the connection comes from.** A local
+> **"This machine" is judged by where the connection comes from**, and the
+> `Host` header must name this machine too (so a page that rebinds its own
+> domain to 127.0.0.1 isn't mistaken for it). A local
 > reverse proxy must say who the real browser is: `X-Forwarded-For`, trusted
 > only from loopback. `tailscale serve` (HTTP/HTTPS) and nginx with
 > `proxy_set_header X-Forwarded-For` do. Anything that forwards raw

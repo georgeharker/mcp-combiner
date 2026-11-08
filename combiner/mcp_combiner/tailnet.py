@@ -85,10 +85,16 @@ def tailnet_info() -> tuple[str | None, str | None]:
         return _info
 
 
+def fresh_tailnet_info() -> tuple[str | None, str | None]:
+    """(MagicDNS name, tailnet IPv4) asked for now, not the per-process cached
+    pair (web_auth refreshes "this machine" periodically)."""
+    name, ip = _tailscale_status()
+    return name, ip or _tailscale_ip()
+
+
 def fresh_tailnet_ip() -> str | None:
-    """The tailnet IPv4 asked for now, not the per-process cached one (web_auth
-    refreshes "this machine" periodically). ``None`` without tailscale."""
-    return _tailscale_status()[1] or _tailscale_ip()
+    """The tailnet IPv4 asked for now. ``None`` without tailscale."""
+    return fresh_tailnet_info()[1]
 
 
 def prefetch_tailnet_info() -> None:

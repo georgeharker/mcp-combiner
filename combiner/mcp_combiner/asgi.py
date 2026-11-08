@@ -439,8 +439,19 @@ def create_app(options: ServeOptions | None = None) -> Starlette:
         RUNTIME.web_signer = Signer.load_or_create(key_path)
         register_login_routes(combiner)
         if combiner_config.web_auth.exempt_local:
-            from mcp_combiner.webauth import start_local_refresh
+            from urllib.parse import urlsplit
 
+            from mcp_combiner.webauth import set_local_names, start_local_refresh
+
+            # Host names that are this machine (beside its addresses and
+            # tailnet name): where OAuth redirects and widget links point.
+            set_local_names(
+                {
+                    urlsplit(url).hostname or ""
+                    for url in (combiner_config.oauth.public_url, base_origin)
+                    if url
+                }
+            )
             # "This machine" off the request path: now, then every minute.
             start_local_refresh()
     app = combiner.http_app(

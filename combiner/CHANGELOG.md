@@ -4,6 +4,31 @@ All notable changes to the combiner are documented here. The version moves in
 lockstep with the rest of the repo (`scripts/bump-version.sh`); releases are
 tagged `vX.Y.Z`.
 
+## [Unreleased]
+
+### Added
+
+- **`/status` page**: every server's state and tool count, pending OAuth
+  authorizations with a link, the combiner's version and uptime, refreshing
+  itself every 20 s — in the authorization-page style. With `web_auth`, this
+  machine or a signed-in browser sees it; others get a sign-in form on the
+  page itself (so a proxy can expose just `/status`), with sign-out there too.
+  Without `web_auth`, only this machine; anyone else gets 404.
+
+### Security
+
+- "This machine" (the `web_auth` exemption, and `/status`) now also requires
+  the `Host` header to name this machine: localhost, one of its addresses,
+  its tailnet name, or the `oauth.public_url` / widget-origin host. A page
+  that rebinds its own domain to 127.0.0.1 connects from loopback but names
+  its own host, so it no longer passes as local.
+
+### Fixed
+
+- The OAuth authorization route imports its web-login module at startup, not
+  per request: reinstalling the package under a running combiner (e.g. an
+  editable reinstall) no longer turns authorization links into server errors.
+
 ## [0.22.0] — 2026-11-08
 
 ### Security

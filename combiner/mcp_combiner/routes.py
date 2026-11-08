@@ -14,14 +14,21 @@ whose values are wire ``mcp-session-id``s — since fastmcp 4 the same ids
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from starlette.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    Response,
+)
 
-from mcp_combiner import authpages, authprompt
+from mcp_combiner import authpages, authprompt, webauth, webgate
 from mcp_combiner.config import CombinerConfig, HealthResponse, ServerStatusInfo
 from mcp_combiner.connections import ConnectionManager
 from mcp_combiner.runtime import RUNTIME, connection_session_id
@@ -74,8 +81,6 @@ def register_routes(
     # back here — since a proxy may expose only /oauth.
     @combiner.custom_route("/oauth/authorize/{elicitation_id}", methods=["GET", "POST"])
     async def oauth_authorize(request: Request) -> Response:
-        from mcp_combiner import webgate
-
         elicitation_id = request.path_params["elicitation_id"]
         pending = authprompt.pending_by_elicitation(elicitation_id)
         if pending is None:
@@ -105,6 +110,61 @@ def register_routes(
         if request.query_params.get("go"):
             return RedirectResponse(pending.url, status_code=302)
         return authpages.authorize_page(pending)
+
+    # The combiner at a glance, for a person. With web_auth: this machine, or
+    # signed in — the sign-in form is on the page itself (POST back here), so
+    # a proxy needs to expose only /status. Without web_auth: this machine
+    # only (server names and pending authorization links aren't for anyone
+    # who can reach the port).
+    @combiner.custom_route("/status", methods=["GET", "POST"])
+    async def status_page(request: Request) -> Response:
+        on = webgate.web_auth_on()
+        local = webgate.from_this_machine(request) and (not on or config.web_auth.exempt_local)
+        session = on and webgate.signed_in(request)
+        if request.method == "POST":
+            if not on:
+                return PlainTextResponse("Not Found", status_code=404)
+            form = await request.form()
+            if form.get("action") == "sign-out":
+                response = RedirectResponse("/status", status_code=303)
+                if session:
+                    response.delete_cookie(webauth.COOKIE, path="/")
+                return response
+            if local or session:
+                return RedirectResponse("/status", status_code=303)
+            refusal = await webgate.check_password(request)
+            if refusal is not None:
+                return authpages.status_sign_in_page(refusal.message, refusal.status)
+            response = RedirectResponse("/status", status_code=303)
+            webgate.set_session_cookie(response, request)
+            return response
+        if not (local or session):
+            if not on:
+                return PlainTextResponse("Not Found", status_code=404)
+            return authpages.status_sign_in_page()
+        rows = []
+        for name in config.servers:
+            state = build_server_status(config, conn_manager, name).state
+            pending = authprompt.pending_for(name)
+            tools = RUNTIME.tools.server_tools.get(name)
+            rows.append(
+                authpages.StatusRow(
+                    name=name,
+                    state=state,
+                    tools=len(tools) if tools is not None else None,
+                    authorize_path=(
+                        f"/oauth/authorize/{pending.elicitation_id}"
+                        if pending is not None and pending.elicit
+                        else None
+                    ),
+                )
+            )
+        return authpages.status_page(
+            rows,
+            version=_combiner_version(),
+            uptime_s=time.time() - RUNTIME.started_at,
+            signed_in=session,
+        )
 
     @combiner.custom_route("/oauth/callback/{server}", methods=["GET"])
     async def oauth_callback(request: Request) -> HTMLResponse:
@@ -471,3 +531,12 @@ def register_routes(
                 "disabled_servers": RUNTIME.sessions.token_snapshot(token),
             }
         )
+
+
+def _combiner_version() -> str:
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("mcp-combiner")
+    except PackageNotFoundError:
+        return "dev"

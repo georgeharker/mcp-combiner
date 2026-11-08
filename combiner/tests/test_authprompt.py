@@ -669,6 +669,10 @@ class TestCombinerPublicUrlFlow:
         assert "<dt>Signs in at</dt><dd>127.0.0.1</dd>" in page
         assert "Pi agent" in page and "chat page-cha…" in page
         assert "needs your permission to connect" in page  # first sign-in
+        # The status page links the pending authorization.
+        async with httpx2.AsyncClient() as http:
+            status = (await http.get(mcp_url.removesuffix("/mcp") + "/status")).text
+        assert f'href="/oauth/authorize/{elicitation["elicitationId"]}"' in status
 
     async def test_web_auth_gates_the_page_and_tickets_open_it(
         self, procs: ProcFactory, oauth_mock: OAuthMockFactory, tmp_path: Path
