@@ -148,8 +148,9 @@ class WebAuthGate(BaseHTTPMiddleware):
 
 
 def _safe_next(raw: str | None) -> str:
-    """Only same-origin paths (no scheme, no //host)."""
-    if not raw or not raw.startswith("/") or raw.startswith("//") or "\\\\" in raw:
+    """Only same-origin paths (no scheme, no //host). Any backslash is refused:
+    browsers read ``/\\host`` as ``//host``."""
+    if not raw or not raw.startswith("/") or raw.startswith("//") or "\\" in raw:
         return "/"
     return raw
 

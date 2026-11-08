@@ -156,7 +156,12 @@ class TestLogin:
     async def test_next_is_same_origin_only(self, procs: ProcFactory, tmp_path: Path) -> None:
         combiner = await _combiner(procs, tmp_path, exempt_local=False)
         async with httpx2.AsyncClient(timeout=10.0) as http:
-            for evil in ("https://evil.example/", "//evil.example/", "javascript:x"):
+            for evil in (
+                "https://evil.example/",
+                "//evil.example/",
+                "/\\evil.example/",
+                "javascript:x",
+            ):
                 r = await http.post(
                     f"{combiner.base_url}/auth/login", data={"password": PASSWORD, "next": evil}
                 )
