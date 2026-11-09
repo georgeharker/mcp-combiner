@@ -234,8 +234,8 @@ class TokenRewriteMiddleware(BaseHTTPMiddleware):
             # Replace any existing value so URL wins over a stale header.
             hdr = _ACP_TOKEN_HEADER.encode()
             headers = [(k, v) for (k, v) in request.scope["headers"] if k.lower() != hdr]
-            assert url_token is not None  # the enclosing branch established it
-            headers.append((hdr, url_token.encode()))
+            if url_token is not None:  # the enclosing branch established it
+                headers.append((hdr, url_token.encode()))
             request.scope["headers"] = headers
 
         # --- Source 2: token in header ---

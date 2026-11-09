@@ -527,8 +527,10 @@ class _RefreshTokenOAuth(OAuth):
             base = ctx.get_authorization_base_url(ctx.server_url)
             token_url = urljoin(base, "/token")
 
-        assert ctx.current_tokens and ctx.current_tokens.refresh_token
-        assert ctx.client_info and ctx.client_info.client_id
+        if not (ctx.current_tokens and ctx.current_tokens.refresh_token):
+            raise OAuthFlowError("No refresh token to refresh with")
+        if not (ctx.client_info and ctx.client_info.client_id):
+            raise OAuthFlowError("No client registration to refresh with")
 
         data: dict[str, str] = {
             "grant_type": "refresh_token",

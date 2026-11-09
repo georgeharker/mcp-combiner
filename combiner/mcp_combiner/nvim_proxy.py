@@ -363,7 +363,8 @@ async def call_nvim_tool(
         "token": _session_tokens.get(sid or ""),
     }
 
-    assert instance_id is not None  # every None path above raises
+    if instance_id is None:  # every None path above raises; kept for the type
+        raise RuntimeError(f"no Neovim instance resolved for {local_name}")
     try:
         result = await channel.call(instance_id, local_name, args, ctx)
     except NoInstanceError as e:
