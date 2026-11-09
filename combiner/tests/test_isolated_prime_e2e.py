@@ -122,3 +122,61 @@ async def test_a_chat_with_a_dead_session_still_sees_the_catalog(
         names = await poll_until(_listed, timeout=60.0, desc="the chat lists the new tool")
         assert "mockup_echo" in names
         assert "server 'mockup' absent" not in log.read_text()[mark:]
+
+
+async def test_a_chat_whose_session_died_gets_a_fresh_one_on_its_next_call(
+    procs: ProcFactory, tmp_path: Path
+) -> None:
+    """The server restarted outside the combiner (the combiner didn't reset
+    anything): a connected chat's next call opens a fresh session and runs,
+    rather than failing on the dead one."""
+    mock = await procs.start_http_mock("mockup")
+    config = tmp_path / "servers.json"
+    entry = http_mock_entry(mock.port) | {"isolate": True}
+    config.write_text(json.dumps({"servers": {"mockup": entry}}))
+    combiner = await procs.start_combiner(config, env=FAST_TIMING_ENV)
+    await combiner.wait_server_state("mockup", ("ready",), timeout=60.0)
+
+    async with Client(
+        StreamableHttpTransport(combiner.mcp_url, headers={"X-MCP-Combiner-Session": _CHAT}),
+        mode=CLIENT_CONNECT_MODE,
+    ) as client:
+        await client.call_tool("mockup_echo", {"message": "before"})
+        mock.proc.kill()
+        mock.proc.wait()
+        await procs.start_http_mock("mockup", port=mock.port)
+        result = await client.call_tool("mockup_echo", {"message": "after"})
+        texts = [getattr(c, "text", "") for c in result.content]
+        assert any("after" in t for t in texts)
+        # The chat is told its state on mockup was reset, once.
+        assert texts[0].startswith("Note: mockup's per-chat state for this chat was reset")
+        again = await client.call_tool("mockup_echo", {"message": "again"})
+        assert not any("per-chat state" in getattr(c, "text", "") for c in again.content)
+
+
+async def test_a_restart_is_noted_on_each_chats_next_call(
+    procs: ProcFactory, tmp_path: Path
+) -> None:
+    """A restart (here run from another chat) resets every chat's session on
+    the server; each of them is told on its next call there."""
+    mock = await procs.start_http_mock("mockup")
+    config = tmp_path / "servers.json"
+    entry = http_mock_entry(mock.port) | {"isolate": True}
+    config.write_text(json.dumps({"servers": {"mockup": entry}}))
+    combiner = await procs.start_combiner(config, env=FAST_TIMING_ENV)
+    await combiner.wait_server_state("mockup", ("ready",), timeout=60.0)
+
+    def chat(token: str) -> Client[Any]:
+        return Client(
+            StreamableHttpTransport(combiner.mcp_url, headers={"X-MCP-Combiner-Session": token}),
+            mode=CLIENT_CONNECT_MODE,
+        )
+
+    async with chat(_CHAT) as client:
+        await client.call_tool("mockup_echo", {"message": "before"})
+        async with chat("0ther000-1111-2222-3333-444444444444") as other:
+            await other.call_tool("combiner__restart_server", {"server_name": "mockup"})
+        await combiner.wait_server_state("mockup", ("ready",), timeout=60.0)
+        result = await client.call_tool("mockup_echo", {"message": "after"})
+        texts = [getattr(c, "text", "") for c in result.content]
+        assert texts[0].startswith("Note: mockup's per-chat state for this chat was reset")

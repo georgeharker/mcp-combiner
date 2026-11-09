@@ -176,8 +176,11 @@ class TestRestartMetaTool:
 
         # Same chat token: must get a clean fresh upstream session, not a
         # cached client bound to the dead pre-restart session id.
+        # The chat is told, once, that its state there was reset.
         async with _chat() as c:
-            assert await _text(c, "mockup_greet", {"who": "b"}) == "Hello, b!"
+            text = await _text(c, "mockup_greet", {"who": "b"})
+            assert text.startswith("Note: mockup's per-chat state") and text.endswith("Hello, b!")
+            assert await _text(c, "mockup_greet", {"who": "c"}) == "Hello, c!"
 
     @requires_sharedserver
     async def test_sharedserver_restart_bounces_backing_process(

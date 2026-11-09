@@ -515,8 +515,10 @@ def register_meta_tools(
         # their upstream session ids die with the process, and a cached client
         # bound to a dead id would error on every call instead of opening a
         # clean fresh session. A server restart is an intentional state reset.
+        from mcp_combiner import resetnotice
         from mcp_combiner.isolated import REGISTRY as isolated_registry
 
+        resetnotice.record_all(server_name, isolated_registry.tokens_for(server_name))
         evicted_chats = await isolated_registry.evict_server(server_name)
         if evicted_chats:
             logger.info(

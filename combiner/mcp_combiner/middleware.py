@@ -25,7 +25,7 @@ from fastmcp.server.middleware.error_handling import ErrorHandlingMiddleware
 from fastmcp.tools import Tool, ToolResult
 from fastmcp.tools.base import InputRequiredToolResult
 from mcp.server.connection import Connection
-from mcp.shared.exceptions import UrlElicitationRequiredError
+from mcp.shared.exceptions import MCPError, UrlElicitationRequiredError
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 
 from mcp_combiner import authprompt, fastvalidate, heldcalls, nvim_proxy, permissions
@@ -542,10 +542,12 @@ class ToolProcessingMiddleware(Middleware):
                 # A handshake-era upstream may ask for input mid-call; hold the
                 # call so the question can go back to this 2026-era client.
                 result = await heldcalls.start(
-                    lambda: call_next(context), _chat_token(), str(fctx.request_id)
+                    lambda: _call_healing(context, call_next, call_server),
+                    _chat_token(),
+                    str(fctx.request_id),
                 )
             else:
-                result = await call_next(context)
+                result = await _call_healing(context, call_next, call_server)
                 if fctx is not None and not era_2026:
                     # A 2026-era upstream asks by returning InputRequiredResult,
                     # which this handshake-era client can't take: ask it live.
@@ -717,7 +719,7 @@ class ToolProcessingMiddleware(Middleware):
                     )
                     # hold_for_widget folds (and returns) a ToolResult — same type in/out.
                     result = cast(ToolResult, held)
-            return result
+            return _with_reset_notice(result, call_server)
 
 
 def _connection_of(ctx: Context | None) -> Connection | None:
@@ -749,6 +751,62 @@ def _is_2026_request(ctx: Context | None) -> bool:
     """Whether *ctx*'s request speaks the 2026-07-28 revision."""
     rc = ctx.request_context if ctx is not None else None
     return rc is not None and rc.protocol_version in MODERN_PROTOCOL_VERSIONS
+
+
+async def _call_healing(
+    context: MiddlewareContext[mt.CallToolRequestParams],
+    call_next: CallNext[mt.CallToolRequestParams, ToolResult],
+    server: str | None,
+) -> ToolResult:
+    """Run the call; if the chat's isolated upstream session turns out to be
+    dead (the server restarted outside the combiner and rejects it), drop it
+    and run the call once more on a fresh session. Safe to retry: a rejected
+    session never reached the tool."""
+    try:
+        return await call_next(context)
+    except Exception as exc:
+        token = _chat_token()
+        if not (server and token and _session_gone(exc)):
+            raise
+        from mcp_combiner.isolated import REGISTRY as isolated_registry
+
+        if not await isolated_registry.drop_dead(server, token):
+            raise
+        logger.warning(
+            "'%s' no longer knows chat %s…'s session (restarted?) — retrying on a fresh one",
+            server,
+            token[:8],
+        )
+        from mcp_combiner import resetnotice
+
+        resetnotice.record(server, token)
+        return await call_next(context)
+
+
+def _with_reset_notice(result: ToolResult, server: str | None) -> ToolResult:
+    """Prepend the chat's pending state-reset note for *server*, if any."""
+    token = _chat_token()
+    if not server or not token:
+        return result
+    from mcp_combiner import resetnotice
+
+    note = resetnotice.consume(server, token)
+    if note is None:
+        return result
+    result.content = [mt.TextContent(type="text", text=note), *result.content]
+    return result
+
+
+def _session_gone(exc: BaseException) -> bool:
+    """Whether *exc* is the upstream rejecting an unknown session (HTTP 404 →
+    ``Session not found``), at the transport level. A tool's own error text
+    that happens to say so isn't: only an ``MCPError`` in the chain counts."""
+    seen: BaseException | None = exc
+    while seen is not None:
+        if isinstance(seen, MCPError) and "session not found" in str(seen).lower():
+            return True
+        seen = seen.__cause__ or seen.__context__
+    return False
 
 
 def _chat_token() -> str | None:

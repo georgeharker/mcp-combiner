@@ -524,6 +524,22 @@ class IsolatedSessionRegistry:
 
     # -- teardown ----------------------------------------------------------
 
+    def tokens_for(self, server: str) -> list[str]:
+        """The chats holding a live or parked session on *server*."""
+        return sorted({t for (s, t) in [*self.live, *self.parked] if s == server})
+
+    async def drop_dead(self, server: str, token: str) -> bool:
+        """Drop one chat's live entry whose upstream session the server no
+        longer knows (it restarted outside the combiner). No DELETE: the session
+        is already gone. The chat's next call opens a fresh one. Returns
+        whether there was an entry to drop."""
+        key = (server, token)
+        entry = self.live.pop(key, None)
+        if entry is None:
+            return False
+        await self._disconnect(entry, key, dropped_sessions=True)
+        return True
+
     async def evict_server(self, server: str) -> int:
         """Drop every live and parked entry for one server (server restart).
 

@@ -118,3 +118,24 @@ async def test_2026_clients_are_asked_with_input_required(_clean: list[str]) -> 
     with pytest.raises(ToolError, match="Restarted 'crib'"):
         await restartprompt.gate(retry, "crib")
     assert _clean == ["crib"]
+
+
+def test_only_a_transport_level_unknown_session_counts_as_gone() -> None:
+    """A tool's own error that happens to mention a session doesn't make the
+    combiner drop the chat's session; only the upstream rejecting it does."""
+    from fastmcp.exceptions import ToolError as _ToolError
+    from mcp.shared.exceptions import MCPError
+
+    from mcp_combiner.middleware import _session_gone
+
+    rejected = MCPError(-32600, "Session not found")
+    assert _session_gone(rejected)
+    try:
+        try:
+            raise rejected
+        except MCPError as inner:
+            raise _ToolError("Error calling tool 'echo': Session not found") from inner
+    except _ToolError as wrapped:
+        assert _session_gone(wrapped)
+    assert not _session_gone(_ToolError("Session not found"))  # the tool's own words
+    assert not _session_gone(MCPError(-32600, "Invalid request"))

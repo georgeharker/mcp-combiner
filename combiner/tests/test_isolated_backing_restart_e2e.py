@@ -118,7 +118,11 @@ async def test_a_dead_backing_process_is_restarted_automatically(
         async def _greeted(token: str = chat) -> str | None:
             return await _greets(combiner.mcp_url, token)
 
-        assert await poll_until(_greeted, timeout=45.0, desc="chat sees tools") == expected
+        greeted = await poll_until(_greeted, timeout=45.0, desc="chat sees tools")
+        assert greeted is not None and greeted.endswith(expected)
+        # Chat A had a session there, so it's told its state was reset;
+        # chat B never had one.
+        assert greeted.startswith("Note: mockup's per-chat state") == (chat == CHAT_A)
     log = (tmp_path / "combiner.log").read_text()
     after = log.split("failed 3 consecutive reconnects", 1)[1]
     assert "isolated per-chat session(s) for 'mockup'" in after  # sessions reset

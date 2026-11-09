@@ -8,6 +8,18 @@ tagged `vX.Y.Z`.
 
 ### Changed
 
+- **A chat whose session died gets a fresh one, and is told.** If an
+  isolated server restarted outside the combiner, a connected chat's next
+  call used to fail with "Session not found" until someone ran
+  `combiner__restart_server`. The combiner now drops that chat's dead
+  session and runs the call once more on a fresh one (safe: a rejected
+  session never reaches the tool). Only the upstream's transport-level
+  rejection counts, never a tool's own error text.
+- **Chats are told when their state on a server was reset.** After any
+  restart (manual, automatic, or one the user approved) or a dead-session
+  replacement, each affected chat's next successful call to that server
+  starts with a one-time note: its per-chat state there (an open project,
+  documents) is gone.
 - **The combiner no longer kills a server that's busy.** The health monitor
   restarts a `sharedServers`-backed server on its own only when it's gone
   (its port refuses connections). One that's still running but has stopped
