@@ -465,12 +465,14 @@ def register_routes(
                     "session_id": session_id,
                     "connected": session_id is not None,
                     "disabled_servers": RUNTIME.sessions.token_snapshot(token),
+                    "hidden_tools": sorted(RUNTIME.sessions.token_hidden_tools.get(token, set())),
                 }
             )
 
         if request.method == "DELETE":
             previously = RUNTIME.sessions.token_snapshot(token)
             RUNTIME.sessions.set_pending(token, None)
+            RUNTIME.sessions.set_hidden(RUNTIME.sessions.token_hidden_tools, token, set())
             await _notify_token_sessions()
             return JSONResponse(
                 {
@@ -516,6 +518,16 @@ def register_routes(
         current = set(RUNTIME.sessions.pending_for(token))
         new_disabled = _resolve_disabled(current)
         RUNTIME.sessions.set_pending(token, new_disabled)
+        # Per-chat hidden tools (glob patterns): "hidden_tools" replaces the
+        # set ([] clears), "hide" / "show" add or remove one pattern.
+        hidden = set(RUNTIME.sessions.token_hidden_tools.get(token, set()))
+        if isinstance(body.get("hidden_tools"), list):
+            hidden = {str(p) for p in body["hidden_tools"] if str(p).strip()}
+        if isinstance(body.get("hide"), str):
+            hidden.add(body["hide"])
+        if isinstance(body.get("show"), str):
+            hidden.discard(body["show"])
+        RUNTIME.sessions.set_hidden(RUNTIME.sessions.token_hidden_tools, token, hidden)
         await _notify_token_sessions()
         logger.info(
             "REST token filter: token=%s connected=%s disabled=%s",
@@ -529,6 +541,7 @@ def register_routes(
                 "session_id": session_id,
                 "connected": session_id is not None,
                 "disabled_servers": RUNTIME.sessions.token_snapshot(token),
+                "hidden_tools": sorted(RUNTIME.sessions.token_hidden_tools.get(token, set())),
             }
         )
 

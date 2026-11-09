@@ -50,6 +50,14 @@ tagged `vX.Y.Z`.
 
 ### Added
 
+- **Per-chat hidden tools.** A chat can hide individual tools, by name or
+  glob over the namespaced names (`"svg-mcp_add_*"`), on top of the
+  per-chat server filter: `combiner__session_hide_tools` /
+  `combiner__session_show_tools`, or `hidden_tools` / `hide` / `show` on
+  `POST /sessions/token/<token>/filter` (which now reports `hidden_tools`,
+  as does `combiner__session_status`). Hidden tools aren't listed to that
+  chat and can't be called from it; other chats are unaffected; the
+  combiner-restart handover carries them.
 - **`/status` page**: every server's state and tool count, pending OAuth
   authorizations with a link, the combiner's version and uptime, refreshing
   itself every 20 s — in the authorization-page style. With `web_auth`, this

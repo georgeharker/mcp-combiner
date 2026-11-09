@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from typing import Any, cast
 
 import mcp.types
@@ -932,8 +933,10 @@ def register_meta_tools(
         token = chat_id or nvim_proxy.token_for_session(ctx.session_id)
         if token:
             blocked = RUNTIME.sessions.token_snapshot(token)
+            hidden = RUNTIME.sessions.token_hidden_tools.get(token, set())
         else:
             blocked = RUNTIME.sessions.disabled_snapshot(ctx.session_id)
+            hidden = RUNTIME.sessions.hidden_tools.get(ctx.session_id, set())
 
         import json
 
@@ -942,8 +945,87 @@ def register_meta_tools(
                 "session_id": ctx.session_id,
                 "token": token,
                 "disabled_servers": blocked,
+                "hidden_tools": sorted(hidden),
             }
         )
+
+    async def _change_hidden(
+        ctx: Context, chat_id: str | None, change: Callable[[set[str]], set[str]], action: str
+    ) -> str:
+        """Apply *change* to this chat's hidden-tool patterns (token store when
+        tokened, else the session store), refresh its tool list, report."""
+        from mcp_combiner import nvim_proxy
+        from mcp_combiner.toolcache import notify_chat_tools_changed
+
+        token = chat_id or nvim_proxy.token_for_session(ctx.session_id)
+        sessions = RUNTIME.sessions
+        store, key = (
+            (sessions.token_hidden_tools, token)
+            if token
+            else (sessions.hidden_tools, ctx.session_id)
+        )
+        updated = change(set(store.get(key, set())))
+        sessions.set_hidden(store, key, updated)
+        if not chat_id or token == nvim_proxy.token_for_session(ctx.session_id):
+            try:
+                await ctx.session.send_tool_list_changed()
+            except Exception:
+                logger.debug("Failed to notify session of tool list change", exc_info=True)
+        if token:
+            await notify_chat_tools_changed(token)
+        logger.info("Session %s (token %s): %s tools %s", ctx.session_id, token, action, updated)
+        import json
+
+        return json.dumps(
+            {
+                "session_id": ctx.session_id,
+                "token": token,
+                "action": action,
+                "hidden_tools": sorted(updated),
+            }
+        )
+
+    @combiner.tool()
+    async def combiner__session_hide_tools(
+        patterns: list[str], ctx: Context, chat_id: str | None = None
+    ) -> str:
+        """Hide tools from the current chat only, by name or glob pattern over
+        the namespaced names (e.g. ``"svg-mcp_add_*"``, ``"github_delete_*"``).
+
+        Hidden tools disappear from this chat's tool list and can't be called
+        from it; other chats are unaffected. To hide a whole server, use
+        combiner__session_disable_server instead.
+
+        Args:
+            patterns: tool names or fnmatch patterns to hide.
+            chat_id: Optional chat identifier when the calling session has no
+                     token binding of its own.
+
+        Returns:
+            JSON with the chat's hidden_tools patterns.
+        """
+        cleaned = {p.strip() for p in patterns if p.strip()}
+        return await _change_hidden(ctx, chat_id, lambda cur: cur | cleaned, "hid")
+
+    @combiner.tool()
+    async def combiner__session_show_tools(
+        ctx: Context, patterns: list[str] | None = None, chat_id: str | None = None
+    ) -> str:
+        """Show tools hidden from the current chat again.
+
+        Args:
+            patterns: the exact patterns to remove (as listed by
+                      combiner__session_status); omit to show everything again.
+            chat_id: Optional chat identifier when the calling session has no
+                     token binding of its own.
+
+        Returns:
+            JSON with the chat's remaining hidden_tools patterns.
+        """
+        if patterns is None:
+            return await _change_hidden(ctx, chat_id, lambda cur: set(), "showed all")
+        removed = {p.strip() for p in patterns}
+        return await _change_hidden(ctx, chat_id, lambda cur: cur - removed, "showed")
 
     @combiner.tool()
     async def combiner__ui_sessions(ctx: Context, chat_id: str | None = None) -> str:

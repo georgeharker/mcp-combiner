@@ -359,6 +359,17 @@ upstream session per chat** (still one upstream server _instance_, shared
 transport). The server is handed a distinct, stable `Mcp-Session-Id` per chat
 and partitions its per-session state automatically — no clash.
 
+**One catalog, per-chat calls.** An isolated HTTP/SSE server's tools,
+resources, templates and prompts are the same for every chat, so the combiner
+lists them through the server's one shared connection; a chat's own upstream
+session is used only for its calls and reads, and is opened on its first
+call. So a chat whose session has died can never make the server look
+toolless. If the server restarts behind the combiner's back, a chat's next
+call finds its session unknown, gets a fresh one, and runs once more; and
+after any restart or such a replacement, the chat's next call to that server
+starts with a one-time note that its state there (an open project, a
+drawing) was reset.
+
 > **stdio servers isolate per-chat SUBPROCESSES.** `"isolate": true` on a
 > stdio entry means each chat gets its **own** `command` subprocess — a stdio
 > subprocess IS a session, so state partitioning is total (no shared-global
@@ -519,6 +530,28 @@ entries can reference the same `sharedServers` entry.
 | `env`            | `object`   | `{}`         | Extra environment variables (supports interpolation)                             |
 | `grace_period`   | `string`   | —            | How long to keep the process alive after the last client detaches (e.g. `"30m"`) |
 | `health_timeout` | `integer`  | `30`         | Seconds to poll the server URL after start before giving up                      |
+
+**When the combiner restarts a server by itself.** `sharedserver` keeps a
+process running but doesn't respawn one that crashed, so the combiner's health
+monitor watches each `sharedServers`-backed server: a ping every 30 s, a
+reconnect after 3 missed pings, and after 3 failed reconnects (about five
+minutes) it decides:
+
+- **Gone** — nothing listens on its port any more (crashed, killed): it's
+  restarted automatically, exactly as `combiner__restart_server` would.
+- **Still running but not answering** — busy on a slow call, or hung: it's
+  **never** restarted automatically, since that would end its work and every
+  chat's state on it. It shows as `unresponsive` in `/health` (`not
+  responding` on `/status`) and keeps being re-dialled. The next tool call
+  routed to it asks the user *"Restart it?"* (an elicitation; an
+  input-required result for 2026-era clients). **Restart now** restarts it and
+  fails that call with a note to retry; **Not now** fails the call and isn't
+  asked again for 10 minutes. A client that can't be asked is told to use
+  `combiner__restart_server`. If it answers again, it's simply back; if its
+  process dies later, it's restarted after all.
+
+Servers given only a `url`, and `externalServers`, are never restarted
+automatically; the combiner just keeps reconnecting.
 
 ### externalServer — non-owned processes
 
@@ -1556,6 +1589,7 @@ The combiner exposes management tools that the LLM can call:
 - `combiner__enable_server` / `combiner__disable_server` — toggle servers globally (all sessions)
 - `combiner__authorize_server` — start OAuth authorization for a server and hand over the link (see [Authorizing from another device](#authorizing-from-another-device))
 - `combiner__session_disable_server` / `combiner__session_enable_server` — toggle a server for the calling session only
+- `combiner__session_hide_tools` / `combiner__session_show_tools` — hide or show individual tools (names or globs) for the calling session only
 
 ### Usage
 
@@ -2084,13 +2118,35 @@ Returns JSON: `{ "session_id": "...", "action": "disabled", "server": "...", "di
 
 Returns JSON: `{ "session_id": "...", "action": "enabled", "server": "...", "disabled_servers": [...] }`
 
-**`combiner__session_status`** — get the current session's disabled server list
+**`combiner__session_hide_tools`** — hide individual tools from this session
+
+| Parameter  | Type                  | Description                                                                  |
+| ---------- | --------------------- | ---------------------------------------------------------------------------- |
+| `patterns` | `string[]` (required) | Tool names or globs over the namespaced names, e.g. `"svg-mcp_add_*"`         |
+| `chat_id`  | `string` (optional)   | Same as above                                                                |
+
+Hidden tools aren't listed to this chat and can't be called from it; other
+chats are unaffected. Returns JSON: `{ "session_id": "...", "action": "hid", "hidden_tools": [...] }`
+
+**`combiner__session_show_tools`** — show hidden tools again
+
+| Parameter  | Type                  | Description                                                       |
+| ---------- | --------------------- | ----------------------------------------------------------------- |
+| `patterns` | `string[]` (optional) | The exact patterns to remove; omit to show everything again       |
+| `chat_id`  | `string` (optional)   | Same as above                                                     |
+
+The token route takes the same: `POST /sessions/token/<token>/filter` with
+`{"hidden_tools": [...]}` (replace; `[]` clears), `{"hide": "<pattern>"}` or
+`{"show": "<pattern>"}`; `GET` reports `hidden_tools`, `DELETE` clears them
+along with the server filter.
+
+**`combiner__session_status`** — get the current session's filters
 
 | Parameter | Type                | Description   |
 | --------- | ------------------- | ------------- |
 | `chat_id` | `string` (optional) | Same as above |
 
-Returns JSON: `{ "session_id": "...", "disabled_servers": [...] }`
+Returns JSON: `{ "session_id": "...", "disabled_servers": [...], "hidden_tools": [...] }`
 
 These complement the global `combiner__enable_server` / `combiner__disable_server`
 tools, which affect all sessions simultaneously.

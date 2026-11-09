@@ -32,7 +32,12 @@ from mcp_combiner import authprompt, fastvalidate, heldcalls, nvim_proxy, permis
 from mcp_combiner.auth import clear_oauth_cache, is_stale_client_error
 from mcp_combiner.connections import AuthenticationError
 from mcp_combiner.isolated import TOKEN_HEADER
-from mcp_combiner.runtime import DOWNSTREAM_REQUEST, RUNTIME, downstream_connection
+from mcp_combiner.runtime import (
+    DOWNSTREAM_REQUEST,
+    RUNTIME,
+    downstream_connection,
+    tool_hidden,
+)
 from mcp_combiner.schemafix import _finalize_schemas, _sanitize_tools
 from mcp_combiner.toolcache import (
     _filter_tools,
@@ -228,12 +233,12 @@ class ToolProcessingMiddleware(Middleware):
             )
             base = self._apply_session_filter(context, RUNTIME.tools.cache)
             full = await nvim_proxy.append_nvim_tools(context, base, RUNTIME.sessions.disabled)
-            return _finalize_schemas(_namespace_app_meta(full))
+            return _finalize_schemas(_namespace_app_meta(_hide_for_chat(context, full)))
 
         tools = await self._fetch_or_join(context, call_next, cache_age)
         base = self._apply_session_filter(context, tools)
         full = await nvim_proxy.append_nvim_tools(context, base, RUNTIME.sessions.disabled)
-        return _finalize_schemas(_namespace_app_meta(full))
+        return _finalize_schemas(_namespace_app_meta(_hide_for_chat(context, full)))
 
     async def _fetch_or_join(
         self,
@@ -438,6 +443,19 @@ class ToolProcessingMiddleware(Middleware):
           the correct MCP semantics: "the tool ran but something went wrong".
         """
         tool_name = context.message.name if context.message else "unknown"
+
+        # Per-chat hidden tools: a tool hidden for this chat can't be called by
+        # name either (it isn't listed to it).
+        if context.fastmcp_context is not None:
+            try:
+                hidden = RUNTIME.sessions.effective_hidden(context.fastmcp_context.session_id)
+            except (RuntimeError, AttributeError):
+                hidden = set()
+            if hidden and tool_hidden(str(tool_name), hidden):
+                raise NotFoundError(
+                    f"Tool '{tool_name}' is hidden for this chat. Use "
+                    "combiner__session_show_tools to show it again."
+                )
 
         # Virtual native server: intercept `neovim_*` and route over the
         # back-channel instead of the upstream proxy. These tools are never in
@@ -781,6 +799,21 @@ async def _call_healing(
 
         resetnotice.record(server, token)
         return await call_next(context)
+
+
+def _hide_for_chat(
+    context: MiddlewareContext[mt.ListToolsRequest], tools: list[Tool]
+) -> list[Tool]:
+    """Drop the tools this chat has hidden (glob patterns; per-chat filter)."""
+    if context.fastmcp_context is None:
+        return tools
+    try:
+        hidden = RUNTIME.sessions.effective_hidden(context.fastmcp_context.session_id)
+    except (RuntimeError, AttributeError):
+        return tools
+    if not hidden:
+        return tools
+    return [t for t in tools if not tool_hidden(str(t.name), hidden)]
 
 
 def _with_reset_notice(result: ToolResult, server: str | None) -> ToolResult:

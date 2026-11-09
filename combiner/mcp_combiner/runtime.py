@@ -100,6 +100,12 @@ class SessionRegistry:
     token_sessions: dict[str, str] = field(default_factory=dict)
     # Filters stored for a token before its client has connected.
     pending_token_filters: dict[str, set[str]] = field(default_factory=dict)
+    # Per-chat hidden TOOLS: glob patterns over namespaced tool names
+    # ("svg-mcp_add_*"), on top of the server blocklist. Token-keyed for
+    # tokened chats (canonical, carried by the handover), session-keyed for
+    # tokenless ones — resolved like the server filters (effective_hidden).
+    token_hidden_tools: dict[str, set[str]] = field(default_factory=dict)
+    hidden_tools: dict[str, set[str]] = field(default_factory=dict)
 
     # -- active sessions --------------------------------------------------
 
@@ -200,6 +206,27 @@ class SessionRegistry:
             return self.pending_token_filters.get(token, set())
         return self.disabled.get(session_id, set())
 
+    # -- per-chat hidden tools ---------------------------------------------
+
+    def effective_hidden(self, session_id: str | None) -> set[str]:
+        """The tool patterns hidden for *session_id*'s chat (read-through, as
+        :meth:`effective_disabled`)."""
+        if not session_id:
+            return set()
+        from mcp_combiner import nvim_proxy
+
+        token = nvim_proxy.token_for_session(session_id)
+        if token is not None:
+            return self.token_hidden_tools.get(token, set())
+        return self.hidden_tools.get(session_id, set())
+
+    def set_hidden(self, store: dict[str, set[str]], key: str, patterns: set[str]) -> None:
+        """Replace *key*'s hidden patterns in *store*; empty clears."""
+        if patterns:
+            store[key] = set(patterns)
+        else:
+            store.pop(key, None)
+
     # -- token-keyed filter store (canonical for tokened sessions) -----------
 
     def disable_token(self, token: str, server: str) -> None:
@@ -238,6 +265,13 @@ class SessionRegistry:
 
     def pop_pending(self, token: str) -> set[str] | None:
         return self.pending_token_filters.pop(token, None)
+
+
+def tool_hidden(name: str, patterns: set[str]) -> bool:
+    """Whether tool *name* matches any per-chat hidden pattern (fnmatch)."""
+    from fnmatch import fnmatchcase
+
+    return any(fnmatchcase(name, pattern) for pattern in patterns)
 
 
 def _tool_fingerprint(tool: "Tool") -> str:
@@ -460,6 +494,8 @@ def reset() -> None:
     r.sessions.disabled.clear()
     r.sessions.token_sessions.clear()
     r.sessions.pending_token_filters.clear()
+    r.sessions.token_hidden_tools.clear()
+    r.sessions.hidden_tools.clear()
     r.tools.cache = None
     r.tools.cache_time = 0.0
     r.tools.server_tools.clear()
