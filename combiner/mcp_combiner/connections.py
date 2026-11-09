@@ -209,6 +209,10 @@ class _ManagedConnection:
     # Set when the monitor handed this connection to the restart routine: the
     # monitor stops, and the routine replaces the connection.
     _handed_off: bool = field(default=False, repr=False)
+    # Still running (its port accepts connections) but not answering MCP after
+    # repeated reconnects: never restarted automatically; the next call routed
+    # to it asks the user (restartprompt). Cleared when a connection opens.
+    _unresponsive: bool = field(default=False, repr=False)
     # Consecutive health-check ping misses on a still-connected session. The
     # monitor only reconnects once this reaches _HEALTH_FAILURES_BEFORE_RECONNECT,
     # so one slow ping (e.g. a token refresh stalling on a high-latency link)
@@ -408,6 +412,8 @@ class ConnectionManager:
         client = conn.client_ref[0]
         if client is not None and client.is_connected():
             return "ready" if conn._tools_ready else "connected"
+        if conn._unresponsive:
+            return "unresponsive"
         if not conn._ready.is_set():
             # First connect attempt still in flight (or not yet begun). Distinct
             # from "disconnected" so an early caller — status during startup,
@@ -415,6 +421,11 @@ class ConnectionManager:
             # after reset_auth_failure, which re-arms _ready for the retry.
             return "starting"
         return "disconnected"
+
+    def is_unresponsive(self, name: str) -> bool:
+        """Running but not answering (see ``_ManagedConnection._unresponsive``)."""
+        conn = self._connections.get(name)
+        return conn is not None and conn._unresponsive
 
     def mark_tools_unready(self, name: str) -> None:
         """Downgrade *name* out of ``ready`` after a concrete failure.
@@ -820,34 +831,54 @@ class ConnectionManager:
             and conn.srv.shared_server
             and self._restart_server is not None
         ):
-            # Re-dialing has failed repeatedly — the backing process is likely
-            # dead (crashed, wedged, or orphan-squatting its port). Restart the
-            # server the way combiner__restart_server does, in its own task:
-            # its teardown cancels this monitor, so it can't run in here.
             conn._consec_failures = 0
-            conn._handed_off = True
-            logger.warning(
-                "'%s' failed %d consecutive reconnects — restarting it "
-                "(the combiner__restart_server routine)",
-                conn.name,
-                _BACKING_RESTART_AFTER,
-            )
-            task = background_task(
-                self._restart_in_background(conn.name), name=f"auto-restart-{conn.name}"
-            )
-            self._background_tasks.append(task)
-            return
+            if not await _port_refuses(conn.srv):
+                # Still running, just not answering (busy, or wedged): never
+                # killed automatically (decision 01M70HS1Q6). Keep re-dialing;
+                # the next call routed here asks the user.
+                if not conn._unresponsive:
+                    logger.warning(
+                        "'%s' is running but hasn't answered %d reconnects — not "
+                        "restarting it; the next call to it will ask the user",
+                        conn.name,
+                        _BACKING_RESTART_AFTER,
+                    )
+                conn._unresponsive = True
+            else:
+                # Gone: nothing listens on its port. Restart it the way
+                # combiner__restart_server does, in its own task: its teardown
+                # cancels this monitor, so it can't run in here.
+                conn._handed_off = True
+                logger.warning(
+                    "'%s' failed %d consecutive reconnects — restarting it "
+                    "(the combiner__restart_server routine)",
+                    conn.name,
+                    _BACKING_RESTART_AFTER,
+                )
+                task = background_task(
+                    self._restart_in_background(conn.name), name=f"auto-restart-{conn.name}"
+                )
+                self._background_tasks.append(task)
+                return
 
         await asyncio.sleep(conn._backoff)
         await self._open(conn)
 
         if conn.client_ref[0] is None:
-            # Failed — increase back-off for next attempt
+            # Failed — increase back-off for next attempt. (Counted even when
+            # unresponsive: every _BACKING_RESTART_AFTER failures re-checks
+            # whether the process has since gone, which IS restarted.)
             conn._consec_failures += 1
             max_backoff = _MAX_BACKOFF_LOCAL if _is_local_upstream(conn.srv) else _MAX_BACKOFF
             conn._backoff = min(conn._backoff * _BACKOFF_MULTIPLIER, max_backoff)
         else:
             conn._consec_failures = 0
+            if conn._unresponsive:
+                conn._unresponsive = False
+                from mcp_combiner import restartprompt
+
+                restartprompt.recovered(conn.name)
+                logger.info("'%s' is answering again", conn.name)
 
     async def _restart_in_background(self, name: str) -> None:
         restart = self._restart_server
@@ -1019,6 +1050,24 @@ def _log_auth_failure_details(name: str, srv: ServerConfig, exc: BaseException) 
             name,
             sent,
         )
+
+
+async def _port_refuses(srv: ServerConfig) -> bool:
+    """Whether nothing is listening on *srv*'s port (the process is gone). A
+    timeout or an accepted connection means something is there."""
+    if not srv.url:
+        return False
+    parsed = urlparse(_interpolate_str(srv.url))
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        _reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), 3.0)
+    except ConnectionRefusedError:
+        return True
+    except (OSError, TimeoutError):
+        return False
+    writer.close()
+    return False
 
 
 def _is_local_upstream(srv: ServerConfig) -> bool:

@@ -401,6 +401,75 @@ class TestReconnectBackingRestart:
         assert len(opens) == dialed  # and it doesn't re-dial itself
         assert conn._consec_failures == 0
 
+    async def test_a_running_but_silent_server_is_never_restarted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Its port still accepts connections: not gone, so not restarted.
+        It reads "unresponsive" (the next call asks the user) and is re-dialed;
+        a successful reconnect clears it."""
+        restarts: list[str] = []
+
+        async def restart_server(name: str) -> str:
+            restarts.append(name)
+            return "restarted"
+
+        listener = await asyncio.start_server(lambda r, w: w.close(), "127.0.0.1", 0)
+        port = listener.sockets[0].getsockname()[1]
+        try:
+            mgr = ConnectionManager(restart_server=restart_server)
+            conn = managed_conn("a", shared_server="crib", url=f"http://127.0.0.1:{port}/mcp")
+            mgr._connections["a"] = conn
+
+            async def failing_open(c: _ManagedConnection) -> None:
+                c.client_ref[0] = None
+
+            monkeypatch.setattr(mgr, "_open", failing_open)
+            for _ in range(_BACKING_RESTART_AFTER + 1):
+                await mgr._reconnect(conn)
+            await asyncio.sleep(0)
+            assert restarts == [] and not conn._handed_off
+            assert mgr.is_unresponsive("a") and mgr.lifecycle_state("a") == "unresponsive"
+
+            async def succeeding_open(c: _ManagedConnection) -> None:
+                c.client_ref[0] = ScriptedClient(connected=True)
+
+            monkeypatch.setattr(mgr, "_open", succeeding_open)
+            await mgr._reconnect(conn)
+            assert not mgr.is_unresponsive("a")
+        finally:
+            listener.close()
+            await listener.wait_closed()
+
+    async def test_a_silent_server_that_later_dies_is_restarted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        restarts: list[str] = []
+
+        async def restart_server(name: str) -> str:
+            restarts.append(name)
+            return "restarted"
+
+        listener = await asyncio.start_server(lambda r, w: w.close(), "127.0.0.1", 0)
+        port = listener.sockets[0].getsockname()[1]
+        mgr = ConnectionManager(restart_server=restart_server)
+        conn = managed_conn("a", shared_server="crib", url=f"http://127.0.0.1:{port}/mcp")
+
+        async def failing_open(c: _ManagedConnection) -> None:
+            c.client_ref[0] = None
+
+        monkeypatch.setattr(mgr, "_open", failing_open)
+        for _ in range(_BACKING_RESTART_AFTER + 1):
+            await mgr._reconnect(conn)
+        assert conn._unresponsive and restarts == []
+        listener.close()
+        await listener.wait_closed()  # now nothing listens: it's gone
+        for _ in range(_BACKING_RESTART_AFTER + 1):
+            if conn._handed_off:
+                break
+            await mgr._reconnect(conn)
+        await asyncio.sleep(0)
+        assert restarts == ["a"]
+
     async def test_no_restart_without_shared_server(self, monkeypatch: pytest.MonkeyPatch) -> None:
         restarts: list[str] = []
 

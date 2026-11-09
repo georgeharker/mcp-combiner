@@ -1,24 +1,23 @@
-"""An isolated, sharedserver-backed upstream whose process wedges and is
-brought back by the health monitor (not by combiner__restart_server).
+"""An isolated, sharedserver-backed upstream that dies or stops answering
+(design decision 01M70HS1Q6).
 
-Seen live with cribsheet: a wedged daemon, the monitor's forced restart, and
-afterwards a server reading "ready" while chats had none of its tools. This
-pins the recovery: the monitor's restart resets the chats' per-chat sessions
-(as combiner__restart_server does) and both an existing and a fresh chat get
-the tools back. The other half of that incident, a prime answered empty after
-the connection had listed tools, is covered by the re-probe unit tests in
-test_connections and test_session_filter.
+- GONE (its process killed, the port refuses): the health monitor restarts it
+  through the combiner__restart_server routine, which resets the chats'
+  per-chat sessions; existing and fresh chats get the tools back.
+- STILL RUNNING but not answering (frozen, as cribsheet was when blocked on an
+  LLM call): never restarted automatically. The next call routed to it asks
+  the user; "Restart now" restarts it and the retried call works.
 """
 
 from __future__ import annotations
 
-import asyncio
 import os
 import signal
 from pathlib import Path
 from typing import Any
 
 import httpx2
+import mcp.types as mt
 import pytest
 from conftest import (
     FAST_TIMING_ENV,
@@ -35,6 +34,7 @@ from conftest import (
 from fakes import content_text
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
+from fastmcp.exceptions import ToolError
 
 from mcp_combiner.runtime import CLIENT_CONNECT_MODE
 
@@ -66,10 +66,7 @@ async def _greets(mcp_url: str, token: str) -> str | None:
         return None
 
 
-@requires_sharedserver
-async def test_monitor_restart_of_an_isolated_backing_restores_its_tools(
-    procs: ProcFactory, tmp_path: Path
-) -> None:
+async def _start(procs: ProcFactory, tmp_path: Path) -> tuple[Any, int]:
     tools_path = write_tools_spec(tmp_path / "tools.json", _SPEC)
     port = free_port()
     shared = procs.track_shared(unique_shared_name())
@@ -89,51 +86,85 @@ async def test_monitor_restart_of_an_isolated_backing_restores_its_tools(
         cfg, env=env, extra_args=["--log-file", str(tmp_path / "combiner.log")]
     )
     await combiner.wait_server_state("mockup", ("ready",), timeout=60.0)
-
-    # A chat restarts the server: the connection (and its monitor) is
-    # re-opened inside that tool call.
-    async with _chat(combiner.mcp_url, CHAT_A) as client:
-        await client.call_tool("combiner__restart_server", {"server_name": "mockup"})
-    await combiner.wait_server_state("mockup", ("ready",), timeout=60.0)
     assert await poll_until(lambda: _greets(combiner.mcp_url, CHAT_A), timeout=30.0)
+    return combiner, port
 
-    async with httpx2.AsyncClient() as http:
-        first = (await http.get(f"http://127.0.0.1:{port}/stats", timeout=2.0)).json()
 
-    # The backing process wedges (alive, answering nothing), as a daemon stuck
-    # on a slow call does; chats' requests hang. Only the monitor's escalation
-    # (a forced stop and restart) brings it back.
-    os.kill(int(first["pid"]), signal.SIGSTOP)
-    stuck = asyncio.create_task(_greets(combiner.mcp_url, CHAT_A))
+async def _pid(port: int) -> int | None:
+    try:
+        async with httpx2.AsyncClient() as http:
+            stats = (await http.get(f"http://127.0.0.1:{port}/stats", timeout=2.0)).json()
+    except Exception:
+        return None
+    return int(stats["pid"])
+
+
+@requires_sharedserver
+async def test_a_dead_backing_process_is_restarted_automatically(
+    procs: ProcFactory, tmp_path: Path
+) -> None:
+    combiner, port = await _start(procs, tmp_path)
+    first = await _pid(port)
+    assert first is not None
+    os.kill(first, signal.SIGKILL)  # gone: nothing listens on its port
 
     async def _new_process() -> int | None:
-        try:
-            async with httpx2.AsyncClient() as http:
-                stats = (await http.get(f"http://127.0.0.1:{port}/stats", timeout=2.0)).json()
-        except Exception:
-            return None
-        pid = int(stats["pid"])
-        return pid if pid != int(first["pid"]) else None
+        pid = await _pid(port)
+        return pid if pid is not None and pid != first else None
 
-    await poll_until(_new_process, timeout=90.0, desc="monitor restarts the backing process")
+    await poll_until(_new_process, timeout=90.0, desc="the monitor restarts the dead process")
+    for chat, expected in ((CHAT_B, "Hello, b0b0!"), (CHAT_A, "Hello, a11c!")):
 
-    # Both the chat that ran restart_server and a fresh chat get the tools back.
-    assert (
-        await poll_until(
-            lambda: _greets(combiner.mcp_url, CHAT_B), timeout=45.0, desc="fresh chat sees tools"
-        )
-        == "Hello, b0b0!"
-    )
-    assert (
-        await poll_until(
-            lambda: _greets(combiner.mcp_url, CHAT_A), timeout=45.0, desc="old chat sees tools"
-        )
-        == "Hello, a11c!"
-    )
-    stuck.cancel()
-    # The monitor's restart reset the chats' sessions, as restart_server does.
+        async def _greeted(token: str = chat) -> str | None:
+            return await _greets(combiner.mcp_url, token)
+
+        assert await poll_until(_greeted, timeout=45.0, desc="chat sees tools") == expected
     log = (tmp_path / "combiner.log").read_text()
-    after_escalation = log.split("failed 3 consecutive reconnects", 1)[1]
-    assert "isolated per-chat session(s) for 'mockup'" in after_escalation
-    # …because it ran the same routine as combiner__restart_server.
-    assert "Automatic restart of 'mockup': Server 'mockup' restarted" in after_escalation
+    after = log.split("failed 3 consecutive reconnects", 1)[1]
+    assert "isolated per-chat session(s) for 'mockup'" in after  # sessions reset
+    assert "Automatic restart of 'mockup': Server 'mockup' restarted" in after  # the routine
+
+
+@requires_sharedserver
+async def test_a_frozen_backing_process_is_not_killed_the_user_is_asked(
+    procs: ProcFactory, tmp_path: Path
+) -> None:
+    combiner, port = await _start(procs, tmp_path)
+    first = await _pid(port)
+    assert first is not None
+    os.kill(first, signal.SIGSTOP)  # alive (its port accepts) but answering nothing
+
+    async def _unresponsive() -> bool | None:
+        async with httpx2.AsyncClient() as http:
+            health = (await http.get(f"{combiner.base_url}/health", timeout=5.0)).json()
+        return True if health["servers"]["mockup"]["state"] == "unresponsive" else None
+
+    await poll_until(_unresponsive, timeout=90.0, desc="the server reads unresponsive")
+    assert await _pid(port) is None  # still the frozen process: nobody restarted it
+    assert (
+        "restarting it (the combiner__restart_server routine)"
+        not in (tmp_path / "combiner.log").read_text()
+    )
+
+    asked: list[str] = []
+
+    async def answer(
+        message: str, response_type: Any, params: mt.ElicitRequestParams, context: object
+    ) -> dict[str, Any]:
+        asked.append(message)
+        return {"value": "Restart now"}
+
+    async with Client(
+        StreamableHttpTransport(combiner.mcp_url, headers={"X-MCP-Combiner-Session": CHAT_B}),
+        mode=CLIENT_CONNECT_MODE,
+        elicitation_handler=answer,
+    ) as client:
+        with pytest.raises(ToolError, match="Restarted 'mockup' at your request"):
+            await client.call_tool("mockup_greet", {"who": "b0b0"})
+    assert asked and "stopped responding" in asked[0]
+
+    greeted = await poll_until(
+        lambda: _greets(combiner.mcp_url, CHAT_B), timeout=45.0, desc="the retried call works"
+    )
+    assert greeted == "Hello, b0b0!"
+    assert await _pid(port) not in (None, first)

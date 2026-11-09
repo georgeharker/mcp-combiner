@@ -373,6 +373,7 @@ _STATES = {
     "connecting": ("warn", "connecting"),
     "reconnecting": ("warn", "reconnecting"),
     "auth_failed": ("warn", "needs authorization"),
+    "unresponsive": ("warn", "not responding"),
     "disconnected": ("bad", "disconnected"),
     "unreachable": ("bad", "unreachable"),
     "failed": ("bad", "failed"),

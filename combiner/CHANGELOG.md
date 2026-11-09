@@ -8,6 +8,17 @@ tagged `vX.Y.Z`.
 
 ### Changed
 
+- **The combiner no longer kills a server that's busy.** The health monitor
+  restarts a `sharedServers`-backed server on its own only when it's gone
+  (its port refuses connections). One that's still running but has stopped
+  answering (for example blocked on a slow call) reads `unresponsive` in
+  `/health` and `/status`, keeps being re-dialled, and is never killed
+  automatically: the next tool call routed to it asks the user "Restart it?"
+  (an elicitation, or an input-required result for 2026-era clients).
+  "Restart now" restarts it and fails that call with a note to retry; "Not
+  now" fails the call and isn't asked again for 10 minutes. A client that
+  can't be asked is told to use `combiner__restart_server`. If the process
+  later dies, it's restarted automatically after all.
 - **Isolated HTTP servers list their catalog through the shared connection.**
   An `isolate: true` server's tools, resources, templates and prompts are the
   same for every chat, so the combiner now lists them through the server's

@@ -497,6 +497,13 @@ class ToolProcessingMiddleware(Middleware):
                 raise authprompt.prompt_error(
                     pending, _connection_of(context.fastmcp_context), _chat_token()
                 )
+            # A server that's running but not answering is never restarted
+            # automatically: ask the user (restartprompt, decision 01M70HS1Q6).
+            if conns is not None and conns.is_unresponsive(call_server):
+                from mcp_combiner import restartprompt
+
+                question = await restartprompt.gate(context.fastmcp_context, call_server)
+                return InputRequiredToolResult(question)
 
         # Input schema gate: a call whose arguments don't match the schema the
         # client was shown fails here, before any permission prompt or
