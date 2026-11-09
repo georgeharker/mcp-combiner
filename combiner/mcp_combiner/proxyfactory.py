@@ -19,7 +19,13 @@ from typing import Any
 
 import httpx2
 from fastmcp import Client, FastMCP
-from fastmcp.server.providers.proxy import FastMCPProxy, _create_client_factory
+from fastmcp.server.providers.proxy import (
+    ClientFactoryT,
+    FastMCPProxy,
+    ProxyMetadataMiddleware,
+    ProxyProvider,
+    _create_client_factory,
+)
 
 from mcp_combiner.auth import build_auth
 from mcp_combiner.config import CombinerConfig, ServerConfig
@@ -199,7 +205,7 @@ def _create_isolated_proxy(config: CombinerConfig, name: str, srv: ServerConfig)
         # Wrap the factory so each per-chat clone gets our handler re-attached
         # (undoing Client.new()'s downgrade), bound to the requesting chat's
         # session (per_chat=True). Passed via the public client_factory= param.
-        return FastMCPProxy(
+        return IsolatedProxy(
             client_factory=forwarding_factory(_gated_factory, name, per_chat=True), name=name
         )
 
@@ -224,7 +230,7 @@ def _create_isolated_proxy(config: CombinerConfig, name: str, srv: ServerConfig)
     # Wrap the (async) acquire so each per-chat clone gets our handler
     # re-attached, bound to the requesting chat's session (per_chat=True).
     # Passed via the public param.
-    return FastMCPProxy(
+    return IsolatedProxy(
         client_factory=forwarding_factory(stateful.acquire_stateful, name, per_chat=True),
         name=name,
     )
@@ -272,3 +278,45 @@ def _needs_oauth(srv: ServerConfig) -> bool:
     if isinstance(srv.auth, dict) and "oauth" in srv.auth:
         return True
     return False
+
+
+class CatalogProxyProvider(ProxyProvider):
+    """A ``ProxyProvider`` that LISTS through the server's shared connection
+    and CALLS through the per-chat factory (design decision 01M70BRB5N).
+
+    An isolated server's catalog (tools, resources, templates, prompts) is the
+    same for every chat; only calls and reads touch a chat's state. Listing
+    through a chat's session made the catalog depend on that session: a dead
+    one read as "no tools", and outside any chat there was no session at all.
+    ``ProxyProvider`` uses ``_get_client`` only for its four ``_list_*``
+    methods, and builds each listed component with ``client_factory``, so
+    overriding ``_get_client`` moves listing alone.
+    """
+
+    def __init__(self, client_factory: ClientFactoryT, server_name: str) -> None:
+        super().__init__(client_factory)
+        self._server_name = server_name
+
+    async def _get_client(self) -> Client[Any]:
+        manager = RUNTIME.conn_manager
+        if manager is not None and manager.has_connection(self._server_name):
+            client: Client[Any] = manager.get_client_factory(self._server_name)()
+            return client
+        # No shared connection registered (not expected for HTTP servers):
+        # list as before, through the per-chat factory.
+        return await super()._get_client()
+
+
+class IsolatedProxy(FastMCPProxy):
+    """``FastMCPProxy`` for an ``isolate: true`` HTTP/SSE server, with a
+    :class:`CatalogProxyProvider` in place of the plain ``ProxyProvider``.
+    Set up exactly as ``FastMCPProxy.__init__`` does otherwise."""
+
+    def __init__(self, *, client_factory: ClientFactoryT, name: str) -> None:
+        FastMCP.__init__(self, name=name)
+        self.provider_error_strategy = "warn"
+        self.client_factory = client_factory
+        provider = CatalogProxyProvider(client_factory, name)
+        self.add_provider(provider)
+        self.middleware.append(ProxyMetadataMiddleware(provider, identity="proxy"))
+        self._setup_proxy_ping_handler()

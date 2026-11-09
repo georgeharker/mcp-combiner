@@ -6,6 +6,18 @@ tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+### Changed
+
+- **Isolated HTTP servers list their catalog through the shared connection.**
+  An `isolate: true` server's tools, resources, templates and prompts are the
+  same for every chat, so the combiner now lists them through the server's
+  one shared connection; each chat's own upstream session is used only for
+  calls and reads. Before, the list came through whichever chat asked, so a
+  chat whose session had died (the server restarted) made the server look
+  toolless. A chat's session is now opened on its first call rather than on
+  its first listing. Isolated stdio servers are unchanged (they list through
+  the chat's own child process, which is replaced when it dies).
+
 ### Added
 
 - **`/status` page**: every server's state and tool count, pending OAuth

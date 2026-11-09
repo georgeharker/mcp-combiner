@@ -242,9 +242,19 @@ class TestResetSilence:
 
         Pins the two observable invariants so regressions diff here."""
         combiner = await self._remember_chat(procs, tmp_path, isolate=True)
+
+        async def _session_id() -> str | None:
+            entries = (await _isolated_map(combiner)).get("isolated_live", [])
+            for e in entries or []:
+                sid = e.get("upstream_session_id")
+                return str(sid) if sid else None
+            return None
+
         async with _chat(combiner) as c:
             await c.call_tool("mockup_mock__remember", {"value": "doc-1"})
             assert _first_text(await c.call_tool("mockup_mock__recall", {})) == "doc-1"
+            old_id = await _session_id()
+            assert old_id
 
             restart_result = await c.call_tool(
                 "combiner__restart_server", {"server_name": "mockup"}
@@ -254,24 +264,20 @@ class TestResetSilence:
             # INVARIANT: the agent-visible reset announcement is part of the return.
             assert "reset" in said and "state is gone" in said, said
 
-            async def _replaced() -> str | None:
-                entries = (await _isolated_map(combiner)).get("isolated_live", [])
-                for e in entries or []:
-                    sid = e.get("upstream_session_id")
-                    return str(sid) if sid else None
-                return None
-
-            new_id = await poll_until(
-                _replaced, timeout=10.0, desc="isolated entry re-established post-reset"
-            )
-            assert new_id, "fresh upstream session must exist after the reset"
-
+            # The reset dropped the chat's session; listing no longer recreates
+            # it (the catalog comes from the shared connection), so the next
+            # CALL opens the fresh one.
             # First recall on the fresh session — a loud-state upstream surfaces the
             # loss itself (mock errors); the silent-mystery class is svg-mcp-shaped.
             from fastmcp.exceptions import ToolError
 
             with pytest.raises(ToolError):
                 await c.call_tool("mockup_mock__recall", {})
+
+            new_id = await poll_until(
+                _session_id, timeout=10.0, desc="fresh isolated session after the reset"
+            )
+            assert new_id != old_id, "the call after the reset must use a fresh session"
             print(
                 "    #5 evidence — post-reset recall raises ToolError (loud upstream); "
                 "silent-state upstreams (svg-mcp) remain the residual gap"
