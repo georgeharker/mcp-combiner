@@ -696,6 +696,45 @@ class TestLocalToolsReady:
             await asyncio.sleep(0.05)
         assert manager.prime_reports == [("unconfirmed", "crib"), ("confirmed", "crib")]
 
+    @pytest.mark.parametrize("isolate", [False, True])
+    async def test_a_server_that_cannot_be_listed_primes_failed_not_empty(
+        self, monkeypatch: pytest.MonkeyPatch, isolate: bool
+    ) -> None:
+        """The combiner's own proxies raise on a failed listing (fastmcp's
+        default answers an EMPTY list), so the prime reports FAILED for a
+        server it can't list, not "answered only empty"."""
+        import socket
+
+        import mcp_combiner.server as srv
+        import mcp_combiner.toolcache as toolcache_mod
+        from mcp_combiner import mounts
+        from mcp_combiner.config import ServerConfig, Transport
+        from mcp_combiner.proxyfactory import _create_server_proxy
+
+        monkeypatch.setattr(toolcache_mod, "invalidate_tool_cache", lambda: None)
+        monkeypatch.setattr(toolcache_mod, "_LOCAL_TOOLS_READY_ATTEMPT", 1.0)
+        monkeypatch.setattr(RUNTIME, "conn_manager", None)
+        with socket.socket() as sock:  # a port nothing listens on
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        server = ServerConfig(
+            name="down",
+            url=f"http://127.0.0.1:{port}/mcp",
+            transport=Transport.HTTP,
+            isolate=isolate,
+        )
+        combiner: FastMCP[Any] = FastMCP("prime-test")
+        mounts.mount_server_provider(
+            combiner,
+            _create_server_proxy(CombinerConfig(servers={"down": server}), "down", server),
+            "down",
+        )
+        try:
+            outcome = await srv.prime_server_tools(combiner, "down", timeout=0.5, interval=0.0)
+            assert outcome is PrimeOutcome.FAILED
+        finally:
+            self._cleanup("down")
+
     async def test_prime_timeout_no_store_no_invalidate(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

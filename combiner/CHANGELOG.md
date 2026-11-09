@@ -17,6 +17,13 @@ tagged `vX.Y.Z`.
   toolless. A chat's session is now opened on its first call rather than on
   its first listing. Isolated stdio servers are unchanged (they list through
   the chat's own child process, which is replaced when it dies).
+- **A server that can't be listed is reported as failed, not empty.** The
+  combiner's per-server proxies now raise on a failed upstream listing
+  (fastmcp's default logs it and answers an empty list). The tools prime
+  reports FAILED with the error, and the resource-set recording keeps the
+  last known set instead of announcing that the server's resources vanished.
+  Chats are unaffected: they list through the combiner's top-level server,
+  which still skips a failing server and re-serves its last-known-good tools.
 
 ### Added
 

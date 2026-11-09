@@ -15,7 +15,7 @@ from server.py:
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Literal
 
 import httpx2
 from fastmcp import Client, FastMCP
@@ -39,6 +39,15 @@ from mcp_combiner.runtime import RUNTIME
 from mcp_combiner.upstream_era import client_mode, era_of
 
 logger = logging.getLogger("mcp-combiner")
+
+#: How each per-server proxy reports a failed upstream listing: RAISE, not
+#: fastmcp's default "warn" (log it and answer an EMPTY list). The combiner's
+#: own per-server listings (the tools prime, resource-set recording) must tell
+#: "failed" from "has none"; an empty answer made a failing server look
+#: toolless. Chats list through the combiner's top-level server, which keeps
+#: "warn": one failing server is skipped there (and its last-known-good tools
+#: re-served), never the whole list.
+PROXY_ERRORS: Literal["raise"] = "raise"
 
 
 def _effective_isolate(srv: ServerConfig, name: str | None = None) -> bool:
@@ -82,7 +91,7 @@ def _create_server_proxy(config: CombinerConfig, name: str, srv: ServerConfig) -
     if RUNTIME.conn_manager and RUNTIME.conn_manager.has_connection(name):
         factory = RUNTIME.conn_manager.get_client_factory(name)
 
-        return FastMCPProxy(client_factory=factory, name=name)
+        return FastMCPProxy(client_factory=factory, name=name, provider_error_strategy=PROXY_ERRORS)
 
     auth: httpx2.Auth | None = build_auth(
         name,
@@ -103,7 +112,7 @@ def _create_server_proxy(config: CombinerConfig, name: str, srv: ServerConfig) -
         # Broadcast (shared upstream, no per-chat).
         client = Client(build_http_transport(srv), auth=auth, mode=client_mode(name))
         factory = forwarding_factory(_create_client_factory(client), name, per_chat=False)
-        return FastMCPProxy(client_factory=factory, name=name)
+        return FastMCPProxy(client_factory=factory, name=name, provider_error_strategy=PROXY_ERRORS)
 
     # No auth — the config-dict path (stdio, and any HTTP/SSE without a persistent
     # connection). _create_client_factory(dict) builds a ProxyClient factory with a
@@ -115,7 +124,7 @@ def _create_server_proxy(config: CombinerConfig, name: str, srv: ServerConfig) -
         proxy_config.model_dump(exclude_none=True), mode=client_mode(name)
     )
     factory = forwarding_factory(base, name, per_chat=False)
-    return FastMCPProxy(client_factory=factory, name=name)
+    return FastMCPProxy(client_factory=factory, name=name, provider_error_strategy=PROXY_ERRORS)
 
 
 def _create_isolated_proxy(config: CombinerConfig, name: str, srv: ServerConfig) -> FastMCP:
@@ -266,6 +275,7 @@ def _create_isolated_stdio_proxy(config: CombinerConfig, name: str, srv: ServerC
     )
     logger.info("Server '%s': per-chat SUBPROCESSS isolation enabled (isolate=true, stdio)", name)
     return FastMCPProxy(
+        provider_error_strategy=PROXY_ERRORS,
         client_factory=forwarding_factory(stateful.acquire_stateful, name, per_chat=True),
         name=name,
     )
@@ -314,7 +324,7 @@ class IsolatedProxy(FastMCPProxy):
 
     def __init__(self, *, client_factory: ClientFactoryT, name: str) -> None:
         FastMCP.__init__(self, name=name)
-        self.provider_error_strategy = "warn"
+        self.provider_error_strategy = PROXY_ERRORS
         self.client_factory = client_factory
         provider = CatalogProxyProvider(client_factory, name)
         self.add_provider(provider)
