@@ -9,7 +9,8 @@
     "extensions": [
       "./src/index.ts"
     ],
-    "image": "https://raw.githubusercontent.com/georgeharker/mcp-combiner/main/plugins/pi/assets/preview.png"
+    "image": "https://raw.githubusercontent.com/georgeharker/mcp-combiner/main/plugins/pi/assets/preview.png",
+    "changelogPath": "./CHANGELOG.md"
   },
   "files": [
     "src",
@@ -18,7 +19,8 @@
     "mcp.json.example",
     "README.md",
     "LICENSE",
-    "assets"
+    "assets",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "build": "tsc",

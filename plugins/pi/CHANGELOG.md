@@ -2,9 +2,47 @@
 
 All notable changes to the Pi extension are documented here. The version moves
 in lockstep with the rest of the repo (`scripts/bump-version.sh`); releases are
-tagged `vX.Y.Z`.
+tagged `vX.Y.Z`. The extension runs the matching mcp-combiner release, so each
+entry also summarises the combiner's changes; the full list is in
+[the combiner's changelog](https://github.com/georgeharker/mcp-combiner/blob/main/combiner/CHANGELOG.md).
 
-## [0.21.3] — 2026-11-04
+## [0.23.1] - 2026-11-09
+
+### Changed
+
+- The package now ships this changelog, so Pi shows what changed after an
+  update.
+
+## [0.23.0] - 2026-11-09
+
+No extension changes. The combiner it runs:
+
+- **Isolated servers** (`isolate: true`, e.g. cribsheet, svg-mcp) list their
+  tools through one shared connection; a chat's own session is only for its
+  calls. A chat whose session died gets a fresh one on its next call, and is
+  told once that its state on that server was reset.
+- **Busy servers are never killed.** The combiner restarts a server by itself
+  only when it's gone; one that's running but not answering prompts "Restart
+  it?" on the next call to it.
+- **Per-chat hidden tools**: `combiner__session_hide_tools` /
+  `combiner__session_show_tools` hide tools by name or glob for one chat.
+- A server that can't be listed is reported as failed, not as having no tools.
+- `/status` page; web login checks the `Host` header; Tailscale docs.
+
+## [0.22.0] - 2026-11-08
+
+No extension changes. The combiner it runs:
+
+- **Web login (`web_auth`)** for widget pages, the widget relay and the OAuth
+  authorization page: a password (e.g. from 1Password via
+  `MCP_COMBINER_WEB_PASSWORD`), single-use ticket links for MCP clients, this
+  machine exempt, rate-limited sign-in.
+- `combiner__authorize_server`, proper OAuth authorization pages, and a
+  per-server `login_hint`.
+- Resource changes from server lifecycle are announced.
+- `/neovim/*` requires the inbound bearer when one is set.
+
+## [0.21.3] - 2026-11-04
 
 ### Fixed
 
@@ -13,14 +51,14 @@ tagged `vX.Y.Z`.
   a connect no longer calls `attachCombiner`, which isn't declared on that path:
   the call threw a `ReferenceError` (temporal dead zone) on every reconnect.
 
-## [0.21.2] — 2026-11-03
+## [0.21.2] - 2026-11-03
 
 ### Changed
 
 - Package metadata (`repository`, `bugs`, `homepage`, preview image) points at the
   renamed repository, `georgeharker/mcp-combiner`.
 
-## [0.20.0] — 2026-11-03
+## [0.20.0] - 2026-11-03
 
 ### Changed
 
@@ -28,7 +66,7 @@ tagged `vX.Y.Z`.
   combiner's bind setting: the first entry of a comma-separated list, loopback for a
   wildcard (`0.0.0.0` / `::`) or `auto` (tailnet), and IPv6 addresses bracketed.
 
-## [0.18.0] — 2026-11-01
+## [0.18.0] - 2026-11-01
 
 ### Added
 
@@ -39,7 +77,7 @@ tagged `vX.Y.Z`.
 Other releases from 0.17.0 to 0.21.2 changed only the combiner (see
 `combiner/CHANGELOG.md`).
 
-## [0.17.0] — 2026-10-08
+## [0.17.0] - 2026-10-08
 
 ### Changed
 
@@ -56,7 +94,7 @@ Other releases from 0.17.0 to 0.21.2 changed only the combiner (see
   pre-emptive flattening in the `mcp()` router. `widget-support.ts` re-exports the shared
   guarded `renderResourceResult` from `render.ts` instead of its own 16 KB cut.
 
-## [0.16.0] — 2026-10-04
+## [0.16.0] - 2026-10-04
 
 ### Removed
 
@@ -127,7 +165,7 @@ Other releases from 0.17.0 to 0.21.2 changed only the combiner (see
   now degrades a stale UI capture to stderr instead of throwing, and the
   teardown retires the whole instance (footer timer, UI captures, connection).
 
-## [0.15.0] — 2026-10-03
+## [0.15.0] - 2026-10-03
 
 ### Added
 
@@ -151,7 +189,7 @@ Other releases from 0.17.0 to 0.21.2 changed only the combiner (see
 - The legacy client factored to `src/legacy-client/` (deletion checklist in
   its README); shared modules extracted to `src/client/`.
 
-## [0.14.0] — 2026-09-17
+## [0.14.0] - 2026-09-17
 
 ### Added
 

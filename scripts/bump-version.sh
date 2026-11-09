@@ -225,6 +225,19 @@ if [ "$is_dev" = 0 ] && [ "$(highest "$base" "$new")" = "$base" ] && [ "$new" !=
   die "new version $new is lower than baseline $base; refusing to go backwards"
 fi
 
+# Every release has its notes written BEFORE the bump. The pi package ships
+# plugins/pi/CHANGELOG.md (Pi shows the entries newer than the last version a
+# user saw, matched by `## [X.Y.Z]` heading), so it needs one for dev builds
+# too; the combiner changelog is per stable release.
+_has_heading() { # $1 = changelog path
+  grep -qE "^## \[$(printf '%s' "$new" | sed 's/[.]/\\./g')\]" "$1"
+}
+[ -f "$ROOT/plugins/pi/CHANGELOG.md" ] && ! _has_heading "$ROOT/plugins/pi/CHANGELOG.md" &&
+  die "plugins/pi/CHANGELOG.md has no '## [$new]' heading; add the release notes first"
+if [ "$is_dev" = 0 ] && [ -f "$ROOT/combiner/CHANGELOG.md" ] && ! _has_heading "$ROOT/combiner/CHANGELOG.md"; then
+  die "combiner/CHANGELOG.md has no '## [$new]' heading; add the release notes first"
+fi
+
 if [ "$dry_run" = 1 ]; then echo "(dry run) no files changed"; exit 0; fi
 
 if [ "$do_commit" = 1 ]; then
