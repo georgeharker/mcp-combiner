@@ -23,6 +23,7 @@ import asyncio
 import time
 import uuid
 import weakref
+from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -410,6 +411,9 @@ class CombinerRuntime:
     # Unique per-process id surfaced via /health; a change signals a combiner
     # restart so clients re-register instances and token bindings.
     boot_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    #: The combiner__restart_server routine (registered with the meta tools);
+    #: the connection monitor's automatic restarts run it too.
+    restart_server: Callable[[str], Awaitable[str]] | None = None
     #: wall-clock start, for the /status page's uptime.
     started_at: float = field(default_factory=time.time)
     # What the last boot's handover restored (or why it was refused) — the LLM's

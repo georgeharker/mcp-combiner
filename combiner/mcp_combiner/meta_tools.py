@@ -473,31 +473,10 @@ def register_meta_tools(
         mount_server_provider(combiner, proxy, server_name)
         return proxy
 
-    @combiner.tool()
-    async def combiner__restart_server(server_name: str) -> str:
-        """Restart a single MCP server in place — ditch it and bring it back fresh.
-
-        This is a true restart, not a refcount bounce: for sharedserver-backed
-        servers the backing process is stopped (``sharedserver admin stop
-        --force``: graceful SIGTERM, SIGKILL fallback) and respawned, rather than
-        merely re-attaching to the same still-running process within its grace
-        period. For HTTP/SSE servers the persistent upstream connection is torn
-        down and re-opened; for plain stdio servers the FastMCP proxy is dropped
-        and recreated. Other servers are left untouched.
-
-        Use this when one server is wedged (hung, stale auth, crashed subprocess)
-        and you want to kick just that one without restarting the whole combiner.
-
-        Note: stopping a sharedserver-backed process clears its shared state, so
-        any *other* clients attached to the same shared server will also see it
-        bounce — that is inherent to a real restart.
-
-        Args:
-            server_name: Name of the server to restart.
-
-        Returns:
-            Status message.
-        """
+    async def restart_server(server_name: str) -> str:
+        """The restart routine: combiner__restart_server, and the connection
+        monitor's automatic restarts (RUNTIME.restart_server) — one path, so a
+        manual and an automatic restart can't drift apart."""
         if server_name not in config.servers:
             return f"Error: Server '{server_name}' not found"
         srv = config.servers[server_name]
@@ -632,6 +611,35 @@ def register_meta_tools(
         )
         logger.info(summary)
         return summary
+
+    RUNTIME.restart_server = restart_server
+
+    @combiner.tool()
+    async def combiner__restart_server(server_name: str) -> str:
+        """Restart a single MCP server in place — ditch it and bring it back fresh.
+
+        This is a true restart, not a refcount bounce: for sharedserver-backed
+        servers the backing process is stopped (``sharedserver admin stop
+        --force``: graceful SIGTERM, SIGKILL fallback) and respawned, rather than
+        merely re-attaching to the same still-running process within its grace
+        period. For HTTP/SSE servers the persistent upstream connection is torn
+        down and re-opened; for plain stdio servers the FastMCP proxy is dropped
+        and recreated. Other servers are left untouched.
+
+        Use this when one server is wedged (hung, stale auth, crashed subprocess)
+        and you want to kick just that one without restarting the whole combiner.
+
+        Note: stopping a sharedserver-backed process clears its shared state, so
+        any *other* clients attached to the same shared server will also see it
+        bounce — that is inherent to a real restart.
+
+        Args:
+            server_name: Name of the server to restart.
+
+        Returns:
+            Status message.
+        """
+        return await restart_server(server_name)
 
     @combiner.tool()
     async def combiner__reload_config() -> str:

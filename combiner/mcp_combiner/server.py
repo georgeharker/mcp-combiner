@@ -294,16 +294,13 @@ def create_combiner(
     # reachability probe only). See externalservers.BackingProcessManager.
     proc_manager = BackingProcessManager(config)
 
-    async def _restart_backing_resetting_chats(name: str) -> bool:
-        """The monitor's automatic backing restart, with the same per-chat
-        reset combiner__restart_server does: the restarted process has none
-        of the chats' state, so their isolated sessions start fresh."""
-        from mcp_combiner.isolated import REGISTRY as isolated_registry
-
-        evicted = await isolated_registry.evict_server(name)
-        if evicted:
-            logger.info("restart: reset %d isolated per-chat session(s) for '%s'", evicted, name)
-        return await proc_manager.restart(name)
+    async def _restart_server(name: str) -> str:
+        """The monitor's automatic restart: the combiner__restart_server
+        routine, registered on RUNTIME by the meta tools (after this)."""
+        routine = RUNTIME.restart_server
+        if routine is None:
+            return f"Server '{name}': no restart routine registered"
+        return await routine(name)
 
     conn_manager = ConnectionManager(
         # Connection-open is a lifecycle signal only — it does NOT mean the
@@ -323,7 +320,7 @@ def create_combiner(
         # (a down container is not auto-relaunched by reconnect churn; use
         # combiner__restart_server) and never for plain url-only servers
         # (nothing is owned; the caller reconnects).
-        restart_backing=_restart_backing_resetting_chats,
+        restart_server=_restart_server,
     )
     _conn_manager = conn_manager
     RUNTIME.conn_manager = conn_manager

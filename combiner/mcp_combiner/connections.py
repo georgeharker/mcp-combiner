@@ -206,6 +206,9 @@ class _ManagedConnection:
     # _BACKING_RESTART_AFTER a sharedserver-backed upstream gets its backing
     # process hard-restarted (see _reconnect). Reset on any successful open.
     _consec_failures: int = field(default=0, repr=False)
+    # Set when the monitor handed this connection to the restart routine: the
+    # monitor stops, and the routine replaces the connection.
+    _handed_off: bool = field(default=False, repr=False)
     # Consecutive health-check ping misses on a still-connected session. The
     # monitor only reconnects once this reaches _HEALTH_FAILURES_BEFORE_RECONNECT,
     # so one slow ping (e.g. a token refresh stalling on a high-latency link)
@@ -240,24 +243,26 @@ class ConnectionManager:
       connection-open instead races the warm-up and can cache an incomplete tool
       set until the TTL expires minutes later.
 
-    An optional ``restart_backing(name) -> bool`` awaitable (normally
-    ``SharedServerManager.restart``) lets the reconnect monitor escalate: after
-    ``_BACKING_RESTART_AFTER`` consecutive failed re-opens on a server with a
-    ``shared_server``, the backing process is hard-restarted — the same path
-    ``combiner__restart_server`` takes manually. Without it a crashed backing
-    process is re-dialed forever, since nothing else respawns it.
+    An optional ``restart_server(name) -> summary`` awaitable lets the reconnect
+    monitor escalate: after ``_BACKING_RESTART_AFTER`` consecutive failed
+    re-opens on a server with a ``shared_server``, the server is restarted by
+    the SAME routine ``combiner__restart_server`` runs (reset chats' sessions,
+    restart the backing process, reconnect, remount, re-list). The monitor
+    hands off to it and stops: the routine's teardown replaces this connection
+    and its monitor. Without it a crashed backing process is re-dialed forever,
+    since nothing else respawns it.
     """
 
     def __init__(
         self,
         on_connection_success: Callable[[str], None] | None = None,
         on_tools_ready: Callable[[str], None] | None = None,
-        restart_backing: Callable[[str], Awaitable[bool]] | None = None,
+        restart_server: Callable[[str], Awaitable[str]] | None = None,
     ) -> None:
         self._connections: dict[str, _ManagedConnection] = {}
         self._on_connection_success = on_connection_success
         self._on_tools_ready = on_tools_ready
-        self._restart_backing = restart_backing
+        self._restart_server = restart_server
         self._background_tasks: list[asyncio.Task[None]] = []
 
     # ------------------------------------------------------------------
@@ -786,9 +791,9 @@ class ConnectionManager:
         """Close the old session and open a fresh one.
 
         After ``_BACKING_RESTART_AFTER`` consecutive failed opens on a
-        sharedserver-backed upstream, escalates to hard-restarting the backing
-        process via ``restart_backing`` — re-dialing a port whose process is
-        dead can never succeed, and nothing else respawns it.
+        sharedserver-backed upstream, hands the server to the restart routine
+        (``restart_server``) — re-dialing a port whose process is dead can never
+        succeed, and nothing else respawns it.
         """
         logger.info("Reconnecting to '%s' (backoff=%.1fs) …", conn.name, conn._backoff)
 
@@ -813,24 +818,25 @@ class ConnectionManager:
         if (
             conn._consec_failures >= _BACKING_RESTART_AFTER
             and conn.srv.shared_server
-            and self._restart_backing is not None
+            and self._restart_server is not None
         ):
             # Re-dialing has failed repeatedly — the backing process is likely
-            # dead (crashed, or orphan-squatting its port). Hard-restart it,
-            # the same path combiner__restart_server takes manually.
+            # dead (crashed, wedged, or orphan-squatting its port). Restart the
+            # server the way combiner__restart_server does, in its own task:
+            # its teardown cancels this monitor, so it can't run in here.
             conn._consec_failures = 0
+            conn._handed_off = True
             logger.warning(
-                "'%s' failed %d consecutive reconnects — restarting its backing process",
+                "'%s' failed %d consecutive reconnects — restarting it "
+                "(the combiner__restart_server routine)",
                 conn.name,
                 _BACKING_RESTART_AFTER,
             )
-            try:
-                if await self._restart_backing(conn.name):
-                    # The restart health-polled the process up — dial soon, not
-                    # after the accumulated back-off.
-                    conn._backoff = _INITIAL_BACKOFF
-            except Exception:
-                logger.exception("Failed to restart backing process for '%s'", conn.name)
+            task = background_task(
+                self._restart_in_background(conn.name), name=f"auto-restart-{conn.name}"
+            )
+            self._background_tasks.append(task)
+            return
 
         await asyncio.sleep(conn._backoff)
         await self._open(conn)
@@ -842,6 +848,17 @@ class ConnectionManager:
             conn._backoff = min(conn._backoff * _BACKOFF_MULTIPLIER, max_backoff)
         else:
             conn._consec_failures = 0
+
+    async def _restart_in_background(self, name: str) -> None:
+        restart = self._restart_server
+        if restart is None:
+            return
+        try:
+            summary = await restart(name)
+        except Exception:
+            logger.exception("Automatic restart of '%s' failed", name)
+            return
+        logger.info("Automatic restart of '%s': %s", name, summary)
 
     async def _monitor(self, conn: _ManagedConnection) -> None:
         """Background task: periodically verify the session is alive."""
@@ -857,6 +874,8 @@ class ConnectionManager:
                 if client is None or not client.is_connected():
                     logger.warning("Connection to '%s' is down — reconnecting", conn.name)
                     await self._reconnect(conn)
+                    if conn._handed_off:
+                        return
                     continue
 
                 # Connected but tools never confirmed listable — the session came
@@ -936,6 +955,8 @@ class ConnectionManager:
                     )
                     conn._consec_ping_failures = 0
                     await self._reconnect(conn)
+                    if conn._handed_off:
+                        return
                 else:
                     conn._consec_ping_failures = 0
         except asyncio.CancelledError:

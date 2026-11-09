@@ -59,9 +59,11 @@ tagged `vX.Y.Z`.
   from a chat's tool call (`combiner__restart_server`) no longer hands that
   chat's request context to its monitor, whose later re-listings ran as that
   chat.
-- The health monitor's automatic restart of a backing process now resets the
-  chats' per-chat sessions for that server, as `combiner__restart_server`
-  does; the restarted process has none of their state.
+- The health monitor's automatic restart now runs the same routine as
+  `combiner__restart_server` (reset the chats' per-chat sessions, restart the
+  backing process, reconnect, remount, re-list), so the two can't drift
+  apart. Before, it only restarted the process, leaving chats on sessions
+  that died with it.
 - The OAuth authorization route imports its web-login module at startup, not
   per request: reinstalling the package under a running combiner (e.g. an
   editable reinstall) no longer turns authorization links into server errors.

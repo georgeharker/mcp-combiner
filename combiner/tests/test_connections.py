@@ -366,19 +366,24 @@ class TestMonitorHealthCheck:
 
 class TestReconnectBackingRestart:
     """After _BACKING_RESTART_AFTER consecutive failed opens on a
-    sharedserver-backed upstream, _reconnect escalates to restart_backing —
-    re-dialing a dead process forever can never recover it."""
+    sharedserver-backed upstream, _reconnect hands the server to the restart
+    routine (combiner__restart_server's) — re-dialing a dead process forever
+    can never recover it."""
 
-    async def test_restarts_backing_after_threshold(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_hands_off_to_the_restart_routine_after_threshold(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         restarts: list[str] = []
+        opens: list[int] = []
 
-        async def restart_backing(name: str) -> bool:
+        async def restart_server(name: str) -> str:
             restarts.append(name)
-            return True
+            return f"Server '{name}' restarted"
 
-        mgr = ConnectionManager(restart_backing=restart_backing)
+        mgr = ConnectionManager(restart_server=restart_server)
 
         async def failing_open(conn: _ManagedConnection) -> None:
+            opens.append(1)
             conn.client_ref[0] = None
 
         monkeypatch.setattr(mgr, "_open", failing_open)
@@ -386,23 +391,24 @@ class TestReconnectBackingRestart:
 
         for _ in range(_BACKING_RESTART_AFTER):
             await mgr._reconnect(conn)
-        assert restarts == []  # threshold not yet reached going in
+        assert restarts == [] and not conn._handed_off  # threshold not yet reached
 
+        dialed = len(opens)
         await mgr._reconnect(conn)
+        await asyncio.sleep(0)  # the routine runs in its own task
         assert restarts == ["a"]
-        # Counter was reset by the escalation; the next reconnect doesn't
-        # immediately restart again.
-        await mgr._reconnect(conn)
-        assert restarts == ["a"]
+        assert conn._handed_off  # the monitor stops; the routine replaces it
+        assert len(opens) == dialed  # and it doesn't re-dial itself
+        assert conn._consec_failures == 0
 
     async def test_no_restart_without_shared_server(self, monkeypatch: pytest.MonkeyPatch) -> None:
         restarts: list[str] = []
 
-        async def restart_backing(name: str) -> bool:
+        async def restart_server(name: str) -> str:
             restarts.append(name)
-            return True
+            return "restarted"
 
-        mgr = ConnectionManager(restart_backing=restart_backing)
+        mgr = ConnectionManager(restart_server=restart_server)
 
         async def failing_open(conn: _ManagedConnection) -> None:
             conn.client_ref[0] = None
@@ -417,11 +423,11 @@ class TestReconnectBackingRestart:
     async def test_success_resets_failure_counter(self, monkeypatch: pytest.MonkeyPatch) -> None:
         restarts: list[str] = []
 
-        async def restart_backing(name: str) -> bool:
+        async def restart_server(name: str) -> str:
             restarts.append(name)
-            return True
+            return "restarted"
 
-        mgr = ConnectionManager(restart_backing=restart_backing)
+        mgr = ConnectionManager(restart_server=restart_server)
         conn = managed_conn("a", shared_server="crib")
 
         async def failing_open(c: _ManagedConnection) -> None:

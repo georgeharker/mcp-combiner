@@ -135,3 +135,5 @@ async def test_monitor_restart_of_an_isolated_backing_restores_its_tools(
     log = (tmp_path / "combiner.log").read_text()
     after_escalation = log.split("failed 3 consecutive reconnects", 1)[1]
     assert "isolated per-chat session(s) for 'mockup'" in after_escalation
+    # …because it ran the same routine as combiner__restart_server.
+    assert "Automatic restart of 'mockup': Server 'mockup' restarted" in after_escalation
