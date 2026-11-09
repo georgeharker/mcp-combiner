@@ -293,6 +293,18 @@ def create_combiner(
     # per ExternalServerManager), and plain url-only servers (background
     # reachability probe only). See externalservers.BackingProcessManager.
     proc_manager = BackingProcessManager(config)
+
+    async def _restart_backing_resetting_chats(name: str) -> bool:
+        """The monitor's automatic backing restart, with the same per-chat
+        reset combiner__restart_server does: the restarted process has none
+        of the chats' state, so their isolated sessions start fresh."""
+        from mcp_combiner.isolated import REGISTRY as isolated_registry
+
+        evicted = await isolated_registry.evict_server(name)
+        if evicted:
+            logger.info("restart: reset %d isolated per-chat session(s) for '%s'", evicted, name)
+        return await proc_manager.restart(name)
+
     conn_manager = ConnectionManager(
         # Connection-open is a lifecycle signal only — it does NOT mean the
         # upstream can list tools yet, so it must not invalidate the cache.
@@ -311,7 +323,7 @@ def create_combiner(
         # (a down container is not auto-relaunched by reconnect churn; use
         # combiner__restart_server) and never for plain url-only servers
         # (nothing is owned; the caller reconnects).
-        restart_backing=proc_manager.restart,
+        restart_backing=_restart_backing_resetting_chats,
     )
     _conn_manager = conn_manager
     RUNTIME.conn_manager = conn_manager

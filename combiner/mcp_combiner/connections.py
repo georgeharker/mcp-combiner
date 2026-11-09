@@ -190,6 +190,9 @@ class _ManagedConnection:
     _next_tools_probe: float = field(default=0.0, repr=False)
     _tools_probe_started: float = field(default=0.0, repr=False)
     _tools_probe_gave_up: bool = field(default=False, repr=False)
+    # Times in a row the combiner's own prime didn't confirm tools that this
+    # connection had listed (see tools_unconfirmed) — spaces its re-probes.
+    _prime_misses: int = field(default=0, repr=False)
     # Consecutive failed _open attempts from the reconnect monitor. At
     # _BACKING_RESTART_AFTER a sharedserver-backed upstream gets its backing
     # process hard-restarted (see _reconnect). Reset on any successful open.
@@ -409,6 +412,35 @@ class ConnectionManager:
         conn = self._connections.get(name)
         if conn is not None:
             conn._tools_ready = False
+
+    def tools_unconfirmed(self, name: str) -> None:
+        """The combiner's prime (through the mounted provider) didn't confirm
+        the tools this connection had just listed — e.g. the upstream answered
+        it empty. Hand the server back to the monitor's not-ready re-probe, on
+        a growing backoff; otherwise it would read "ready" with no tools and
+        nothing would ever look again."""
+        conn = self._connections.get(name)
+        if conn is None or not conn._tools_ready:
+            return
+        conn._tools_ready = False
+        conn._prime_misses += 1
+        backoff = min(
+            _TOOLS_PROBE_BACKOFF_MAX, _HEALTH_CHECK_INTERVAL * 2 ** (conn._prime_misses - 1)
+        )
+        conn._next_tools_probe = asyncio.get_running_loop().time() + backoff
+        logger.warning(
+            "'%s' listed its tools, but the combiner's prime didn't confirm them "
+            "(miss %d) — re-probing in %.0fs",
+            name,
+            conn._prime_misses,
+            backoff,
+        )
+
+    def tools_confirmed(self, name: str) -> None:
+        """The prime confirmed *name*'s tools: clear the miss count."""
+        conn = self._connections.get(name)
+        if conn is not None:
+            conn._prime_misses = 0
 
     def reset_auth_failure(self, name: str) -> None:
         """Clear the auth-failure flag so the server can be retried."""
@@ -761,6 +793,7 @@ class ConnectionManager:
         conn._next_tools_probe = 0.0
         conn._tools_probe_started = 0.0
         conn._tools_probe_gave_up = False
+        conn._prime_misses = 0
 
         # Close the old stack — this ends the previous ``async with client:``
         try:

@@ -25,6 +25,14 @@ tagged `vX.Y.Z`.
 
 ### Fixed
 
+- A server could read "ready" while offering no tools. After the health
+  monitor restarted a wedged backing process, the connection listed the tools
+  but the combiner's own listing (through the mounted provider) came back
+  empty, and nothing looked again. Now an unconfirmed listing hands the server
+  back to the monitor's re-probe, on a growing backoff. Seen with cribsheet.
+- The health monitor's automatic restart of a backing process now resets the
+  chats' per-chat sessions for that server, as `combiner__restart_server`
+  does; the restarted process has none of their state.
 - The OAuth authorization route imports its web-login module at startup, not
   per request: reinstalling the package under a running combiner (e.g. an
   editable reinstall) no longer turns authorization links into server errors.

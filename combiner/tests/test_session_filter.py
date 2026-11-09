@@ -17,7 +17,7 @@ from unittest.mock import MagicMock
 
 import mcp.types as mt
 import pytest
-from fakes import ScriptedProvider
+from fakes import FakeConnManager, ScriptedProvider
 from fastmcp import FastMCP
 from fastmcp.resources import Resource
 from fastmcp.server.middleware import MiddlewareContext
@@ -575,6 +575,20 @@ class _HungResourcesProvider(ScriptedProvider):
         return []
 
 
+class _RecordingConnManager(FakeConnManager):
+    """Records what the prime reports back about each server's tools."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.prime_reports: list[tuple[str, str]] = []
+
+    def tools_unconfirmed(self, name: str) -> None:
+        self.prime_reports.append(("unconfirmed", name))
+
+    def tools_confirmed(self, name: str) -> None:
+        self.prime_reports.append(("confirmed", name))
+
+
 class TestLocalToolsReady:
     """`prime_server_tools`: the started → ready transition attempt — invoke
     tools/list on the server's mounted provider and record the outcome in the
@@ -660,6 +674,27 @@ class TestLocalToolsReady:
             assert ok is PrimeOutcome.READY
         finally:
             self._cleanup("hung")
+
+    async def test_tools_ready_with_an_empty_prime_hands_back_to_the_monitor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The connection listed tools (tools-ready fired) but the combiner's
+        prime got none: the connection manager is told, so it re-probes."""
+        import mcp_combiner.toolcache as toolcache_mod
+
+        manager = _RecordingConnManager()
+        monkeypatch.setattr(RUNTIME, "conn_manager", manager)
+        monkeypatch.setattr(RUNTIME, "combiner", FastMCP("prime-test"))
+        outcomes = iter([PrimeOutcome.EMPTY, PrimeOutcome.READY])
+
+        async def fake_prime(combiner: object, name: str) -> PrimeOutcome:
+            return next(outcomes)
+
+        monkeypatch.setattr(toolcache_mod, "prime_server_tools", fake_prime)
+        for _ in range(2):
+            toolcache_mod._on_upstream_tools_ready("crib")
+            await asyncio.sleep(0.05)
+        assert manager.prime_reports == [("unconfirmed", "crib"), ("confirmed", "crib")]
 
     async def test_prime_timeout_no_store_no_invalidate(
         self, monkeypatch: pytest.MonkeyPatch

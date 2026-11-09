@@ -554,6 +554,35 @@ class TestLifecycleState:
         _inject_conn(mgr, "a", auth_failed=True, has_client=False, first_attempt_done=False)
         assert mgr.lifecycle_state("a") == "auth_failed"
 
+    async def test_an_unconfirmed_prime_rearms_the_probe_with_backoff(self) -> None:
+        """The connection listed tools, but the prime got none: back to
+        "connected" with a re-probe scheduled, each miss waiting longer."""
+        mgr = ConnectionManager()
+        _inject_conn(mgr, "a", connected=True, tools_ready=True)
+        conn = mgr._connections["a"]
+        loop = asyncio.get_running_loop()
+
+        mgr.tools_unconfirmed("a")
+        assert mgr.lifecycle_state("a") == "connected"
+        first = conn._next_tools_probe - loop.time()
+        assert first > 0
+
+        conn._tools_ready = True  # the re-probe listed tools again…
+        mgr.tools_unconfirmed("a")  # …and the prime missed again
+        second = conn._next_tools_probe - loop.time()
+        assert second > first * 1.5  # each miss waits longer
+        assert conn._prime_misses == 2
+
+        mgr.tools_confirmed("a")
+        assert conn._prime_misses == 0
+        mgr.tools_unconfirmed("nope")  # unknown servers are ignored
+
+    def test_unconfirmed_leaves_a_not_ready_connection_alone(self) -> None:
+        mgr = ConnectionManager()
+        _inject_conn(mgr, "a", connected=True, tools_ready=False)
+        mgr.tools_unconfirmed("a")
+        assert mgr._connections["a"]._prime_misses == 0
+
     def test_mark_tools_unready_downgrades_ready_to_connected(self) -> None:
         mgr = ConnectionManager()
         _inject_conn(mgr, "a", connected=True, tools_ready=True)

@@ -530,11 +530,18 @@ def _on_upstream_tools_ready(name: str) -> None:
         return
 
     async def _prime_gated() -> None:
+        conn_manager = RUNTIME.conn_manager
         if await prime_server_tools(combiner, name) is not PrimeOutcome.READY:
             # No confirmed list came back (never answered, or only empty
             # answers) — clear silently so the next fetch re-lists live;
-            # publication waits for a confirmed list.
+            # publication waits for a confirmed list. The connection already
+            # counted itself tools-ready, so re-arm its re-probe: nothing else
+            # would look again.
             clear_tool_cache()
+            if conn_manager is not None:
+                conn_manager.tools_unconfirmed(name)
+        elif conn_manager is not None:
+            conn_manager.tools_confirmed(name)
 
     try:
         loop = asyncio.get_running_loop()
