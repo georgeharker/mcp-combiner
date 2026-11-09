@@ -25,11 +25,21 @@ tagged `vX.Y.Z`.
 
 ### Fixed
 
+- Per-chat-isolated HTTP servers (`isolate: true`, e.g. cribsheet) no longer
+  log "answered only empty" at every combiner start. Their startup tools
+  listing runs outside any chat, where their client couldn't be made; fastmcp
+  turns that error into an empty list. They now get a throwaway client for it,
+  as isolated stdio servers already did.
 - A server could read "ready" while offering no tools. After the health
   monitor restarted a wedged backing process, the connection listed the tools
-  but the combiner's own listing (through the mounted provider) came back
-  empty, and nothing looked again. Now an unconfirmed listing hands the server
-  back to the monitor's re-probe, on a growing backoff. Seen with cribsheet.
+  but the combiner's own listing failed (fastmcp reports a failed listing as
+  an empty one), and nothing looked again. Now an unconfirmed listing hands
+  the server back to the monitor's re-probe, on a growing backoff. Seen with
+  cribsheet.
+- Connection health monitors start in a clean context. A connection opened
+  from a chat's tool call (`combiner__restart_server`) no longer hands that
+  chat's request context to its monitor, whose later re-listings ran as that
+  chat.
 - The health monitor's automatic restart of a backing process now resets the
   chats' per-chat sessions for that server, as `combiner__restart_server`
   does; the restarted process has none of their state.

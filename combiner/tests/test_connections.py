@@ -13,6 +13,7 @@ the TTL expires. ``_signal_tools_ready`` is the bridge — it primes one bounded
 from __future__ import annotations
 
 import asyncio
+import contextvars
 from typing import NoReturn
 
 import mcp.types as mt
@@ -26,6 +27,7 @@ from mcp_combiner.connections import (
     ConnectionManager,
     _is_local_upstream,
     _ManagedConnection,
+    background_task,
 )
 
 
@@ -503,6 +505,9 @@ def _inject_conn(
     )
 
 
+_CALLER: contextvars.ContextVar[str | None] = contextvars.ContextVar("caller", default=None)
+
+
 class TestLifecycleState:
     def test_unknown_when_not_managed(self) -> None:
         assert ConnectionManager().lifecycle_state("nope") == "unknown"
@@ -553,6 +558,18 @@ class TestLifecycleState:
         mgr = ConnectionManager()
         _inject_conn(mgr, "a", auth_failed=True, has_client=False, first_attempt_done=False)
         assert mgr.lifecycle_state("a") == "auth_failed"
+
+    async def test_background_tasks_do_not_inherit_the_callers_request(self) -> None:
+        """The monitor is started from wherever the connection was opened,
+        often a chat's tool call; it must not carry that chat's context."""
+        seen: list[str | None] = []
+
+        async def look() -> None:
+            seen.append(_CALLER.get())
+
+        _CALLER.set("chat-a")
+        await background_task(look(), name="t")
+        assert seen == [None]
 
     async def test_an_unconfirmed_prime_rearms_the_probe_with_backoff(self) -> None:
         """The connection listed tools, but the prime got none: back to

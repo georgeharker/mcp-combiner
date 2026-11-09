@@ -31,11 +31,12 @@ Auth-failure semantics
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import os
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable, Coroutine
 from urllib.parse import urlparse
 
 import httpx2
@@ -65,6 +66,14 @@ HttpClient = Client[StreamableHttpTransport | SSETransport]
 # ---------------------------------------------------------------------------
 # Reconnection tuning
 # ---------------------------------------------------------------------------
+def background_task(coro: Coroutine[Any, Any, None], *, name: str) -> asyncio.Task[None]:
+    """A long-lived task in a CLEAN context. A connection is often opened from
+    inside a chat's tool call (combiner__restart_server, enable_server); a
+    plain create_task would hand its monitor that request's context — chat
+    token and all — for life, so its later re-primes would run as that chat."""
+    return asyncio.get_running_loop().create_task(coro, name=name, context=contextvars.Context())
+
+
 def _env_float(name: str, default: float) -> float:
     """Timing knob override for tests (MCP_COMBINER_* env); defaults unchanged."""
     try:
@@ -526,9 +535,7 @@ class ConnectionManager:
 
         # Start the background health/reconnect monitor
         if conn._monitor_task is None or conn._monitor_task.done():
-            conn._monitor_task = asyncio.create_task(
-                self._monitor(conn), name=f"conn-monitor-{name}"
-            )
+            conn._monitor_task = background_task(self._monitor(conn), name=f"conn-monitor-{name}")
 
     async def connect_all(self, config: CombinerConfig) -> None:
         """Open persistent connections for every registered HTTP/SSE server.

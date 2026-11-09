@@ -692,6 +692,16 @@ class IsolatedSessionRegistry:
 REGISTRY = IsolatedSessionRegistry()
 
 
+def _in_request() -> bool:
+    """Whether a server request context is active (a chat's call or listing),
+    as opposed to the combiner's own background work (startup prime, monitor)."""
+    try:
+        get_context().session
+    except Exception:
+        return False
+    return True
+
+
 class TokenKeyedStatefulClient(StatefulProxyClient[ClientTransportT]):
     """``StatefulProxyClient`` whose per-chat cache is keyed by chat token.
 
@@ -719,6 +729,14 @@ class TokenKeyedStatefulClient(StatefulProxyClient[ClientTransportT]):
     async def acquire_stateful(self) -> Client[Any]:
         token = _request_group_key()
         if token is None:
+            if not _in_request():
+                # OUT of any request — the startup/re-probe tools/list.
+                # ``new_stateful`` needs a request context and would raise
+                # (which fastmcp's server layer turns into an EMPTY list, so
+                # the prime read "answered empty" on every start). Serve the
+                # probe with a throwaway clone: the proxy's list opens and
+                # closes it, and no chat's session is touched.
+                return self._new_per_chat()
             return super().new_stateful()
 
         session = _request_connection()
@@ -857,12 +875,7 @@ class TokenKeyedStdioClient(StatefulProxyClient[StdioTransport]):
             #      raise, so serve the probe with an EPHEMERAL client
             #      (keep_alive=False): the proxy's list runs in one context
             #      and the child dies with it — startup never leaks children.
-            in_request = True
-            try:
-                get_context().session
-            except Exception:
-                in_request = False
-            if not in_request:
+            if not _in_request():
                 return self._new_stdio_probe()
             return super().new_stateful()
 
