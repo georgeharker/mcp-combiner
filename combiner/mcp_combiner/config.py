@@ -586,12 +586,6 @@ class ServerConfig(BaseModel):
     """
 
     isolate: bool | None = None
-    #: The profiles this server belongs to (see :class:`ProfileConfig`). Empty:
-    #: not governed by profiles. Otherwise it runs only while one of them is on.
-    profiles: list[str] = Field(default_factory=list)
-    #: The server's own ``disabled`` from the file, before profiles apply
-    #: (``disabled`` is the effective value everything else reads).
-    disabled_in_file: bool = False
     """Tri-state: give each downstream chat its own upstream MCP session.
 
     When isolated, the combiner opens a separate upstream session per downstream
@@ -619,6 +613,12 @@ class ServerConfig(BaseModel):
 
     See ``proxyfactory._effective_isolate``.
     """
+    #: The profiles this server belongs to (see :class:`ProfileConfig`). Empty:
+    #: not governed by profiles. Otherwise it runs only while one of them is on.
+    profiles: list[str] = Field(default_factory=list)
+    #: The server's own ``disabled`` from the file, before profiles apply
+    #: (``disabled`` is the effective value everything else reads).
+    disabled_in_file: bool = False
 
     @classmethod
     def from_dict(cls, name: str, data: dict[str, Any]) -> ServerConfig:
@@ -1207,11 +1207,11 @@ class CombinerConfig(BaseModel):
     bind: BindConfig = Field(default_factory=BindConfig)
     web_auth: WebAuthConfig = Field(default_factory=WebAuthConfig)
     permissions: PermissionPolicy | None = None
-    #: Profiles that LOADED on this machine (their ``when`` matched), by name.
-    profiles: dict[str, ProfileConfig] = Field(default_factory=dict)
     """Global tool-call permission policy applied to every server, unless a
     server overrides it.  ``None`` (default) means **off** — no gate, identical
     to pre-feature behavior.  See :class:`PermissionPolicy`."""
+    #: Profiles that LOADED on this machine (their ``when`` matched), by name.
+    profiles: dict[str, ProfileConfig] = Field(default_factory=dict)
     config_path: str = ""
 
     @classmethod

@@ -125,6 +125,18 @@ class TestLoading:
             _load(tmp_path, {"mcpServers": {}, **doc})
 
 
+def test_a_failed_enable_or_disable_is_not_counted_as_done() -> None:
+    """The profile toggle reports failures from enable_server / disable_server
+    by their messages; "enabled but failed to mount" is a failure."""
+    from mcp_combiner.meta_tools import went_wrong
+
+    assert not went_wrong("Server 'a' enabled and mounted")
+    assert not went_wrong("Server 'a' disabled and unmounted (1 provider(s) removed)")
+    assert went_wrong("Server 'a' enabled but failed to mount: boom")
+    assert went_wrong("Server 'a' disabled but failed to unmount: boom")
+    assert went_wrong("Error: Server 'a' not found")
+
+
 @pytest.mark.e2e
 async def test_turning_a_profile_on_and_off(procs: ProcFactory, tmp_path: Path) -> None:
     one = await procs.start_http_mock("one")

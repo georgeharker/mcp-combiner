@@ -69,6 +69,13 @@ def _unnamespace_failed(exc: Any) -> bool:
     return "not found" in low or "no such" in low or "unknown" in low or "does not exist" in low
 
 
+def went_wrong(result: str) -> bool:
+    """Whether enable_server / disable_server reported a failure: their
+    errors start "Error" or say "... but failed to ..." (e.g. "enabled but
+    failed to mount"), so success can't be read from "enabled" alone."""
+    return result.startswith("Error") or " but failed to " in result
+
+
 def register_meta_tools(
     combiner: FastMCP,
     config: CombinerConfig,
@@ -638,10 +645,10 @@ def register_meta_tools(
             should_run = server_runs(srv, config.profiles)
             if should_run and srv.disabled:
                 result = await combiner__enable_server(srv_name)
-                (started if "enabled" in result else failed).append(srv_name)
+                (failed if went_wrong(result) else started).append(srv_name)
             elif not should_run and not srv.disabled:
                 result = await combiner__disable_server(srv_name)
-                (stopped if "disabled" in result else failed).append(srv_name)
+                (failed if went_wrong(result) else stopped).append(srv_name)
         parts = [f"Profile '{name}' {'on' if on else 'off'}"]
         if started:
             parts.append(f"started {', '.join(started)}")
