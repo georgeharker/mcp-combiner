@@ -749,6 +749,18 @@ async def cmd_health(args: argparse.Namespace) -> int:
     return 0 if code == 200 else 1
 
 
+async def cmd_profile(args: argparse.Namespace) -> int:
+    if args.action == "list":
+        _emit(args, await _call_meta(args, "combiner__profiles", {}))
+        return 0
+    if not args.name:
+        print(f"profile {args.action}: name a profile", file=sys.stderr)
+        return 2
+    tool = "combiner__enable_profile" if args.action == "enable" else "combiner__disable_profile"
+    _emit(args, await _call_meta(args, tool, {"profile": args.name}))
+    return 0
+
+
 async def cmd_enable(args: argparse.Namespace) -> int:
     _emit(args, await _call_meta(args, "combiner__enable_server", {"server_name": args.server}))
     return 0
@@ -1010,6 +1022,12 @@ def add_ctl_parsers(subparsers: "argparse._SubParsersAction[argparse.ArgumentPar
         p.add_argument("server", help="Server name from the combiner config")
         _common(p)
         p.set_defaults(func=fn)
+
+    p = subparsers.add_parser("profile", help="List server profiles, or turn one on or off")
+    p.add_argument("action", choices=["list", "enable", "disable"])
+    p.add_argument("name", nargs="?", help="Profile name (enable/disable)")
+    _common(p)
+    p.set_defaults(func=cmd_profile)
 
     p = subparsers.add_parser("reload", help="Re-read the config file and apply the diff")
     _common(p)

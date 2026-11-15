@@ -4,6 +4,26 @@ All notable changes to the combiner are documented here. The version moves in
 lockstep with the rest of the repo (`scripts/bump-version.sh`); releases are
 tagged `vX.Y.Z`.
 
+## [Unreleased]
+
+### Added
+
+- **Server profiles**: named groups of servers in the config's `profiles`
+  block, which servers join with `"profiles": [...]`.
+  - A profile loads only where its `when` matches: `platforms`
+    (`darwin`/`linux`/`win32`), `hosts` (short host name), `env` (variables
+    set, or set to a value). A server none of whose profiles load is skipped
+    entirely, so one config file works across machines (e.g. Mac-only
+    servers).
+  - A loaded profile is on unless `"enabled": false`. A server runs if any
+    of its loaded profiles is on (and it isn't itself `disabled`).
+  - `MCP_COMBINER_PROFILES=+music,-google` overrides `enabled` at startup.
+  - `combiner__profiles`, `combiner__enable_profile`,
+    `combiner__disable_profile`, and `mcp-combiner profile list|enable|disable`
+    list and toggle them at runtime (until a restart or config reload).
+  - Unknown profile names, platforms or keys fail the config load.
+  - `/health` and `combiner__status` list each server's profiles.
+
 ## [0.23.1] — 2026-11-09
 
 No combiner changes. Packaging: the Pi extension (`@geohar/pi-mcp-combiner`)

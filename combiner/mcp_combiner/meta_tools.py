@@ -617,6 +617,86 @@ def register_meta_tools(
 
     RUNTIME.restart_server = restart_server
 
+    async def _set_profile(name: str, on: bool) -> str:
+        """Turn profile *name* on or off: start or stop each member server
+        whose should-run state changes (on-wins: a server stays up while any
+        of its other loaded profiles is on). Memory-only, like enable_server:
+        a restart or reload reapplies the config file."""
+        from mcp_combiner.config import server_runs
+
+        profile = config.profiles.get(name)
+        if profile is None:
+            known = ", ".join(sorted(config.profiles)) or "none"
+            return f"Error: profile '{name}' isn't loaded here (loaded: {known})"
+        config.profiles[name] = profile.model_copy(update={"enabled": on})
+        started: list[str] = []
+        stopped: list[str] = []
+        failed: list[str] = []
+        for srv_name, srv in list(config.servers.items()):
+            if name not in srv.profiles:
+                continue
+            should_run = server_runs(srv, config.profiles)
+            if should_run and srv.disabled:
+                result = await combiner__enable_server(srv_name)
+                (started if "enabled" in result else failed).append(srv_name)
+            elif not should_run and not srv.disabled:
+                result = await combiner__disable_server(srv_name)
+                (stopped if "disabled" in result else failed).append(srv_name)
+        parts = [f"Profile '{name}' {'on' if on else 'off'}"]
+        if started:
+            parts.append(f"started {', '.join(started)}")
+        if stopped:
+            parts.append(f"stopped {', '.join(stopped)}")
+        if failed:
+            parts.append(f"failed: {', '.join(failed)} (see combiner__status)")
+        if not (started or stopped or failed):
+            parts.append("no servers changed")
+        logger.info("; ".join(parts))
+        return "; ".join(parts) + "."
+
+    @combiner.tool()
+    async def combiner__enable_profile(profile: str) -> str:
+        """Turn a server profile on: start its servers.
+
+        A profile is a named group of servers from the config's ``profiles``.
+        A server runs while ANY of its profiles is on. The change lasts until
+        the combiner restarts or reloads its config.
+
+        Args:
+            profile: the profile's name (see combiner__profiles).
+        """
+        return await _set_profile(profile, True)
+
+    @combiner.tool()
+    async def combiner__disable_profile(profile: str) -> str:
+        """Turn a server profile off: stop its servers, except those that
+        another profile that's on still needs.
+
+        Args:
+            profile: the profile's name (see combiner__profiles).
+        """
+        return await _set_profile(profile, False)
+
+    @combiner.tool()
+    async def combiner__profiles() -> str:
+        """List the server profiles loaded on this machine: whether each is
+        on, and its servers (with whether each is running)."""
+        import json
+
+        return json.dumps(
+            {
+                name: {
+                    "enabled": profile.enabled,
+                    "servers": {
+                        srv_name: not srv.disabled
+                        for srv_name, srv in sorted(config.servers.items())
+                        if name in srv.profiles
+                    },
+                }
+                for name, profile in sorted(config.profiles.items())
+            }
+        )
+
     @combiner.tool()
     async def combiner__restart_server(server_name: str) -> str:
         """Restart a single MCP server in place — ditch it and bring it back fresh.
@@ -725,6 +805,7 @@ def register_meta_tools(
         config.shared_servers = new_cfg.shared_servers
         config.external_servers = new_cfg.external_servers
         config.oauth = new_cfg.oauth
+        config.profiles = new_cfg.profiles
 
         # 3) Mount added + changed servers that are enabled, now reading the
         #    fresh definitions from the swapped-in config.

@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -383,6 +384,140 @@ def _merge_policies(
     )
 
 
+PROFILES_ENV = "MCP_COMBINER_PROFILES"
+
+
+class ProfileWhen(BaseModel):
+    """Where a profile LOADS. Every given condition must match; none given
+    means everywhere."""
+
+    #: ``sys.platform`` values: ``darwin``, ``linux``, ``win32``.
+    platforms: list[str] = Field(default_factory=list)
+    #: Short host names (``socket.gethostname()`` up to the first dot), any case.
+    hosts: list[str] = Field(default_factory=list)
+    #: Environment: a list of variables that must be set and non-empty, or an
+    #: object of variable -> required value.
+    env: list[str] | dict[str, str] = Field(default_factory=list)
+
+    PLATFORMS: ClassVar[frozenset[str]] = frozenset({"darwin", "linux", "win32"})
+
+    @classmethod
+    def from_dict(cls, profile: str, data: object) -> ProfileWhen:
+        if not isinstance(data, dict):
+            raise ValueError(f"profile '{profile}': when must be an object")
+        unknown = sorted(set(data) - {"platforms", "hosts", "env"})
+        if unknown:
+            raise ValueError(f"profile '{profile}': unknown when key(s) {', '.join(unknown)}")
+        platforms = data.get("platforms", [])
+        hosts = data.get("hosts", [])
+        env = data.get("env", [])
+        for key, value in (("platforms", platforms), ("hosts", hosts)):
+            if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+                raise ValueError(f"profile '{profile}': when.{key} must be a list of strings")
+        bad = sorted(set(platforms) - cls.PLATFORMS)
+        if bad:
+            raise ValueError(
+                f"profile '{profile}': unknown platform(s) {', '.join(bad)}; "
+                f"use {', '.join(sorted(cls.PLATFORMS))}"
+            )
+        if isinstance(env, dict):
+            env = {str(k): str(v) for k, v in env.items()}
+        elif not (isinstance(env, list) and all(isinstance(v, str) for v in env)):
+            raise ValueError(f"profile '{profile}': when.env must be a list or an object")
+        return cls(platforms=platforms, hosts=hosts, env=env)
+
+    def matches(self) -> bool:
+        import socket
+
+        if self.platforms and sys.platform not in self.platforms:
+            return False
+        if self.hosts:
+            host = socket.gethostname().split(".", 1)[0].lower()
+            if host not in {h.lower() for h in self.hosts}:
+                return False
+        if isinstance(self.env, dict):
+            return all(os.environ.get(k) == v for k, v in self.env.items())
+        return all(os.environ.get(k) for k in self.env)
+
+
+class ProfileConfig(BaseModel):
+    """A named group of servers (``"profiles": {name: {...}}``), design
+    decision 01M7E7BH8D. It LOADS where its ``when`` matches; a loaded profile
+    is on unless ``enabled: false``; a server in one or more profiles runs if
+    ANY of its loaded profiles is on."""
+
+    name: str
+    when: ProfileWhen = Field(default_factory=ProfileWhen)
+    enabled: bool = True
+
+    @classmethod
+    def from_dict(cls, name: str, data: object) -> ProfileConfig:
+        if not isinstance(data, dict):
+            raise ValueError(f"profile '{name}' must be an object")
+        unknown = sorted(set(data) - {"when", "enabled"})
+        if unknown:
+            raise ValueError(f"profile '{name}': unknown key(s) {', '.join(unknown)}")
+        enabled = data.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ValueError(f"profile '{name}': enabled must be true or false")
+        when = ProfileWhen.from_dict(name, data["when"]) if "when" in data else ProfileWhen()
+        return cls(name=name, when=when, enabled=enabled)
+
+
+def profile_overrides() -> dict[str, bool]:
+    """``$MCP_COMBINER_PROFILES``: comma-separated ``+name`` (on) / ``-name``
+    (off); a bare name means on."""
+    out: dict[str, bool] = {}
+    for item in os.environ.get(PROFILES_ENV, "").split(","):
+        item = item.strip()
+        if item:
+            out[item.lstrip("+-")] = not item.startswith("-")
+    return out
+
+
+def server_runs(srv: ServerConfig, profiles: dict[str, ProfileConfig]) -> bool:
+    """Whether *srv* should run: not disabled in the file, and (when governed
+    by profiles) at least one of its loaded profiles on — on-wins."""
+    if srv.disabled_in_file:
+        return False
+    if not srv.profiles:
+        return True
+    return any(profiles[p].enabled for p in srv.profiles if p in profiles)
+
+
+def resolve_profiles(
+    defined: dict[str, ProfileConfig], servers: dict[str, ServerConfig]
+) -> tuple[dict[str, ProfileConfig], dict[str, ServerConfig]]:
+    """Apply profiles at load: the profiles that load here (with
+    ``$MCP_COMBINER_PROFILES`` applied), and the servers that remain, each
+    ``disabled`` unless :func:`server_runs`. A server whose profiles all failed
+    to load is dropped: it doesn't exist on this machine."""
+    for name, srv in servers.items():
+        unknown = sorted(set(srv.profiles) - set(defined))
+        if unknown:
+            raise ValueError(f"server '{name}': unknown profile(s) {', '.join(unknown)}")
+    overrides = profile_overrides()
+    unknown_env = sorted(set(overrides) - set(defined))
+    if unknown_env:
+        logger.warning("%s names unknown profile(s): %s", PROFILES_ENV, ", ".join(unknown_env))
+    loaded: dict[str, ProfileConfig] = {}
+    for name, profile in defined.items():
+        if not profile.when.matches():
+            logger.info("profile '%s' doesn't apply on this machine — not loaded", name)
+            continue
+        if name in overrides:
+            profile = profile.model_copy(update={"enabled": overrides[name]})
+        loaded[name] = profile
+    kept: dict[str, ServerConfig] = {}
+    for name, srv in servers.items():
+        if srv.profiles and not any(p in loaded for p in srv.profiles):
+            logger.info("server '%s': none of its profiles load here — skipped", name)
+            continue
+        srv.disabled = not server_runs(srv, loaded)
+        kept[name] = srv
+    return loaded, kept
+
+
 class ServerConfig(BaseModel):
     """Configuration for a single MCP server."""
 
@@ -451,6 +586,12 @@ class ServerConfig(BaseModel):
     """
 
     isolate: bool | None = None
+    #: The profiles this server belongs to (see :class:`ProfileConfig`). Empty:
+    #: not governed by profiles. Otherwise it runs only while one of them is on.
+    profiles: list[str] = Field(default_factory=list)
+    #: The server's own ``disabled`` from the file, before profiles apply
+    #: (``disabled`` is the effective value everything else reads).
+    disabled_in_file: bool = False
     """Tri-state: give each downstream chat its own upstream MCP session.
 
     When isolated, the combiner opens a separate upstream session per downstream
@@ -507,8 +648,12 @@ class ServerConfig(BaseModel):
                 "permissions",
                 "isolate",
                 "protocol",
+                "profiles",
             },
         )
+        raw_profiles = data.get("profiles", [])
+        if not isinstance(raw_profiles, list) or not all(isinstance(p, str) for p in raw_profiles):
+            raise ValueError(f"server '{name}': profiles must be a list of profile names")
         transport_str = data.get("transport")
         if transport_str is None:
             transport_str = "http" if "url" in data else "stdio"
@@ -548,6 +693,8 @@ class ServerConfig(BaseModel):
             permissions=PermissionPolicy.from_dict(data.get("permissions")),
             isolate=(None if data.get("isolate") is None else bool(data["isolate"])),
             protocol=_upstream_protocol(name, data.get("protocol")),
+            profiles=list(raw_profiles),
+            disabled_in_file=bool(data.get("disabled", False)),
         )
 
 
@@ -582,6 +729,8 @@ class ServerStatusInfo(BaseModel):
     """sharedServers key if this server has a managed process, else ``None``."""
     external_server: str | None = None
     """externalServers key if this server has a non-owned backing process, else ``None``."""
+    profiles: list[str] = Field(default_factory=list)
+    """The profiles this server belongs to (empty: not governed by profiles)."""
     state: str = "unknown"
     """Runtime lifecycle state: ``"ready"``, ``"connected"`` (session up, tools
     warming), ``"disconnected"``, ``"auth_failed"``, or ``"disabled"``. Overlaid
@@ -1058,6 +1207,8 @@ class CombinerConfig(BaseModel):
     bind: BindConfig = Field(default_factory=BindConfig)
     web_auth: WebAuthConfig = Field(default_factory=WebAuthConfig)
     permissions: PermissionPolicy | None = None
+    #: Profiles that LOADED on this machine (their ``when`` matched), by name.
+    profiles: dict[str, ProfileConfig] = Field(default_factory=dict)
     """Global tool-call permission policy applied to every server, unless a
     server overrides it.  ``None`` (default) means **off** — no gate, identical
     to pre-feature behavior.  See :class:`PermissionPolicy`."""
@@ -1091,6 +1242,13 @@ class CombinerConfig(BaseModel):
         servers = {
             name: ServerConfig.from_dict(name, srv_data) for name, srv_data in raw_servers.items()
         }
+        raw_profiles = raw.get("profiles", {})
+        if not isinstance(raw_profiles, dict):
+            raise ValueError("profiles must be an object of profile name -> settings")
+        profiles, servers = resolve_profiles(
+            {name: ProfileConfig.from_dict(name, data) for name, data in raw_profiles.items()},
+            servers,
+        )
 
         shared_servers = {
             name: SharedServerConfig.from_dict(name, data) for name, data in raw_shared.items()
@@ -1170,6 +1328,7 @@ class CombinerConfig(BaseModel):
             isolation=isolation,
             validation=validation,
             permissions=permissions,
+            profiles=profiles,
             config_path=str(path),
         )
 
@@ -1273,6 +1432,7 @@ class CombinerConfig(BaseModel):
             auth_type=auth_type,
             shared_server=srv.shared_server,
             external_server=srv.external_server,
+            profiles=list(srv.profiles),
         )
 
 
