@@ -6,6 +6,10 @@ tagged `vX.Y.Z`. The extension runs the matching mcp-combiner release, so each
 entry also summarises the combiner's changes; the full list is in
 [the combiner's changelog](https://github.com/georgeharker/mcp-combiner/blob/main/combiner/CHANGELOG.md).
 
+## [0.24.2] - 2026-11-15
+
+No extension changes. The combiner it runs now requires fastmcp 4.2.0.
+
 ## [0.24.1] - 2026-11-15
 
 No extension changes. The combiner's CLI now explains clearly when it can't

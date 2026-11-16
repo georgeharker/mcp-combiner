@@ -4,6 +4,13 @@ All notable changes to the combiner are documented here. The version moves in
 lockstep with the rest of the repo (`scripts/bump-version.sh`); releases are
 tagged `vX.Y.Z`.
 
+## [0.24.2] — 2026-11-15
+
+### Changed
+
+- Requires **fastmcp 4.2.0** or later (was 4.1.5); the full test suite runs
+  against it. No combiner code changes.
+
 ## [0.24.1] — 2026-11-15
 
 ### Fixed
