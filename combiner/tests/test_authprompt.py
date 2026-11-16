@@ -868,6 +868,49 @@ class TestAuthorizeServerTool:
             done = await poll_until(_authorized, timeout=30.0, desc="authorized")
             assert "already authorized" in done
 
+    async def test_the_cli_prints_the_link_and_reports_when_done(
+        self, procs: ProcFactory, oauth_mock: OAuthMockFactory, tmp_path: Path
+    ) -> None:
+        """`mcp-combiner authorize <server>`: the link is the answer (exit 0);
+        once authorized, it says so; an unknown server is an error (exit 1)."""
+        import asyncio
+        import os
+        import sys
+
+        mock = await oauth_mock()
+        base = (await self._start(procs, mock, tmp_path)).removesuffix("/mcp")
+        env = {k: v for k, v in os.environ.items() if not k.startswith("MCP_COMBINER")}
+
+        async def cli(*argv: str) -> tuple[int, str, str]:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-m",
+                "mcp_combiner",
+                *argv,
+                "--url",
+                base,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            out, err = await proc.communicate()
+            return proc.returncode or 0, out.decode(), err.decode()
+
+        code, out, _ = await cli("authorize", "mock")
+        assert code == 0, out
+        assert out.startswith("Authorize 'mock': open")
+        link = out.split()[-1]
+        assert link.startswith(base + "/oauth/authorize/"), out
+        assert (await _follow_as_user(link)).status_code == 200
+
+        async def _done() -> str | None:
+            code, out, _ = await cli("authorize", "mock")
+            return out if code == 0 and "already authorized" in out else None
+
+        assert await poll_until(_done, timeout=30.0, desc="authorized")
+        code, _, err = await cli("authorize", "nope")
+        assert code == 1 and "nope" in err
+
     async def test_clients_without_url_elicitation_get_the_link_as_text(
         self, procs: ProcFactory, oauth_mock: OAuthMockFactory, tmp_path: Path
     ) -> None:

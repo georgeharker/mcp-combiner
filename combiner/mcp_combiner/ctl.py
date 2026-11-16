@@ -20,6 +20,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -96,6 +97,62 @@ async def _call_meta(args: argparse.Namespace, tool: str, tool_args: dict[str, A
             if text is not None:
                 parts.append(text)
         return "\n".join(parts)
+
+
+async def _call_meta_outcome(
+    args: argparse.Namespace, tool: str, tool_args: dict[str, Any]
+) -> tuple[bool, str, str | None]:
+    """Like :func:`_call_meta`, but a tool error is an answer, not an
+    exception: ``(failed, text, url)``. *url* is a URL elicitation's link
+    (``-32042``), when the combiner answered with one."""
+    from fastmcp import Client
+    from fastmcp.client.transports.http import StreamableHttpTransport
+    from mcp.shared.exceptions import MCPError
+
+    transport = StreamableHttpTransport(
+        f"{_base_url(args)}/mcp", headers=_auth_headers(), max_sse_event_size=MAX_SSE_EVENT_BYTES
+    )
+    async with Client(transport, mode=CLIENT_CONNECT_MODE) as client:
+        try:
+            result = await asyncio.wait_for(
+                client.call_tool(tool, tool_args, raise_on_error=False), timeout=120.0
+            )
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"meta call '{tool}' got no answer after 120s") from None
+        except MCPError as exc:
+            data = exc.error.data if isinstance(exc.error.data, dict) else {}
+            links = [e.get("url") for e in data.get("elicitations", []) if isinstance(e, dict)]
+            url = next((u for u in links if isinstance(u, str)), None)
+            return True, exc.error.message, url
+    text = "\n".join(t for t in (getattr(i, "text", None) for i in result.content) if t)
+    return bool(result.is_error), text, None
+
+
+_LINK = re.compile(r"https?://[^\s'\"<>]+")
+
+
+async def cmd_authorize(args: argparse.Namespace) -> int:
+    """Start OAuth authorization for a server and print the link to open.
+    A link is the expected answer (exit 0); ``--open`` opens it here."""
+    failed, text, url = await _call_meta_outcome(
+        args, "combiner__authorize_server", {"server_name": args.server}
+    )
+    if url is None and failed:
+        match = _LINK.search(text)
+        url = match.group(0).rstrip(".,;)") if match else None
+    if url is None:
+        # No link: already authorized (success), or a real error.
+        print(text, file=sys.stderr if failed else sys.stdout)
+        return 1 if failed else 0
+    if getattr(args, "json", False):
+        print(json.dumps({"server": args.server, "url": url, "message": text}, indent=2))
+    else:
+        print(f"Authorize '{args.server}': open\n  {url}")
+    if args.open:
+        import webbrowser
+
+        webbrowser.open(url)
+    return 0
 
 
 def _emit(args: argparse.Namespace, data: Any) -> None:
@@ -1022,6 +1079,15 @@ def add_ctl_parsers(subparsers: "argparse._SubParsersAction[argparse.ArgumentPar
         p.add_argument("server", help="Server name from the combiner config")
         _common(p)
         p.set_defaults(func=fn)
+
+    p = subparsers.add_parser(
+        "authorize",
+        help="Start OAuth authorization for a server and print the link to open",
+    )
+    p.add_argument("server", help="Server name from the combiner config")
+    p.add_argument("--open", action="store_true", help="Also open the link in a browser here")
+    _common(p)
+    p.set_defaults(func=cmd_authorize)
 
     p = subparsers.add_parser("profile", help="List server profiles, or turn one on or off")
     p.add_argument("action", choices=["list", "enable", "disable"])

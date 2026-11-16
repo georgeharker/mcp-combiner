@@ -8,6 +8,11 @@ tagged `vX.Y.Z`.
 
 ### Added
 
+- **`mcp-combiner authorize <server> [--open]`**: starts OAuth authorization
+  for a server from the shell and prints the link to open (`--open` also
+  opens it in a browser here), via `combiner__authorize_server`. Exits 0 with
+  a link or when the server is already authorized, 1 on an error.
+
 - **Server profiles**: named groups of servers in the config's `profiles`
   block, which servers join with `"profiles": [...]`.
   - A profile loads only where its `when` matches: `platforms`

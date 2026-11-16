@@ -101,6 +101,8 @@ mcp-combiner enable <server>           # mount + connect
 mcp-combiner disable <server>          # unmount + disconnect
 mcp-combiner restart-server <server>   # hard bounce one upstream (like :MCPRestartServer)
 mcp-combiner reload                    # re-read config, apply the diff
+mcp-combiner authorize <server> [--open]   # start OAuth, print (or open) the link
+mcp-combiner profile list|enable|disable [name]   # server profiles
 mcp-combiner tools                     # list advertised tools
 mcp-combiner call myserver_echo --args '{"message": "hi"}'
 mcp-combiner session status                              # list sessions
@@ -863,7 +865,10 @@ A server that has never been authorized mounts no tools, so there is no call
 to route to it. `combiner__authorize_server(server_name)` — always available —
 starts its authorization on demand and fails with the same `-32042` link (or
 the text fallback); a server already connected says so. This is the way in for
-headless deployments.
+headless deployments. From a shell, `mcp-combiner authorize <server>` does the
+same and prints the link (`--open` also opens it in a browser on this
+machine); it exits 0 with a link or when the server is already authorized, 1
+on an error such as an unknown server.
 
 `elicit` without `public_url` still works, with a startup warning: the link
 redirects to the loopback callback, so it only completes from a browser on the
