@@ -6,6 +6,18 @@ tagged `vX.Y.Z`. The extension runs the matching mcp-combiner release, so each
 entry also summarises the combiner's changes; the full list is in
 [the combiner's changelog](https://github.com/georgeharker/mcp-combiner/blob/main/combiner/CHANGELOG.md).
 
+## [0.24.0] - 2026-11-15
+
+No extension changes. The combiner it runs:
+
+- **Server profiles**: named groups of servers (`"profiles"` in the config).
+  A profile loads only where its `when` matches (platform, host name,
+  environment), so one config works across machines; a server runs if any
+  of its profiles is on. `combiner__enable_profile` / `combiner__disable_profile`
+  switch them; `MCP_COMBINER_PROFILES=+a,-b` at startup.
+- `mcp-combiner authorize <server> [--open]` starts OAuth from the shell and
+  prints the link.
+
 ## [0.23.1] - 2026-11-09
 
 ### Changed
