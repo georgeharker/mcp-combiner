@@ -76,7 +76,7 @@ markers = [
 ]
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py312"  # matches requires-python
 line-length = 100
 
 [tool.ruff.lint]

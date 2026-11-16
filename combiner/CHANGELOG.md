@@ -4,6 +4,20 @@ All notable changes to the combiner are documented here. The version moves in
 lockstep with the rest of the repo (`scripts/bump-version.sh`); releases are
 tagged `vX.Y.Z`.
 
+## [0.24.1] — 2026-11-15
+
+### Fixed
+
+- **The CLI explains a combiner it can't reach.** Every `mcp-combiner`
+  command that talks to the running combiner (`authorize`, `enable`,
+  `restart-server`, `profile`, `status`, …) now says "cannot reach the
+  combiner at <url> — is it running?", how to start one (`mcp-combiner
+  start`, or the client that runs it) and how to point at another
+  (`--url`, `--host`/`--port`), instead of "error: Client failed to
+  connect: All connection attempts failed". `authorize` adds that it must
+  be the combiner your clients use, since the authorization lives there.
+- Lint targets Python 3.12, matching `requires-python`.
+
 ## [0.24.0] — 2026-11-15
 
 ### Added

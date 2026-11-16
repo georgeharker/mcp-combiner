@@ -1127,14 +1127,59 @@ def add_ctl_parsers(subparsers: "argparse._SubParsersAction[argparse.ArgumentPar
     p.set_defaults(func=cmd_session)
 
 
+#: Extra advice when a command can't reach the combiner, by command name.
+_UNREACHABLE_HINTS = {
+    "authorize": (
+        "Authorization runs inside the combiner your clients use (its link, "
+        "callback and stored tokens live there), so start or point at that one "
+        "rather than a separate one."
+    ),
+}
+
+
+def _unreachable(exc: BaseException) -> bool:
+    """Whether *exc* is, at bottom, a failure to connect to the combiner —
+    however it's wrapped (fastmcp re-raises httpx's ConnectError as a
+    RuntimeError; anyio adds exception groups)."""
+    seen: set[int] = set()
+    pending: list[BaseException] = [exc]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, (httpx2.ConnectError, httpx2.ConnectTimeout, ConnectionError)):
+            return True
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+        for linked in (current.__cause__, current.__context__):
+            if linked is not None:
+                pending.append(linked)
+    return False
+
+
+def unreachable_message(args: argparse.Namespace) -> str:
+    """What to tell someone whose command couldn't reach the combiner."""
+    lines = [
+        f"cannot reach the combiner at {_base_url(args)} — is it running?",
+        "  start one: `mcp-combiner start` (or open the client that runs it: "
+        "Neovim, pi, Claude Code)",
+        "  running elsewhere: pass --url http://host:port (or --host / --port)",
+    ]
+    hint = _UNREACHABLE_HINTS.get(str(getattr(args, "command", "")))
+    if hint:
+        lines.append(f"  {hint}")
+    return "\n".join(lines)
+
+
 def run(args: argparse.Namespace) -> int:
     """Run the selected control command."""
     try:
         result: int = asyncio.run(args.func(args))
         return result
-    except httpx2.ConnectError:
-        print(f"cannot reach combiner at {_base_url(args)}", file=sys.stderr)
-        return 1
     except Exception as e:  # surfaced as a clean CLI error, not a traceback
-        print(f"error: {e}", file=sys.stderr)
+        if _unreachable(e):
+            print(unreachable_message(args), file=sys.stderr)
+        else:
+            print(f"error: {e}", file=sys.stderr)
         return 1
