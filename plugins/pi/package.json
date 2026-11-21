@@ -26,7 +26,7 @@
     "build": "tsc",
     "clean": "rm -rf dist",
     "typecheck": "tsc --noEmit",
-    "smoke": "node scripts/smoke.mjs",
+    "smoke": "tsc && node scripts/smoke.mjs",
     "prepack": "node -e \"require('fs').copyFileSync('../../CLAUDE.md.example', './instructions.txt')\"",
     "prepublishOnly": "npm run clean && npm run build",
     "test": "vitest run"
