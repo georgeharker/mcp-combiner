@@ -228,6 +228,11 @@ export type CombinerStatus =
     | { kind: "stopped" }
     | { kind: "unknown"; noAnswer?: string }
 
+/** Where the sharedserver resolver fetches sharedserver from when it's missing or
+ *  older than SHAREDSERVER_MIN_VERSION (latest release, not a pin). */
+const SHAREDSERVER_INSTALLER_URL =
+    "https://github.com/georgeharker/sharedserver/releases/latest/download/sharedserver-installer.sh"
+
 /** Cap on the synchronous `sharedserver use` / `unuse` (they normally take a few
  *  ms; a hung sharedserver must not freeze pi's main thread indefinitely). */
 const SHAREDSERVER_TIMEOUT_MS = 10_000
@@ -323,6 +328,103 @@ export function resolvePort(log: LogFn): number {
         }
     }
     return port
+}
+
+// ── launch plan ────────────────────────────────────────────────────
+
+/** Everything one `sharedserver use` needs, resolved from the environment. */
+export type LaunchPlan = {
+    binary: string
+    name: string
+    port: number
+    /** The full `sharedserver use …` argv (after the binary). */
+    useArgs: string[]
+    /** The combiner's log files (sharedserver's capture, the combiner's own). */
+    logs: string[]
+    /** The combiner command line, for the "attached" log line. */
+    describe: string
+}
+
+/** Resolve what to launch: sharedserver, the combiner command, its config, name,
+ *  port and grace period, and assemble the `use` command line. Undefined (with the
+ *  reason logged) when something can't be found. Runs the synchronous version
+ *  probes (resolveSharedserver, resolveCombiner). */
+function planLaunch(log: LogFn): LaunchPlan | undefined {
+    const binary = resolveSharedserver(
+        {
+            label: "mcp-combiner",
+            minVersion: SHAREDSERVER_MIN_VERSION,
+            installerUrl: SHAREDSERVER_INSTALLER_URL,
+        },
+        env("SHAREDSERVER_BIN"),
+        process.env,
+        log,
+    )
+    if (!binary) {
+        log("error", "sharedserver binary not found; set $SHAREDSERVER_BIN, or PI_MCP_COMBINER_MANAGE=false")
+        return undefined
+    }
+    const combiner = resolveCombiner(log)
+    if (!combiner) {
+        log(
+            "error",
+            "mcp-combiner could not be found or fetched; install uv and it is fetched from PyPI on demand, " +
+                "or install mcp-combiner, or set $PI_MCP_COMBINER_COMMAND / $PI_MCP_COMBINER_CHECKOUT",
+        )
+        return undefined
+    }
+    const cfgPath = resolveConfig(log)
+    if (!cfgPath) return undefined // resolveConfig already logged the specifics
+
+    const name = env("PI_MCP_COMBINER_NAME") ?? DEFAULT_NAME
+    const port = resolvePort(log)
+    const grace = env("PI_MCP_COMBINER_GRACE") ?? DEFAULT_GRACE
+    // Logging parity with the sibling plugins' two-file scheme: sharedserver captures
+    // raw stdout/stderr (--log-file on `use`), and the combiner writes its own
+    // --log-file. Both default under $XDG_STATE_HOME/mcp-combiner; "none" disables.
+    const logDir = join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "mcp-combiner")
+    const pyLogFile = env("PI_MCP_COMBINER_PYLOG") ?? join(logDir, "mcp-combiner-py.log")
+    const captureFile = env("PI_MCP_COMBINER_LOG") ?? join(logDir, "mcp-combiner.log")
+
+    const wrappedArgs = [...combiner.args, ...(combiner.extra ?? []), ...serveArgs(combiner, cfgPath, port, pyLogFile)]
+    return {
+        binary,
+        name,
+        port,
+        useArgs: [...useArgs(name, grace, captureFile), "--", combiner.cmd, ...wrappedArgs],
+        logs: [captureFile, pyLogFile].filter((f) => f !== "none"),
+        describe: `${combiner.cmd} ${wrappedArgs.join(" ")}`,
+    }
+}
+
+/** The combiner's serve flags: [--mcp] --config <cfg> --port <port> [--host <host>],
+ *  plus its own --log-file / --log-level, which ride the same version gate as --mcp. */
+function serveArgs(combiner: Command, cfgPath: string, port: number, pyLogFile: string): string[] {
+    const serve: string[] = []
+    const modern = combinerNeedsMcpFlag(combiner)
+    if (modern) serve.push("--mcp")
+    serve.push("--config", cfgPath, "--port", String(port))
+    const host = env("PI_MCP_COMBINER_HOST")
+    if (host) serve.push("--host", host)
+    if (modern) {
+        if (pyLogFile !== "none") serve.push("--log-file", pyLogFile)
+        serve.push("--log-level", env("PI_MCP_COMBINER_LOG_LEVEL") ?? "info")
+    }
+    return serve
+}
+
+/** sharedserver's own `use` flags for this pi process (the ref is this pid's). */
+function useArgs(name: string, grace: string, captureFile: string): string[] {
+    const args = ["use", name, "--pid", String(process.pid), "--grace-period", grace, "--metadata", `pi-${process.pid}`]
+    if (captureFile !== "none") {
+        try {
+            mkdirSync(dirname(captureFile), { recursive: true })
+        } catch {
+            // best-effort — a failed mkdir just means sharedserver may drop the capture
+        }
+        args.push("--log-file", captureFile)
+    }
+    return args
 }
 
 // ── per-process state ──────────────────────────────────────────────
@@ -489,29 +591,43 @@ export class CombinerProcess {
         const status = await this.statusOf(att.binary, att.name)
         if (this.state.quitting) return "gone"
         // Someone re-attached while we looked (another caller's respawn or attach).
-        if (this.state.attachment !== att) return this.booting() ? "relaunched" : "alive"
-        if (status.kind === "unknown") {
-            // No answer from sharedserver is its bug: report it (once per streak) and
-            // decide by our own pid check: gone means dead.
-            if (status.noAnswer) this.reportNoAnswer(status.noAnswer)
-            const known = att.identity
-            if (!known || this.isAlive(known.pid)) return this.booting() ? "relaunched" : "alive"
-            return this.respawn(att, known)
-        }
+        if (this.state.attachment !== att) return this.waitOrBoot()
+        if (status.kind === "unknown") return this.refusedWithoutAnswer(att, status)
         this.noAnswerReported = false
         const ours = await this.attachedIdentity(att)
-        if (status.kind === "running") {
-            if (!ours) return this.booting() ? "relaunched" : "alive"
-            if (sameCombiner(ours, status.identity)) {
-                // sharedserver can still read "active" just after a death: trust the pid.
-                if (!this.isAlive(ours.pid)) return this.respawn(att, ours)
-                return this.booting() ? "relaunched" : "alive"
-            }
-            // Someone else started a new combiner: same function, same ref.
-            await this.attach({ onlyIfRunning: true })
-            return "alive"
-        }
+        if (status.kind === "running") return this.refusedWhileRunning(att, ours, status.identity)
         return this.respawn(att, ours)
+    }
+
+    /** "alive", or "relaunched" while our own fresh launch is still booting (so the
+     *  connect gets the cold-start budget). */
+    private waitOrBoot(): Liveness {
+        return this.booting() ? "relaunched" : "alive"
+    }
+
+    /** sharedserver gave no definite answer. No answer at all is its bug: report it
+     *  (once per streak) and decide by our own pid check: gone means dead. */
+    private refusedWithoutAnswer(att: Attachment, status: { kind: "unknown"; noAnswer?: string }): Promise<Liveness> | Liveness {
+        if (status.noAnswer) this.reportNoAnswer(status.noAnswer)
+        const known = att.identity
+        if (!known || this.isAlive(known.pid)) return this.waitOrBoot()
+        return this.respawn(att, known)
+    }
+
+    /** sharedserver says a combiner is running. Ours (and its pid really exists):
+     *  keep waiting. A different process: attach to it, same function, same ref. */
+    private async refusedWhileRunning(
+        att: Attachment,
+        ours: CombinerIdentity | undefined,
+        running: CombinerIdentity,
+    ): Promise<Liveness> {
+        if (!ours) return this.waitOrBoot()
+        if (sameCombiner(ours, running)) {
+            // sharedserver can still read "active" just after a death: trust the pid.
+            return this.isAlive(ours.pid) ? this.waitOrBoot() : this.respawn(att, ours)
+        }
+        await this.attach({ onlyIfRunning: true })
+        return "alive"
     }
 
     /** Respawn our dead combiner with the one attach function, within the cap.
@@ -615,42 +731,45 @@ export class CombinerProcess {
         let reportedFor: string | undefined
         let ticks = 0
         let stopped = false
-        const report = (key: string) => {
-            if (stopped || key === reportedFor) return
-            reportedFor = key
-            onGone()
-        }
         const timer = setInterval(() => {
             ticks++
-            void (async () => {
-                const att = this.state.attachment
-                if (!att || this.state.quitting) return
-                const ours = att.identity
-                if (!ours) {
-                    // Identity not known yet: no pid to check. Ask sharedserver only on
-                    // the periodic ticks, and report a stopped combiner even so.
-                    if (ticks % WATCH_STATUS_EVERY !== 0) return
-                    const status = await this.statusOf(att.binary, att.name)
-                    if (this.state.attachment !== att) return
-                    if (status.kind === "running" && !att.identity) att.identity = status.identity
-                    else if (status.kind === "stopped") report("unknown")
-                    return
-                }
-                const key = identityKey(ours)
-                if (key === reportedFor) return
-                if (!this.isAlive(ours.pid)) return report(key)
-                if (ticks % WATCH_STATUS_EVERY !== 0) return
-                const status = await this.statusOf(att.binary, att.name)
-                if (this.state.attachment !== att) return
-                if (status.kind === "stopped" || (status.kind === "running" && !sameCombiner(ours, status.identity)))
-                    report(key)
-            })()
+            void this.watchTick(ticks % WATCH_STATUS_EVERY === 0, reportedFor).then((gone) => {
+                if (gone === undefined || stopped || gone === reportedFor) return
+                reportedFor = gone
+                onGone()
+            })
         }, WATCH_INTERVAL_MS)
         timer.unref()
         return () => {
             stopped = true
             clearInterval(timer)
         }
+    }
+
+    /** One watch tick. Resolves to the key of our combiner process if it's gone
+     *  (that's what watch() reports, once per key), else undefined. `withStatus`:
+     *  this is a periodic tick, so also ask sharedserver. */
+    private async watchTick(withStatus: boolean, reportedFor: string | undefined): Promise<string | undefined> {
+        const att = this.state.attachment
+        if (!att || this.state.quitting) return undefined
+        const ours = att.identity
+        if (!ours) {
+            // Identity not known yet: no pid to check. Ask sharedserver only on the
+            // periodic ticks, and report a stopped combiner even so.
+            if (!withStatus) return undefined
+            const status = await this.statusOf(att.binary, att.name)
+            if (this.state.attachment !== att) return undefined
+            if (status.kind === "running" && !att.identity) att.identity = status.identity
+            return status.kind === "stopped" ? "unknown" : undefined
+        }
+        const key = identityKey(ours)
+        if (key === reportedFor) return undefined
+        if (!this.isAlive(ours.pid)) return key
+        if (!withStatus) return undefined
+        const status = await this.statusOf(att.binary, att.name)
+        if (this.state.attachment !== att) return undefined
+        const replaced = status.kind === "running" && !sameCombiner(ours, status.identity)
+        return status.kind === "stopped" || replaced ? key : undefined
     }
 
     /** Whether process `pid` exists (a seam for tests). EPERM means it exists but
@@ -692,122 +811,73 @@ export class CombinerProcess {
         return flight
     }
 
-    /** The attach itself (resolve sharedserver + the combiner, `sharedserver use`,
-     *  record the identity). Protected so tests can subclass it; nothing else
-     *  overrides it. */
+    /** The attach itself: plan the launch, `sharedserver use`, record the
+     *  attachment. Protected so tests can subclass it; nothing else overrides it. */
     protected async attachOnce(opts: { onlyIfRunning?: boolean }): Promise<boolean> {
         if (this.state.quitting) return false
-        const log = this.log
-        const binary = resolveSharedserver(
-            {
-                label: "mcp-combiner",
-                minVersion: SHAREDSERVER_MIN_VERSION,
-                installerUrl:
-                    "https://github.com/georgeharker/sharedserver/releases/latest/download/sharedserver-installer.sh",
-            },
-            env("SHAREDSERVER_BIN"),
-            process.env,
-            log,
-        )
-        if (!binary) {
-            log("error", "sharedserver binary not found; set $SHAREDSERVER_BIN, or PI_MCP_COMBINER_MANAGE=false")
-            return false
-        }
-
-        const combiner = resolveCombiner(log)
-        if (!combiner) {
-            log(
-                "error",
-                "mcp-combiner could not be found or fetched; install uv and it is fetched from PyPI on demand, " +
-                    "or install mcp-combiner, or set $PI_MCP_COMBINER_COMMAND / $PI_MCP_COMBINER_CHECKOUT",
-            )
-            return false
-        }
-
-        const cfgPath = resolveConfig(log)
-        if (!cfgPath) return false // resolveConfig already logged the specifics
-
-        const name = env("PI_MCP_COMBINER_NAME") ?? DEFAULT_NAME
+        const plan = this.plan()
+        if (!plan) return false
         // `use` launches a stopped server; the reconnect paths must only attach.
-        if (opts.onlyIfRunning && (await this.statusOf(binary, name)).kind !== "running") return false
+        if (opts.onlyIfRunning && (await this.statusOf(plan.binary, plan.name)).kind !== "running") return false
         if (this.state.quitting) return false
-        const port = resolvePort(log)
-        const grace = env("PI_MCP_COMBINER_GRACE") ?? DEFAULT_GRACE
-
-        // Assemble: <combiner> [--mcp] --config <cfg> --port <port> [--host <host>]
-        const serve: string[] = []
-        const modern = combinerNeedsMcpFlag(combiner)
-        if (modern) serve.push("--mcp")
-        serve.push("--config", cfgPath, "--port", String(port))
-        const host = env("PI_MCP_COMBINER_HOST")
-        if (host) serve.push("--host", host)
-
-        // Logging parity with the sibling plugins' two-file scheme: sharedserver captures
-        // raw stdout/stderr (--log-file on `use`), and the combiner writes its own
-        // --log-file. Both default under $XDG_STATE_HOME/mcp-combiner; "none" disables.
-        // Combiner-side flags ride the same version gate as --mcp.
-        const logDir = join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "mcp-combiner")
-        const pyLogFile = env("PI_MCP_COMBINER_PYLOG") ?? join(logDir, "mcp-combiner-py.log")
-        if (modern) {
-            if (pyLogFile !== "none") serve.push("--log-file", pyLogFile)
-            serve.push("--log-level", env("PI_MCP_COMBINER_LOG_LEVEL") ?? "info")
-        }
-
-        const wrappedArgs = [...combiner.args, ...(combiner.extra ?? []), ...serve]
-        const useArgs = [
-            "use",
-            name,
-            "--pid",
-            String(process.pid),
-            "--grace-period",
-            grace,
-            "--metadata",
-            `pi-${process.pid}`,
-        ]
-        const logFile = env("PI_MCP_COMBINER_LOG") ?? join(logDir, "mcp-combiner.log")
-        if (logFile !== "none") {
-            try {
-                mkdirSync(dirname(logFile), { recursive: true })
-            } catch {
-                // best-effort — a failed mkdir just means sharedserver may drop the capture
-            }
-            useArgs.push("--log-file", logFile)
-        }
-        useArgs.push("--", combiner.cmd, ...wrappedArgs)
-
         installProcessCleanup()
-        // A combiner that just died reads "defunct" until sharedserver's watcher has
-        // reaped it, and `use` refuses with "Retry shortly": retry a few times.
+        const result = await this.runUse(plan)
+        if (!result.attached) return false
+        if (result.launched) this.noteLaunched()
+        this.recordAttachment(plan)
+        return true
+    }
+
+    /** `sharedserver use` (synchronous; capped at SHAREDSERVER_TIMEOUT_MS). A
+     *  combiner that just died reads "defunct" until sharedserver's watcher has
+     *  reaped it, and `use` refuses with "Retry shortly": retry a few times, unless pi
+     *  started quitting meanwhile. `launched`: `use` said "Started server", i.e. it
+     *  launched the combiner rather than attaching to a running one. */
+    private async runUse(plan: LaunchPlan): Promise<{ attached: boolean; launched: boolean }> {
         for (let attempt = 1; ; attempt++) {
-            const result = spawnSync(binary, useArgs, { stdio: "pipe", env: process.env, timeout: SHAREDSERVER_TIMEOUT_MS })
+            const result = this.runSharedserver(plan.binary, plan.useArgs)
             if (result.error) {
-                log("error", `${name}: failed to spawn sharedserver (${result.error.message})`)
-                return false
+                this.log("error", `${plan.name}: failed to spawn sharedserver (${result.error.message})`)
+                return { attached: false, launched: false }
             }
             if (result.status === 0) {
-                // `use` says "Started server" when it launched the combiner itself.
-                if (/Started server/.test(result.stdout?.toString() ?? "")) this.noteLaunched()
-                break
+                return { attached: true, launched: /Started server/.test(result.stdout?.toString() ?? "") }
             }
             const stderr = result.stderr?.toString().trim() ?? ""
             if (attempt < ATTACH_DEFUNCT_RETRIES && /defunct|retry shortly/i.test(stderr)) {
                 await new Promise((resolve) => setTimeout(resolve, ATTACH_DEFUNCT_DELAY_MS).unref())
                 // Quit may have released the combiner while we slept: don't re-take it.
-                if (this.state.quitting) return false
+                if (this.state.quitting) return { attached: false, launched: false }
                 continue
             }
-            log("error", `${name}: sharedserver use exited ${result.status}${stderr ? ` (${stderr})` : ""}`)
-            return false
+            this.log("error", `${plan.name}: sharedserver use exited ${result.status}${stderr ? ` (${stderr})` : ""}`)
+            return { attached: false, launched: false }
         }
+    }
 
-        const attachment: Attachment = { binary, name, identity: undefined }
+    /** Resolve what to launch (a seam for tests). */
+    protected plan(): LaunchPlan | undefined {
+        return planLaunch(this.log)
+    }
+
+    /** Run one synchronous sharedserver command (a seam for tests). */
+    protected runSharedserver(
+        binary: string,
+        args: string[],
+    ): { status: number | null; stdout?: Buffer | string; stderr?: Buffer | string; error?: Error } {
+        return spawnSync(binary, args, { stdio: "pipe", env: process.env, timeout: SHAREDSERVER_TIMEOUT_MS })
+    }
+
+    /** Record this pi's ref on the combiner. The process identity is filled in from
+     *  sharedserver in the background (attachedIdentity fills it lazily otherwise). */
+    private recordAttachment(plan: LaunchPlan): void {
+        const attachment: Attachment = { binary: plan.binary, name: plan.name, identity: undefined }
         this.state.attachment = attachment
-        this.state.logs = [logFile, pyLogFile].filter((f) => f !== "none")
-        void this.statusOf(binary, name).then((status) => {
+        this.state.logs = plan.logs
+        void this.statusOf(plan.binary, plan.name).then((status) => {
             if (status.kind === "running" && this.state.attachment === attachment && !attachment.identity)
                 attachment.identity = status.identity
         })
-        log("info", `combiner "${name}" attached on port ${port} (${combiner.cmd} ${wrappedArgs.join(" ")})`)
-        return true
+        this.log("info", `combiner "${plan.name}" attached on port ${plan.port} (${plan.describe})`)
     }
 }

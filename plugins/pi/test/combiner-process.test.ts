@@ -21,6 +21,7 @@ import {
     parseCombinerStatus,
     type CombinerIdentity,
     type CombinerStatus,
+    type LaunchPlan,
     type LogFn,
 } from "../src/combiner-process.js"
 
@@ -478,5 +479,94 @@ describe("final review fixes", () => {
         } finally {
             vi.useRealTimers()
         }
+    })
+})
+
+/** The REAL attachOnce (plan -> use -> record), with sharedserver's replies scripted:
+ *  each `use` call takes the next reply. */
+class ScriptedUse extends CombinerProcess {
+    replies: Array<{ status: number | null; stdout?: string; stderr?: string; error?: Error }> = []
+    useCalls: string[][] = []
+    planned: LaunchPlan | undefined = {
+        binary: "sharedserver",
+        name: "mcp-combiner",
+        port: 9741,
+        useArgs: ["use", "mcp-combiner", "--pid", "1"],
+        logs: ["/tmp/a.log"],
+        describe: "mcp-combiner --mcp",
+    }
+    logged: Logged[] = []
+    constructor() {
+        const logged: Logged[] = []
+        super((level, message) => logged.push({ level, message }))
+        this.logged = logged
+    }
+    protected override plan(): LaunchPlan | undefined {
+        return this.planned
+    }
+    protected override runSharedserver(_binary: string, args: string[]) {
+        this.useCalls.push(args)
+        return this.replies.shift() ?? { status: 1, stderr: "no scripted reply" }
+    }
+    protected override statusOf(): Promise<CombinerStatus> {
+        return Promise.resolve({ kind: "running", identity: ours })
+    }
+    get launchedAt(): number | undefined {
+        return (this as unknown as { state: { launchedAt?: number } }).state.launchedAt
+    }
+}
+
+describe("attachOnce (the real one)", () => {
+    it("a use that launched ('Started server') is noted as our launch", async () => {
+        const proc = new ScriptedUse()
+        proc.replies = [{ status: 0, stdout: "Started server mcp-combiner (PID: 7, refcount: 1)" }]
+        expect(await proc.attach()).toBe(true)
+        expect(proc.attached).toBe(true)
+        expect(proc.launchedAt).toBeDefined()
+    })
+
+    it("a use that only attached isn't a launch", async () => {
+        const proc = new ScriptedUse()
+        proc.replies = [{ status: 0, stdout: "Attached to mcp-combiner (refcount: 3)" }]
+        expect(await proc.attach()).toBe(true)
+        expect(proc.launchedAt).toBeUndefined()
+    })
+
+    it("retries while sharedserver says defunct, then attaches", async () => {
+        const proc = new ScriptedUse()
+        proc.replies = [
+            { status: 1, stderr: "shutting down (defunct, cleanup pending). Retry shortly" },
+            { status: 0, stdout: "Started server mcp-combiner" },
+        ]
+        expect(await proc.attach()).toBe(true)
+        expect(proc.useCalls.length).toBe(2)
+    })
+
+    it("a failing use is logged and leaves no attachment", async () => {
+        const proc = new ScriptedUse()
+        proc.replies = [{ status: 2, stderr: "boom" }]
+        expect(await proc.attach()).toBe(false)
+        expect(proc.attached).toBe(false)
+        expect(proc.logged.some((l) => l.level === "error" && /use exited 2 \(boom\)/.test(l.message))).toBe(true)
+    })
+
+    it("quit during a defunct retry: no attach after it", async () => {
+        const proc = new ScriptedUse()
+        proc.replies = [
+            { status: 1, stderr: "defunct. Retry shortly" },
+            { status: 0, stdout: "Started server mcp-combiner" },
+        ]
+        const pending = proc.attach()
+        proc.quit()
+        expect(await pending).toBe(false)
+        expect(proc.attached).toBe(false)
+        expect(proc.useCalls.length).toBe(1)
+    })
+
+    it("nothing to launch (no plan): no use at all", async () => {
+        const proc = new ScriptedUse()
+        proc.planned = undefined
+        expect(await proc.attach()).toBe(false)
+        expect(proc.useCalls).toEqual([])
     })
 })
