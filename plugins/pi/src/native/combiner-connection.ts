@@ -109,7 +109,7 @@ function ncDbg(s: string): void {
 
 // Keep in sync with plugins/pi/package.json "version": scripts/bump-version.sh stamps
 // this line alongside the package files (the string is what this client declares).
-const CLIENT_INFO = { name: "pi-mcp-combiner", version: "0.24.2" }
+const CLIENT_INFO = { name: "pi-mcp-combiner", version: "0.24.4" }
 const CONNECT_TIMEOUT_MS = 8_000
 const LIST_CACHE_MS = 5_000
 
@@ -317,12 +317,16 @@ export class NativeCombinerConnection implements CombinerConnection {
             try {
                 await Promise.race([
                     settle,
-                    new Promise((_, reject) =>
-                        setTimeout(
+                    new Promise((_, reject) => {
+                        // Stored so `finally` clears it, and unref'd: a pending
+                        // timeout must never keep pi's process alive (it held
+                        // pi open for 8s after every connect when unstored).
+                        timer = setTimeout(
                             () => reject(new Error(`connect timeout after ${CONNECT_TIMEOUT_MS}ms`)),
                             CONNECT_TIMEOUT_MS,
-                        ),
-                    ),
+                        )
+                        timer.unref?.()
+                    }),
                 ])
             } catch (e) {
                 // The client may STILL complete its connect after this failure (the
