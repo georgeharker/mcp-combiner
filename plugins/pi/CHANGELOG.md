@@ -13,10 +13,10 @@ entry also summarises the combiner's changes; the full list is in
 - **pi exits promptly.** Every connect left an 8-second connect-timeout timer
   running (it was never stored, so it was never cleared), which held pi's
   process open after shutdown. The timer is now cleared and `unref`'d.
-- **Faster startup.** The combiner's location and version are checked once per
-  pi process instead of on every session start and reconnect; with the
-  combiner's own faster `--version`, startup drops from about 1.2 s to about
-  0.2 s when the combiner is installed.
+- **Faster startup.** With the combiner's faster `--version` (combiner
+  changelog), the version check pi runs while starting takes about 0.1 s
+  instead of 1.2 s, so startup drops from about 1.2 s to about 0.2 s when
+  the combiner is installed.
 
 ## [0.24.3] - 2026-11-20
 
