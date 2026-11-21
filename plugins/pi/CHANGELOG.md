@@ -6,6 +6,16 @@ tagged `vX.Y.Z`. The extension runs the matching mcp-combiner release, so each
 entry also summarises the combiner's changes; the full list is in
 [the combiner's changelog](https://github.com/georgeharker/mcp-combiner/blob/main/combiner/CHANGELOG.md).
 
+## [0.24.3] - 2026-11-20
+
+### Fixed
+
+- Compatible with pi 1.6.0's TUI contract: the extension's components
+  declare `render()` as returning `readonly string[]`, so they typecheck
+  against `@earendil-works/pi-tui` 1.6, whose `Container.render` returns a
+  cached read-only array. No behaviour change. The `pi-tui` peer range now
+  includes the 1.x releases (`^0.85.1 || ^1.0.0`).
+
 ## [0.24.2] - 2026-11-15
 
 No extension changes. The combiner it runs now requires fastmcp 4.2.0.

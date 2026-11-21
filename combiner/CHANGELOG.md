@@ -4,6 +4,11 @@ All notable changes to the combiner are documented here. The version moves in
 lockstep with the rest of the repo (`scripts/bump-version.sh`); releases are
 tagged `vX.Y.Z`.
 
+## [0.24.3] — 2026-11-20
+
+No combiner changes. The Pi extension is compatible with pi 1.6.0's TUI
+contract (see `plugins/pi/CHANGELOG.md`).
+
 ## [0.24.2] — 2026-11-15
 
 ### Changed
