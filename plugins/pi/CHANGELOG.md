@@ -73,6 +73,12 @@ entry also summarises the combiner's changes; the full list is in
 
 ### Changed
 
+- **Requires sharedserver 0.9.6 or newer** (the pi, OpenCode and Claude plugins
+  alike; was 0.6.7 / 0.6.6). 0.9.6 adds a launch lock: several clients calling
+  `use` on a stopped combiner at once now start exactly one and keep every
+  reference (0.9.5 could start two and lose references), which the automatic
+  respawn relies on. An older sharedserver found on your PATH makes the plugins
+  fetch the current release, unless you set `SHAREDSERVER_BIN` explicitly.
 - The footer shows `registering tools N/M` while a registration pass runs.
 - Depends on `@earendil-works/pi-mcp` `^1.6.0` (was `^1.2.0`).
 

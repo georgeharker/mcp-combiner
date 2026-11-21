@@ -38,9 +38,12 @@ const DEFAULT_GRACE = "30m"
 // version; it moves only when this extension depends on newer combiner behaviour.
 const MIN_COMBINER_VERSION: [number, number, number] = [0, 8, 0]
 // Floor-only against sharedserver's latest release: this repo consumes sharedserver
-// rather than shipping it. Kept equal to the OpenCode plugin's value (they resolve the
-// same binary the same way).
-const SHAREDSERVER_MIN_VERSION = "0.6.7"
+// rather than shipping it. Kept equal to the OpenCode plugin's and the Claude plugin's
+// (bin/sharedserver.conf) values: they resolve the same binary the same way.
+// 0.9.6 adds the launch lock: concurrent `use` calls on a stopped server start exactly
+// one and keep every ref (0.9.5 could start two and lose refs). The automatic respawn
+// in this module relies on it: several pi processes respawn a dead combiner at once.
+const SHAREDSERVER_MIN_VERSION = "0.9.6"
 
 
 /** Respawn cap: at most RESPAWN_LIMIT respawns in any RESPAWN_WINDOW_MS; one more

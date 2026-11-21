@@ -125,8 +125,11 @@ const COMBINER_DIRECTIVE: string = (() => {
 // Resolution lives in a module vendored byte-identical from georgeharker/sharedserver
 // (scripts/sync-vendored.sh), so the Claude hook's bin/sharedserver and this plugin
 // answer "which sharedserver, and why" identically. Floor-only against the latest
-// release: mcp-companion consumes sharedserver rather than shipping it.
-const SHAREDSERVER_MIN_VERSION = "0.6.7"
+// release: mcp-companion consumes sharedserver rather than shipping it. Kept equal to
+// the pi extension's and the Claude plugin's values. 0.9.6 adds the launch lock:
+// concurrent `use` calls on a stopped server start exactly one and keep every ref
+// (0.9.5 could start two and lose refs).
+const SHAREDSERVER_MIN_VERSION = "0.9.6"
 
 function resolveBinary(
     override: string | undefined,
