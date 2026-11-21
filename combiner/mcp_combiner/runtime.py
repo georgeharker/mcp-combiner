@@ -20,6 +20,8 @@ Layout mirrors the state's two concerns:
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 import time
 import uuid
 import weakref
@@ -464,9 +466,41 @@ class CombinerRuntime:
     notification_tasks: set[asyncio.Task[None]] = field(default_factory=set)
 
 
+def stale_install_note(exc: BaseException) -> str:
+    """Suffix for lazy ImportErrors in a combiner whose install vanished.
+
+    An in-place reinstall (e.g. ``uv pip install`` replacing a copied install
+    with an editable one) deletes the module directory a running combiner was
+    launched from. The process keeps working — every already-imported module
+    stays in memory — but its cached package still carries the dead path, so
+    the first *lazy* submodule import (``from mcp_combiner import resetnotice``,
+    on the first restart call) fails with "cannot import name" citing a file
+    that no longer exists on disk. That reads exactly like a release bug; the
+    suffix says what it actually is and names the real fix. "" when *exc* is
+    not an ImportError or the package directory is still present.
+    """
+    if not isinstance(exc, ImportError):
+        return ""
+    module = sys.modules.get("mcp_combiner")
+    file = getattr(module, "__file__", None)
+    if not file:
+        return ""
+    pkg_dir = os.path.dirname(os.path.abspath(file))
+    if os.path.isdir(pkg_dir):
+        return ""
+    return (
+        f" — this combiner process is stale: the module directory it was loaded"
+        f" from ({pkg_dir}) no longer exists on disk, almost certainly deleted by"
+        f" an in-place reinstall. Restart the combiner itself:"
+        f" `mcp-combiner restart --force` (`restart-server <name>` cannot help —"
+        f" that tool call runs inside this stale process)."
+    )
+
+
 # The process-wide runtime. server.py and the modules extracted from it share
 # this instance; tests may reset() it for isolation.
 RUNTIME = CombinerRuntime()
+
 
 # The downstream (client-facing) request in flight for THIS task, as (session,
 # request_id). Set by ToolProcessingMiddleware.on_request when the fastmcp request

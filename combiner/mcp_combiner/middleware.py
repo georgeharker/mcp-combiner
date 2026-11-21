@@ -36,6 +36,7 @@ from mcp_combiner.runtime import (
     DOWNSTREAM_REQUEST,
     RUNTIME,
     downstream_connection,
+    stale_install_note,
     tool_hidden,
 )
 from mcp_combiner.schemafix import _finalize_schemas, _sanitize_tools
@@ -795,7 +796,10 @@ async def _call_healing(
             server,
             token[:8],
         )
-        from mcp_combiner import resetnotice
+        try:
+            from mcp_combiner import resetnotice
+        except ImportError as e:
+            raise ToolError(f"{e}{stale_install_note(e)}") from e
 
         resetnotice.record(server, token)
         return await call_next(context)
@@ -821,7 +825,10 @@ def _with_reset_notice(result: ToolResult, server: str | None) -> ToolResult:
     token = _chat_token()
     if not server or not token:
         return result
-    from mcp_combiner import resetnotice
+    try:
+        from mcp_combiner import resetnotice
+    except ImportError as e:
+        raise ToolError(f"{e}{stale_install_note(e)}") from e
 
     note = resetnotice.consume(server, token)
     if note is None:

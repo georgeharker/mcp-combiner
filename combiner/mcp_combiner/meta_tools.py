@@ -16,7 +16,7 @@ from mcp_combiner.backing import BackingProcessLike
 from mcp_combiner.config import CombinerConfig, ServerConfig
 from mcp_combiner.connections import ConnectionManager
 from mcp_combiner.mounts import drop_server_providers, mount_server_provider
-from mcp_combiner.runtime import RUNTIME
+from mcp_combiner.runtime import RUNTIME, stale_install_note
 
 logger = logging.getLogger("mcp-combiner")
 
@@ -523,7 +523,10 @@ def register_meta_tools(
         # their upstream session ids die with the process, and a cached client
         # bound to a dead id would error on every call instead of opening a
         # clean fresh session. A server restart is an intentional state reset.
-        from mcp_combiner import resetnotice
+        try:
+            from mcp_combiner import resetnotice
+        except ImportError as e:
+            raise ToolError(f"restart '{server_name}': {e}{stale_install_note(e)}") from e
         from mcp_combiner.isolated import REGISTRY as isolated_registry
 
         resetnotice.record_all(server_name, isolated_registry.tokens_for(server_name))
