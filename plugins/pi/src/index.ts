@@ -26,7 +26,7 @@
 // degrade-rather-than-die behaviour, so a user running several clients gets one answer
 // to "which combiner / which sharedserver am I on, and why".
 
-import { spawnSync } from "node:child_process"
+import { spawn, spawnSync } from "node:child_process"
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { basename, dirname, join } from "node:path"
@@ -355,6 +355,17 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
     }
 
     let connection: NativeCombinerConnection | undefined
+    // When we manage the combiner, connects wait until the manage half has attached
+    // (launched it, or found it running): a connect started before the attach can be
+    // refused on a cold start. Released whatever the attach's outcome, so a failed
+    // attach never parks the connection. No gate when someone else owns it.
+    let releaseAttachGate: () => void = () => undefined
+    const attachGate =
+        manage && !hostOwned
+            ? new Promise<void>((resolve) => {
+                  releaseAttachGate = resolve
+              })
+            : undefined
     let nativeSurface: ReturnType<typeof activateNativeMode> | undefined
     // Set once the footer exists (the `if (connection)` block below); the native
     // surface, created first, reports registration progress through it.
@@ -396,6 +407,7 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
         }
         g.__piMcpCombinerDispose = []
         connection = new NativeCombinerConnection(connInputsFor(sessionCfg), clientLog)
+        if (attachGate) connection.setStartGate(attachGate)
         // The mcp router registers alongside the per-tool native surface (the same
         // owned connection — not a second proxy): tool_call gates such as
         // pi-permission-system and pi-subagents recognize MCP calls by the tool
@@ -500,7 +512,7 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
                 // re-attaching on every connect is safe and cheap). Host-owned / unmanaged
                 // combiners have nothing to attach to, and the factory returns before
                 // `attachCombiner` is declared — calling it there is a TDZ ReferenceError.
-                if (state === "connected" && !hostOwned && manage) attachCombiner(clientLog)
+                if (state === "connected" && !hostOwned && manage) void attachCombiner(clientLog)
                 refreshFooter()
             },
             // Stage 2: the widget hold announces its UI URL mid-call — open it.
@@ -709,7 +721,7 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
     // Pi forbids starting background resources from the factory, so all of this is
     // deferred to session_start. session_start fires again on reload/new/resume/fork
     // within the same process; the `attachment` guard makes re-entry a no-op attach.
-    const attachCombiner = (log: LogFn): void => {
+    const attachCombiner = async (log: LogFn): Promise<void> => {
         const binary = resolveSharedserver(
             {
                 label: "mcp-combiner",
@@ -785,13 +797,20 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
         useArgs.push("--", combiner.cmd, ...wrappedArgs)
 
         installProcessCleanup()
-        const result = spawnSync(binary, useArgs, { stdio: "pipe", env: process.env })
-        if (result.error) {
-            log("error", `${name}: failed to spawn sharedserver (${result.error.message})`)
-            return
-        }
-        if (result.status !== 0) {
-            const stderr = result.stderr?.toString().trim()
+        // A combiner that just died reads "defunct" until sharedserver's watcher has
+        // reaped it, and `use` refuses with "Retry shortly": retry a few times.
+        for (let attempt = 1; ; attempt++) {
+            const result = spawnSync(binary, useArgs, { stdio: "pipe", env: process.env })
+            if (result.error) {
+                log("error", `${name}: failed to spawn sharedserver (${result.error.message})`)
+                return
+            }
+            if (result.status === 0) break
+            const stderr = result.stderr?.toString().trim() ?? ""
+            if (attempt < ATTACH_DEFUNCT_RETRIES && /defunct|retry shortly/i.test(stderr)) {
+                await new Promise((resolve) => setTimeout(resolve, ATTACH_DEFUNCT_DELAY_MS).unref())
+                continue
+            }
             log("error", `${name}: sharedserver use exited ${result.status}${stderr ? ` (${stderr})` : ""}`)
             return
         }
@@ -800,9 +819,16 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
         log("info", `combiner "${name}" attached on port ${port} (${combiner.cmd} ${wrappedArgs.join(" ")})`)
     }
 
-    pi.on("session_start", (_event, ctx) => {
-        if (attachment) return // already attached in this process
-        attachCombiner(makeLog(ctx, notify))
+    pi.on("session_start", async (_event, ctx) => {
+        try {
+            if (!attachment) await attachCombiner(makeLog(ctx, notify)) // else already attached in this process
+        } finally {
+            releaseAttachGate()
+        }
+        // Between refused-connect retries, ask sharedserver whether the combiner is
+        // still there, so a launch that died stops the retry at once.
+        const att = attachment
+        if (att) connection?.setLivenessCheck(() => sharedserverActive(att.binary, att.name))
     })
 
     pi.on("session_shutdown", (event: SessionShutdownEvent) => {
@@ -966,6 +992,32 @@ function installConfig(ctx: ExtensionCommandContext, pathArg?: string): void {
             `Run /reload so pi-mcp-adapter re-reads mcp.json.`,
         "info",
     )
+}
+
+/** `sharedserver use` attempts while the server reads "defunct" (being reaped). */
+const ATTACH_DEFUNCT_RETRIES = 4
+const ATTACH_DEFUNCT_DELAY_MS = 300
+
+/** `sharedserver check <name>`: exit 0 = active (running or starting). Anything else
+ *  (defunct, not running) is false. Async, so it never blocks pi's main thread;
+ *  after 2 s with no answer it reports true (unknown must not stop a retry). */
+function sharedserverActive(binary: string, name: string): Promise<boolean> {
+    return new Promise((resolve) => {
+        const child = spawn(binary, ["check", name], { stdio: "ignore", env: process.env })
+        const timer = setTimeout(() => {
+            child.kill()
+            resolve(true)
+        }, 2_000)
+        timer.unref()
+        child.on("error", () => {
+            clearTimeout(timer)
+            resolve(true)
+        })
+        child.on("exit", (code) => {
+            clearTimeout(timer)
+            resolve(code === 0)
+        })
+    })
 }
 
 function makeLog(ctx: ExtensionContext, notify: boolean): LogFn {

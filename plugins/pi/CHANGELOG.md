@@ -22,6 +22,18 @@ entry also summarises the combiner's changes; the full list is in
   pass in progress at its next slice, and `/new`, `/resume` or `/reload` stops
   it, so it never calls the retired extension API.
 
+- **Cold start no longer leaves the session without tools for 30 seconds.** The
+  first connect used to start before the combiner was attached, and
+  `sharedserver use` returns once the combiner is launched, not once it
+  listens. A refused connect then failed for good until the 30-second footer
+  refresh happened to reconnect. Connects now wait for the attach, and a
+  refused connect is retried (100 ms backoff up to 1 s, for up to 15 s), which
+  also covers reconnecting after a combiner restart. Between retries,
+  `sharedserver check` ends the wait early if the combiner has died. In a cold
+  start test, the tools arrived at 3.9 s instead of 31.5 s.
+- `sharedserver use` is retried when it reports the combiner as shutting down
+  ("defunct ... Retry shortly").
+
 ### Changed
 
 - The footer shows `registering tools N/M` while a registration pass runs.

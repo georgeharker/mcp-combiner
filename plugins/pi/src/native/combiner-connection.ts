@@ -111,6 +111,34 @@ function ncDbg(s: string): void {
 // this line alongside the package files (the string is what this client declares).
 const CLIENT_INFO = { name: "pi-mcp-combiner", version: "0.24.4" }
 const CONNECT_TIMEOUT_MS = 8_000
+
+/** Retry schedule for a REFUSED connect (nothing listening on the port yet). The
+ *  combiner's launcher, `sharedserver use`, returns once the process is launched,
+ *  not once it listens, and a combiner another client launched a moment ago may
+ *  still be booting. So a refused connect right after an attach is expected, and
+ *  this retry is what waits for the port. Backoff doubles from `firstMs` to `maxMs`
+ *  within `budgetMs`. Other errors (timeouts, HTTP errors) are not retried here. */
+export type ConnectRetry = { budgetMs: number; firstMs: number; maxMs: number }
+const DEFAULT_CONNECT_RETRY: ConnectRetry = { budgetMs: 15_000, firstMs: 100, maxMs: 1_000 }
+
+/** True for a connect refused at the socket (Node's fetch: TypeError "fetch failed"
+ *  whose cause chain carries code ECONNREFUSED). */
+export function isConnectionRefused(e: unknown): boolean {
+    let cur: unknown = e
+    for (let depth = 0; depth < 5 && typeof cur === "object" && cur !== null; depth++) {
+        if ((cur as { code?: unknown }).code === "ECONNREFUSED") return true
+        cur = (cur as { cause?: unknown }).cause
+    }
+    return false
+}
+
+/** setTimeout as a promise, unref'd so a pending retry never holds pi open. */
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+        const t = setTimeout(resolve, ms)
+        t.unref?.()
+    })
+}
 const LIST_CACHE_MS = 5_000
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -153,11 +181,34 @@ export class NativeCombinerConnection implements CombinerConnection {
      *  StreamableHttpTransport). Injection lets tests drive the connection over an
      *  in-memory pair instead of HTTP. */
     private readonly transportFactory: ((url: URL) => McpTransport) | undefined
+    private readonly retry: ConnectRetry
+    /** Resolved once the combiner has been attached (launched, or found running).
+     *  Every connect waits on it, so a connect never races the launch. Unset when
+     *  someone else owns the combiner (host-owned / unmanaged): nothing to wait for. */
+    private startGate: Promise<void> | undefined
+    /** Between refused-connect retries: false means the combiner process is gone
+     *  (stop retrying now instead of waiting out the budget). */
+    private livenessCheck: (() => Promise<boolean>) | undefined
 
-    constructor(conn: ResolvedConnection, log: LogFn, opts?: { transportFactory?: (url: URL) => McpTransport }) {
+    constructor(
+        conn: ResolvedConnection,
+        log: LogFn,
+        opts?: { transportFactory?: (url: URL) => McpTransport; retry?: ConnectRetry },
+    ) {
         this.conn = conn
         this.log = log
         this.transportFactory = opts?.transportFactory
+        this.retry = opts?.retry ?? DEFAULT_CONNECT_RETRY
+    }
+
+    /** Make every connect wait for `gate` (the manage half's attach). */
+    setStartGate(gate: Promise<void>): void {
+        this.startGate = gate
+    }
+
+    /** Install the between-retries liveness check (see livenessCheck). */
+    setLivenessCheck(check: () => Promise<boolean>): void {
+        this.livenessCheck = check
     }
 
     setHooks(hooks: ConnectionHooks): void {
@@ -193,6 +244,36 @@ export class NativeCombinerConnection implements CombinerConnection {
         if (this.token === token) return
         this.token = token
         void this.reset("token changed")
+    }
+
+    /** Wait for the attach, then connect, retrying a REFUSED connect on the
+     *  ConnectRetry schedule. Stops retrying when the budget is spent, a reset
+     *  supersedes this connect, or the liveness check says the combiner is gone;
+     *  the last error is rethrown for ensureConnected's failure path. */
+    private async connectWithRetry(attempt: () => Promise<McpClient>, genAtStart: number): Promise<McpClient> {
+        if (this.startGate) await this.startGate
+        const deadline = Date.now() + this.retry.budgetMs
+        let delay = this.retry.firstMs
+        let announced = false
+        for (;;) {
+            try {
+                return await attempt()
+            } catch (e) {
+                if (!isConnectionRefused(e) || this.generation !== genAtStart || Date.now() + delay > deadline) throw e
+                // A failing check counts as alive: it must never stop a retry that would work.
+                if (this.livenessCheck && !(await this.livenessCheck().catch(() => true))) throw e
+                if (!announced) {
+                    announced = true
+                    this.log(
+                        "info",
+                        `combiner not listening yet at ${this.conn.baseUrl}; retrying for up to ${Math.round(this.retry.budgetMs / 1000)} s`,
+                    )
+                }
+                await sleep(delay)
+                if (this.generation !== genAtStart) throw e
+                delay = Math.min(delay * 2, this.retry.maxMs)
+            }
+        }
     }
 
     /** Drop the connection + caches (session reset / shutdown). Never throws. */
@@ -236,7 +317,7 @@ export class NativeCombinerConnection implements CombinerConnection {
 
         this.state = "connecting"
         const genAtStart = this.generation
-        const connectPromise = (async (): Promise<McpClient> => {
+        const attempt = async (): Promise<McpClient> => {
             const client = new McpClient({
                 name: CLIENT_INFO.name,
                 version: CLIENT_INFO.version,
@@ -366,7 +447,8 @@ export class NativeCombinerConnection implements CombinerConnection {
             }
             this.hooks.onStateChange?.(this.state)
             return client
-        })()
+        }
+        const connectPromise = this.connectWithRetry(attempt, genAtStart)
         this.connecting = connectPromise
 
         try {
