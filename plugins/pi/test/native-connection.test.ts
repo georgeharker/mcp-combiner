@@ -12,7 +12,7 @@
 // combiner mints a FRESH pair per connect (`FakeCombiner.attach()`), the same way
 // the real server would accept a new HTTP session. Call counters live at the
 // FakeCombiner level and therefore survive across re-connects.
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import { McpSessionExpiredError, type JsonRpcMessage, type McpTransport } from "@earendil-works/pi-mcp"
 import { createInMemoryTransportPair, InMemoryTransport } from "@earendil-works/pi-mcp/testing"
 import { NativeCombinerConnection, type ResolvedConnection } from "../src/native/combiner-connection.js"
@@ -180,5 +180,24 @@ describe("NativeCombinerConnection retry semantics (review regression cases)", (
         await conn.ensureConnected()
         expect(conn.state).toBe("connected")
         await conn.reset("test end")
+    })
+})
+describe("NativeCombinerConnection timers", () => {
+    it("leaves no connect-timeout timer behind after a successful connect", async () => {
+        // The connect timeout used to be created but never stored, so `finally`
+        // couldn't clear it: an 8s timer outlived every connect and held pi's
+        // process open after shutdown.
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] })
+        try {
+            const server = new FakeCombiner(() => ({ result: {} }))
+            const conn = makeConnection(server)
+            conn.bindUi({ hasUI: false })
+            conn.setToken("tok-timer")
+            await conn.ensureConnected()
+            expect(vi.getTimerCount()).toBe(0)
+            await conn.reset("test end")
+        } finally {
+            vi.useRealTimers()
+        }
     })
 })

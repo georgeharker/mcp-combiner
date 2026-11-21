@@ -166,7 +166,7 @@ const PLUGIN_VERSION: string | undefined = (() => {
  *  explicit env command → `mcp-combiner` on PATH (only when new enough) →
  *  `uv run --project <checkout> python -m mcp_combiner` → a pinned release via uvx. The
  *  uvx tail is what makes a bare install work with nothing installed by hand. */
-function resolveCombiner(log: LogFn): Command | undefined {
+function resolveCombinerUncached(log: LogFn): Command | undefined {
     const extra = splitArgs(env("PI_MCP_COMBINER_ARGS"))
 
     const command = env("PI_MCP_COMBINER_COMMAND")
@@ -208,6 +208,22 @@ function resolveCombiner(log: LogFn): Command | undefined {
     }
 
     return undefined
+}
+
+/** Process-global, like CLEANUP_GUARD (jiti re-instantiates this module per session
+ *  bind; Symbol.for survives that): which combiner, at which version, doesn't change
+ *  within one pi process, and finding out costs a Python start or two. Without this,
+ *  every session_start AND every reconnect re-ran the probes synchronously. A miss
+ *  isn't cached, so it's retried on the next attach. */
+const COMBINER_CACHE = Symbol.for("mcp-companion:resolved-combiner")
+
+function resolveCombiner(log: LogFn): Command | undefined {
+    const g = globalThis as Record<symbol, Command | undefined>
+    const cached = g[COMBINER_CACHE]
+    if (cached) return cached
+    const found = resolveCombinerUncached(log)
+    if (found) g[COMBINER_CACHE] = found
+    return found
 }
 
 /** True if the resolved combiner supports (needs) the `--mcp` serve flag. Unknown

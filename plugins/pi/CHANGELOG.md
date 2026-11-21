@@ -6,6 +6,18 @@ tagged `vX.Y.Z`. The extension runs the matching mcp-combiner release, so each
 entry also summarises the combiner's changes; the full list is in
 [the combiner's changelog](https://github.com/georgeharker/mcp-combiner/blob/main/combiner/CHANGELOG.md).
 
+## [Unreleased]
+
+### Fixed
+
+- **pi exits promptly.** Every connect left an 8-second connect-timeout timer
+  running (it was never stored, so it was never cleared), which held pi's
+  process open after shutdown. The timer is now cleared and `unref`'d.
+- **Faster startup.** The combiner's location and version are checked once per
+  pi process instead of on every session start and reconnect; with the
+  combiner's own faster `--version`, startup drops from about 1.2 s to about
+  0.2 s when the combiner is installed.
+
 ## [0.24.3] - 2026-11-20
 
 ### Fixed

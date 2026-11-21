@@ -20,6 +20,15 @@ import sys
 import types
 from typing import Any
 
+# A bare `--version` answers before the imports below (uvicorn and the whole
+# server stack, ~1s): clients probe it on every start (the pi extension runs it
+# while pi starts up). Same output as argparse's version action.
+if sys.argv[1:] == ["--version"]:
+    from mcp_combiner import __version__
+
+    print(f"mcp-combiner {__version__}")
+    raise SystemExit(0)
+
 # Serve mode looks up this machine's tailnet name/address (bind 'auto',
 # advertise, oauth.public_url) — slow on some platforms. Start it now, so it
 # overlaps the imports below rather than adding to startup.
