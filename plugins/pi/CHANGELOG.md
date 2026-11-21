@@ -6,7 +6,7 @@ tagged `vX.Y.Z`. The extension runs the matching mcp-combiner release, so each
 entry also summarises the combiner's changes; the full list is in
 [the combiner's changelog](https://github.com/georgeharker/mcp-combiner/blob/main/combiner/CHANGELOG.md).
 
-## [Unreleased]
+## [0.24.4] - 2026-11-20
 
 ### Fixed
 
@@ -18,7 +18,7 @@ entry also summarises the combiner's changes; the full list is in
   instead of 1.2 s, so startup drops from about 1.2 s to about 0.2 s when
   the combiner is installed.
 
-## [0.24.3] - 2026-11-20
+## [0.24.3] - 2026-11-20 (not published; included in 0.24.4)
 
 ### Fixed
 
