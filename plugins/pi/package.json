@@ -23,10 +23,10 @@
     "CHANGELOG.md"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "node ./node_modules/typescript/bin/tsc",
     "clean": "rm -rf dist",
-    "typecheck": "tsc --noEmit",
-    "smoke": "tsc && node scripts/smoke.mjs",
+    "typecheck": "node ./node_modules/typescript/bin/tsc --noEmit",
+    "smoke": "node ./node_modules/typescript/bin/tsc && node scripts/smoke.mjs",
     "prepack": "node -e \"require('fs').copyFileSync('../../CLAUDE.md.example', './instructions.txt')\"",
     "prepublishOnly": "npm run clean && npm run build",
     "test": "vitest run"
@@ -58,6 +58,7 @@
   "devDependencies": {
     "@earendil-works/pi-tui": "^1.6.0",
     "@types/node": "^22.0.0",
+    "@typescript/native": "npm:typescript@^7.0.2",
     "typescript": "^5.6.0",
     "vitest": "^4.1.11"
   },
@@ -74,6 +75,6 @@
     }
   },
   "dependencies": {
-    "@earendil-works/pi-mcp": "^1.6.0"
+    "@earendil-works/pi-mcp": "^1.2.0"
   }
 }
