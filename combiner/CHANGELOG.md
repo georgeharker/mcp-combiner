@@ -9,6 +9,10 @@ tagged `vX.Y.Z`.
 No combiner changes. The Pi extension is compatible with pi 1.6.0's TUI
 contract (see `plugins/pi/CHANGELOG.md`).
 
+The Nix build passes again: since 0.24.1 its test run failed, because the
+new "can't reach the combiner" tests read the build sandbox's deliberately
+missing `SSL_CERT_FILE`. The tests now ignore it. No code changes.
+
 ## [0.24.2] — 2026-11-15
 
 ### Changed

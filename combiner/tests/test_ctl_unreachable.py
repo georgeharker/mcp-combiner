@@ -12,6 +12,16 @@ import pytest
 from mcp_combiner import ctl
 
 
+@pytest.fixture(autouse=True)
+def _real_certificates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The HTTP client loads CA certificates before connecting, even for
+    http://. Nix's build sandbox sets SSL_CERT_FILE to a file that doesn't
+    exist (/no-cert-file.crt), which fails with ENOENT before any connection
+    is tried; these tests are about the connection, so use the defaults."""
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+
+
 def _parse(*argv: str) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="mcp-combiner")
     sub = parser.add_subparsers(dest="command")
