@@ -50,19 +50,25 @@ export function countsFromHealth(health: unknown): FooterCounts {
     return { enabled, ready, disabled }
 }
 
+/** A native tool-registration pass in progress: tools registered so far / to register. */
+export type RegisterProgress = { done: number; total: number }
+
 /** Render the footer text for a mode (undefined = clear the slot). */
 export function footerText(
     mode: FooterStatus,
     counts: FooterCounts,
     connectionState: string,
     toolCount?: number,
+    registering?: RegisterProgress,
 ): string | undefined {
     if (mode === "off") return undefined
     if (mode === "compact") return `${PLUG} MCP ${counts.ready}/${counts.enabled}`
     let text = `${PLUG} ${counts.enabled} ${counts.enabled === 1 ? "server" : "servers"} enabled`
     if (counts.ready > 0) text += ` (${counts.ready} ready)`
     if (counts.disabled > 0) text += ` (${counts.disabled} disabled)`
-    if (typeof toolCount === "number" && toolCount > 0) text += ` · ${toolCount} tools`
+    if (registering && registering.done < registering.total) {
+        text += ` · registering tools ${registering.done}/${registering.total}`
+    } else if (typeof toolCount === "number" && toolCount > 0) text += ` · ${toolCount} tools`
     if (connectionState !== "connected" && connectionState !== "disconnected") {
         text += ` — ${connectionState}`
     }
@@ -78,6 +84,7 @@ export async function updateFooter(
     ui: ExtensionUIContext | undefined,
     key: string,
     mode: FooterStatus,
+    registering?: RegisterProgress,
 ): Promise<void> {
     if (mode === "off") return
     const setStatus = ui?.setStatus
@@ -94,7 +101,7 @@ export async function updateFooter(
     try {
         const [health, tools] = await Promise.all([connection.health(), connection.listTools().catch(() => undefined)])
         const toolCount = tools?.length
-        text = footerText(mode, countsFromHealth(health), connection.state, toolCount)
+        text = footerText(mode, countsFromHealth(health), connection.state, toolCount, registering)
     } catch {
         // Combiner unreachable: report our connection state honestly, still occupying
         // the slot so the label never silently vanishes.

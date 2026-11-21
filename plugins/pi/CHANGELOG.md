@@ -6,6 +6,27 @@ tagged `vX.Y.Z`. The extension runs the matching mcp-combiner release, so each
 entry also summarises the combiner's changes; the full list is in
 [the combiner's changelog](https://github.com/georgeharker/mcp-combiner/blob/main/combiner/CHANGELOG.md).
 
+## [Unreleased]
+
+### Fixed
+
+- **No more typing freeze after startup.** pi rebuilds its whole tool registry
+  on every `registerTool`, and with codemode on that re-renders every tool's
+  declaration, so registering the combiner's ~1,000 tools in one go froze the
+  editor for 10 seconds or more. Tools now register in slices of about 50 ms
+  each, yielding to pi between them. A time budget rather than a fixed count
+  keeps the slices even, since each call gets slower as the registry grows.
+  Typing lag during registration is now about 55 ms (worst seen: 156 ms); all
+  the tools arrive over about 10 s.
+- A newer catalog (a `tools/list_changed` mid-registration) supersedes the
+  pass in progress at its next slice, and `/new`, `/resume` or `/reload` stops
+  it, so it never calls the retired extension API.
+
+### Changed
+
+- The footer shows `registering tools N/M` while a registration pass runs.
+- Depends on `@earendil-works/pi-mcp` `^1.6.0` (was `^1.2.0`).
+
 ## [0.24.4] - 2026-11-20
 
 ### Fixed

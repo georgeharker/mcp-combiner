@@ -40,6 +40,9 @@ export type NativeActivationOptions = {
     /** Cap on guarded tool-result text before spill-to-file (maxResultChars setting);
      *  forwarded to the tool surface and the interactive read_* tools. */
     maxResultChars?: number
+    /** Tool-registration progress for the current pass (registered, total); see
+     *  NativeToolSurfaceOptions.onProgress. index.ts drives the footer from it. */
+    onToolProgress?: (done: number, total: number) => void
     log: (level: "info" | "warn" | "error", message: string) => void
 }
 
@@ -57,8 +60,18 @@ export function activateNativeMode(
     // Cross-pass memory for the read_* tools (skip re-registration of unchanged
     // names — pi.registerTool replaces-by-name with a warning).
     const resourceRegistered = new Set<string>()
+    // Only the NEWEST tool pass may change toolState. activateNativeTools yields
+    // between registration slices, so passes can overlap in time; each run() bumps
+    // `generation`, and a pass whose generation is stale stops at its next check.
+    // That is enough on its own: a pass checks shouldContinue() after every await
+    // (listTools and each slice yield), and every state change happens synchronously
+    // between those checks, so a superseded pass never touches state again. A
+    // dispose() stops the pass the same way (pi's registerTool throws once the
+    // extension API is invalidated).
+    let generation = 0
     const run = () => {
         if (!active) return
+        const mine = ++generation
         void activateNativeTools(pi, {
             connection: opts.connection,
             serverFilter: opts.serverFilter,
@@ -66,10 +79,17 @@ export function activateNativeMode(
             state: toolState,
             warnLargeDirectExposure: opts.warnLargeDirectExposure,
             maxResultChars: opts.maxResultChars,
+            shouldContinue: () => active && generation === mine,
+            onProgress: opts.onToolProgress,
             log: opts.log,
-        }).catch((e) =>
-            opts.log("warn", `native tool surface failed: ${e instanceof Error ? e.message : String(e)}`),
-        )
+        })
+            .catch((e) => opts.log("warn", `native tool surface failed: ${e instanceof Error ? e.message : String(e)}`))
+            // The newest pass always ends with a "done" report, even when it had
+            // nothing to register or failed, so a "registering" left by a superseded
+            // pass never sticks in the footer.
+            .finally(() => {
+                if (active && generation === mine) opts.onToolProgress?.(0, 0)
+            })
         if (opts.exposeResources !== false) {
             void activateNativeResources(
                 pi,

@@ -60,8 +60,33 @@ export type NativeToolSurfaceOptions = {
     /** Warn when the direct-exposure set grows large (every declared schema rides in
      *  every request). Settings kill-switch: warnLargeDirectExposure (default true). */
     warnLargeDirectExposure?: boolean
+    /** Checked after every yield between registration slices: false means this
+     *  pass should stop (the session ended, or a newer pass superseded it). pi's
+     *  registerTool throws once the extension API is invalidated (/new, /resume,
+     *  /reload), and a superseded pass would only redo work the next one does. */
+    shouldContinue?: () => boolean
+    /** Registration progress for this pass: (registered so far, total to register).
+     *  Called after each slice; not called when the pass has nothing to register.
+     *  done >= total means finished (activateNativeMode also reports (0, 0) when its
+     *  newest pass ends, however it ends). */
+    onProgress?: (done: number, total: number) => void
     log: (level: "info" | "warn" | "error", message: string) => void
 }
+
+/** Main-thread time a registration slice may use before yielding to the event
+ *  loop. Every pi.registerTool rebuilds pi's whole tool registry, and with codemode
+ *  active that re-renders a declaration for every codemode tool registered so far.
+ *  So a pass is O(n²) and the per-call cost grows as the pass goes (from ~2 ms to
+ *  ~12–18 ms at ~1,000 tools). A fixed tool COUNT per slice made the last slices
+ *  about six times longer than the first; a time budget keeps every slice about
+ *  the same length. Registering a 1,000-tool catalog in one go froze typing for
+ *  ~10 s. A slice always registers at least one tool, so a call slower than the
+ *  budget still makes progress. */
+export const REGISTER_SLICE_MS = 50
+
+/** Yield to the event loop with a MACROTASK. A microtask (await Promise.resolve())
+ *  runs before pi reads stdin, so typing would stay frozen across the whole pass. */
+const yieldToEventLoop = (): Promise<void> => new Promise((resolve) => setImmediate(resolve))
 
 /** Registration memory across passes: currently-declared names + each tool's schema
  *  signature, so a changed schema re-registers and an unchanged one doesn't (pi's
@@ -185,17 +210,26 @@ function removedToolDefinition(name: string): ToolDefinition {
 /** Register the combiner's tools natively, DIFFING against `state` (which the caller
  *  reuses across passes): unchanged declarations are skipped (pi.registerTool
  *  replaces-by-name with a warning — churn on every list_changed would spam), changed
- *  schemas re-register, and removed tools are re-registered hidden. Returns the names
- *  currently active (for status/panel surfaces). */
+ *  schemas re-register, and removed tools are re-registered hidden.
+ *
+ *  Registration runs in time-boxed slices (REGISTER_SLICE_MS) with an event-loop
+ *  yield between them, so a large catalog never holds pi's main thread for long. `state` is updated per registerTool, never ahead of it, so a
+ *  pass that stops early (shouldContinue() false) leaves state matching exactly what
+ *  pi holds and the next pass's diff resumes from there. Callers must not run two
+ *  passes over the same state at once (native/index.ts serialises them). Returns the
+ *  names currently active (for status/panel surfaces). */
 export async function activateNativeTools(pi: ExtensionAPI, opts: NativeToolSurfaceOptions): Promise<string[]> {
     const state: NativeToolSurfaceState = opts.state ?? { names: new Set(), signatures: new Map() }
+    const keepGoing = opts.shouldContinue ?? (() => true)
     const tools = applyServerFilter(await opts.connection.listTools(true), resolveFilter(opts.serverFilter))
+    if (!keepGoing()) return [...state.names]
     const allowlist = Array.isArray(resolveDirectSpec(opts.directSpec)) ? (resolveDirectSpec(opts.directSpec) as string[]) : []
     const reserved: ReadonlySet<string> = new Set(RESERVED_TOOL_NAMES)
 
+    // Diff first, register second: the slices then hold only real registrations.
     const currentNames = new Set(tools.map((t) => t.name))
     const directNames: string[] = []
-    let fresh = 0
+    const toRegister: Array<{ def: ToolDefinition; sig: string | null }> = []
     for (const sum of tools) {
         if (reserved.has(sum.name)) {
             opts.log("warn", `skipping combiner tool "${sum.name}" — collides with a reserved name`)
@@ -209,17 +243,14 @@ export async function activateNativeTools(pi: ExtensionAPI, opts: NativeToolSurf
         // Diff: skip the re-register when the schema signature is unchanged (pi keeps
         // the existing declaration; re-registering would log its warning for nothing).
         const sig = renderSchemaSignature(sum.inputSchema)
-        if (state.names.has(sum.name) && state.signatures.get(sum.name) === sig) {
-            continue
-        }
-        pi.registerTool(toNativeTool(sum, opts.connection, exposure, opts.maxResultChars))
-        state.signatures.set(sum.name, sig)
-        state.names.add(sum.name)
-        fresh++
+        if (state.names.has(sum.name) && state.signatures.get(sum.name) === sig) continue
         if (exposure === "direct") directNames.push(sum.name)
+        toRegister.push({ def: toNativeTool(sum, opts.connection, exposure, opts.maxResultChars), sig })
     }
-    // Removals: hide them (never unregister silently — pi has no unregister; a hidden
-    // re-register at the same name retires the declaration).
+
+    // Removals first: hide them (never unregister silently — pi has no unregister; a
+    // hidden re-register at the same name retires the declaration). They also shrink
+    // the registry, which makes every later rebuild cheaper.
     let removed = 0
     for (const goneName of [...state.names]) {
         if (currentNames.has(goneName)) continue
@@ -227,6 +258,26 @@ export async function activateNativeTools(pi: ExtensionAPI, opts: NativeToolSurf
         state.names.delete(goneName)
         state.signatures.delete(goneName)
         removed++
+    }
+
+    let fresh = 0
+    while (fresh < toRegister.length) {
+        if (fresh > 0) {
+            await yieldToEventLoop()
+            if (!keepGoing()) {
+                opts.log("info", `native tool surface: pass stopped after ${fresh}/${toRegister.length} (superseded or session ended)`)
+                return [...state.names]
+            }
+        }
+        const sliceStart = performance.now()
+        do {
+            const { def, sig } = toRegister[fresh]
+            pi.registerTool(def)
+            state.signatures.set(def.name, sig)
+            state.names.add(def.name)
+            fresh++
+        } while (fresh < toRegister.length && performance.now() - sliceStart < REGISTER_SLICE_MS)
+        opts.onProgress?.(fresh, toRegister.length)
     }
     if (
         directNames.length > DIRECT_EXPOSURE_WARN_THRESHOLD &&

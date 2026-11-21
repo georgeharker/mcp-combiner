@@ -54,7 +54,7 @@ import { resolveSessionConfig, type SessionConfig } from "./client/config-ladder
 import { metaToolCall, statusText as controlStatusText } from "./client/control.js"
 import { openCombinerPanel } from "./client/panel.js"
 import { syncPromptCommands } from "./client/prompts.js"
-import { updateFooter } from "./client/footer.js"
+import { updateFooter, type RegisterProgress } from "./client/footer.js"
 
 const DEFAULT_PORT = 9741
 const DEFAULT_NAME = "mcp-combiner"
@@ -356,6 +356,9 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
 
     let connection: NativeCombinerConnection | undefined
     let nativeSurface: ReturnType<typeof activateNativeMode> | undefined
+    // Set once the footer exists (the `if (connection)` block below); the native
+    // surface, created first, reports registration progress through it.
+    let onToolProgress: ((done: number, total: number) => void) | undefined
     // Session-config HOLDER: everything the ladder shapes, resolved against a SESSION
     // cwd (worktree subagents / project switches get their own project layers).
     // Factory-time resolution with process.cwd() is the pre-session default; every
@@ -409,6 +412,7 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
         // session_start (post-setToken — the connection refuses to connect
         // without a grouping token); list_changed re-syncs ride resyncAll below.
         nativeSurface = activateNativeMode(pi, {
+            onToolProgress: (done, total) => onToolProgress?.(done, total),
             connection,
             // Getters, not snapshots: worktrees / project switches re-resolve
             // sessionCfg per session_start, and a load-time value would apply the
@@ -451,9 +455,25 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
             void conn.reset("superseded by a newer extension instance (reload)")
         })
 
+        // Native registration progress (undefined when no pass is registering).
+        let registering: RegisterProgress | undefined
+        let lastProgressPaint = 0
         const refreshFooter = () => {
             if (uiCtx)
-                void updateFooter(conn, uiCtx, settings.mcpFooterKey, settings.mcpFooterStatus).catch(() => undefined)
+                void updateFooter(conn, uiCtx, settings.mcpFooterKey, settings.mcpFooterStatus, registering).catch(
+                    () => undefined,
+                )
+        }
+        // Called after every registration slice. Repaint at most every 500 ms (each
+        // repaint fetches /health) and always on the final slice.
+        onToolProgress = (done, total) => {
+            const finished = done >= total
+            registering = finished ? undefined : { done, total }
+            const now = Date.now()
+            if (finished || now - lastProgressPaint >= 500) {
+                lastProgressPaint = now
+                refreshFooter()
+            }
         }
         const syncPrompts = () => {
             if (!settings.prompts) return
