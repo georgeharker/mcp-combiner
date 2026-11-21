@@ -4,6 +4,13 @@ All notable changes to the combiner are documented here. The version moves in
 lockstep with the rest of the repo (`scripts/bump-version.sh`); releases are
 tagged `vX.Y.Z`.
 
+## [0.24.5] — 2026-11-21
+
+No combiner changes. This release is the Pi extension (startup typing freeze
+fixed, cold-start connect, a turn waits for tools, automatic reconnect and
+respawn of the combiner) and a sharedserver >= 0.9.6 requirement in the Pi,
+OpenCode and Claude plugins; see `plugins/pi/CHANGELOG.md`.
+
 ## [0.24.4] — 2026-11-20
 
 ### Fixed
