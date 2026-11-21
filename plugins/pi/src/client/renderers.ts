@@ -37,7 +37,7 @@ class TitleRow implements TuiComponent {
         this.cached = null
     }
 
-    render(width: number): string[] {
+    render(width: number): readonly string[] {
         const safeWidth = Math.max(1, Math.floor(width))
         if (this.cached?.width === safeWidth) return this.cached.lines
         const fg = this.theme?.fg?.bind(this.theme)
@@ -84,7 +84,7 @@ class CompactResult implements TuiComponent {
         this.cached = null
     }
 
-    render(width: number): string[] {
+    render(width: number): readonly string[] {
         const safeWidth = Math.max(1, Math.floor(width))
         if (this.cached?.width === safeWidth) return this.cached.lines
         const fg = this.theme?.fg?.bind(this.theme)

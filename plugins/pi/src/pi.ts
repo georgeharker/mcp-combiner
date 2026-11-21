@@ -80,7 +80,7 @@ export type ImageBlock = { type: "image"; data: string; mimeType: string }
  *  time the transcript invalidates (session restore, theme change, resize).
  *  Renderers must at minimum no-op it / drop any width cache. */
 export type TuiComponent = {
-    render(width: number): string[]
+    render(width: number): readonly string[]
     invalidate(): void
 }
 

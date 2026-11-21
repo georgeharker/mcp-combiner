@@ -276,7 +276,7 @@ class CombinerPanel implements Component {
 
     // ── rendering ──
 
-    render(width: number): string[] {
+    render(width: number): readonly string[] {
         const w = Math.min(PANEL_WIDTH, Math.max(40, width))
         const inner = w - 4
         this.container.clear()

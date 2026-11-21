@@ -4,6 +4,23 @@ All notable changes to the combiner are documented here. The version moves in
 lockstep with the rest of the repo (`scripts/bump-version.sh`); releases are
 tagged `vX.Y.Z`.
 
+## [0.24.3] — 2026-11-20
+
+### Fixed
+
+- **A combiner whose install was replaced underneath it says so.** An
+  in-place reinstall can delete the package directory a running combiner was
+  loaded from; its next lazy import (the reset notes, on a restart or a
+  healed session) used to fail with a bare "cannot import name". It now adds
+  that the process is stale and to run `mcp-combiner restart --force`.
+
+The Pi extension is compatible with pi 1.6.0's TUI contract (see
+`plugins/pi/CHANGELOG.md`).
+
+The Nix build passes again: since 0.24.1 its test run failed, because the
+"can't reach the combiner" tests read the build sandbox's deliberately
+missing `SSL_CERT_FILE`. The tests now ignore it.
+
 ## [0.24.2] — 2026-11-15
 
 ### Changed

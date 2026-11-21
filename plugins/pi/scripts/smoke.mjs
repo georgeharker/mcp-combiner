@@ -106,7 +106,10 @@ try {
 try {
     await conn.applyFilter({ allow: ["github"] })
     const filtered = await conn.listTools(true)
-    const nonGithub = filtered.filter((t) => !t.name.startsWith("github_") && !t.name.startsWith("combiner__"))
+    // The combiner's own tools stay whatever the filter: combiner__* and
+    // open_widget (the widget tool, which has no combiner__ prefix).
+    const ownTool = (name) => name.startsWith("combiner__") || name === "open_widget"
+    const nonGithub = filtered.filter((t) => !t.name.startsWith("github_") && !ownTool(t.name))
     check("token filter applies", nonGithub.length === 0, `${filtered.length} tools remain`)
     const bearer = process.env.MCP_COMBINER_AUTH_TOKEN
     const headers = bearer ? { authorization: `Bearer ${bearer}` } : {}
