@@ -15,6 +15,9 @@ entry also summarises the combiner's changes; the full list is in
   against `@earendil-works/pi-tui` 1.6, whose `Container.render` returns a
   cached read-only array. No behaviour change. The `pi-tui` peer range now
   includes the 1.x releases (`^0.85.1 || ^1.0.0`).
+- `npm run smoke` builds first: it tests the built `dist/`, and a stale build
+  had produced false failures. Its token-filter check now treats
+  `open_widget` as a combiner tool, which no server filter hides.
 
 ## [0.24.2] - 2026-11-15
 
