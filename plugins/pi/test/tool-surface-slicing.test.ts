@@ -414,6 +414,7 @@ describe("review fixes", () => {
         }
         const conn = new SlowHealth()
         conn.catalog = catalog("srv", 7)
+        conn.state = "connected" // the footer lists tools only on a live connection
         let shown: string | undefined
         const ui = { setStatus: (_key: string, text: string | undefined) => (shown = text) }
         let registering: { done: number; total: number } | undefined = { done: 3, total: 7 }
@@ -427,5 +428,27 @@ describe("review fixes", () => {
         await early
         expect(shown).toContain("7 tools")
         expect(shown).not.toContain("registering")
+    })
+})
+
+describe("footer never connects", () => {
+    it("a footer repaint while disconnected doesn't list tools (no connect)", async () => {
+        class Counting extends CatalogConnection {
+            lists = 0
+            override async listTools(): Promise<ToolSummary[]> {
+                this.lists++
+                return this.catalog
+            }
+            override health(): Promise<unknown> {
+                return Promise.resolve({ servers: {} })
+            }
+        }
+        const conn = new Counting()
+        conn.state = "disconnected"
+        await updateFooter(conn, { setStatus: () => undefined }, "mcp", "full")
+        expect(conn.lists).toBe(0)
+        conn.state = "connected"
+        await updateFooter(conn, { setStatus: () => undefined }, "mcp", "full")
+        expect(conn.lists).toBe(1)
     })
 })

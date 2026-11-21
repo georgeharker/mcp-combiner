@@ -101,8 +101,11 @@ export async function updateFooter(
     }
     let text: string | undefined
     try {
-        const [health, tools] = await Promise.all([connection.health(), connection.listTools().catch(() => undefined)])
-        const toolCount = tools?.length
+        // List tools only on a live connection: a footer repaint must never start a
+        // connect itself (it would bypass the connection's reconnect backoff).
+        const tools = connection.state === "connected" ? connection.listTools().catch(() => undefined) : undefined
+        const [health, toolList] = await Promise.all([connection.health(), tools])
+        const toolCount = toolList?.length
         text = footerText(mode, countsFromHealth(health), connection.state, toolCount, registering?.())
     } catch {
         // Combiner unreachable: report our connection state honestly, still occupying

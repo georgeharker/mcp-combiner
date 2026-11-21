@@ -125,6 +125,23 @@ const CONNECT_TIMEOUT_MS = 8_000
 export type ConnectRetry = { budgetMs: number; reconnectBudgetMs: number; firstMs: number; maxMs: number }
 const DEFAULT_CONNECT_RETRY: ConnectRetry = { budgetMs: 15_000, reconnectBudgetMs: 3_000, firstMs: 100, maxMs: 1_000 }
 
+/** Staying connected on its own (setAutoReconnect): after a dropped connection,
+ *  reconnect after `dropMs`, doubling to `dropMaxMs` while connections keep dropping
+ *  within `stableMs` of connecting (a combiner that accepts and then closes must not
+ *  be hammered). After a failed connect, try again in the background after
+ *  `failMs`, doubling to `failMaxMs`, until it succeeds or the connection is closed. */
+export type AutoReconnect = { dropMs: number; dropMaxMs: number; stableMs: number; failMs: number; failMaxMs: number }
+const DEFAULT_AUTO_RECONNECT: AutoReconnect = {
+    dropMs: 500,
+    dropMaxMs: 30_000,
+    stableMs: 10_000,
+    failMs: 1_000,
+    failMaxMs: 10_000,
+}
+
+/** The liveness check's answer (NativeCombinerConnection.setLivenessCheck). */
+export type Liveness = "alive" | "gone" | "relaunched"
+
 /** True for a connect refused at the socket (Node's fetch: TypeError "fetch failed"
  *  whose cause chain carries code ECONNREFUSED). */
 export function isConnectionRefused(e: unknown): boolean {
@@ -190,23 +207,83 @@ export class NativeCombinerConnection implements CombinerConnection {
      *  Every connect waits on it, so a connect never races the launch. Unset when
      *  someone else owns the combiner (host-owned / unmanaged): nothing to wait for. */
     private startGate: Promise<void> | undefined
-    /** Between refused-connect retries: false means the combiner process is gone
-     *  (stop retrying now instead of waiting out the budget). pi never relaunches a
-     *  combiner that died: the next session's attach starts one. */
-    private livenessCheck: (() => Promise<boolean>) | undefined
+    /** Between refused-connect retries (CombinerProcess.onRefused): "alive" keeps
+     *  retrying; "gone" stops now instead of waiting out the budget; "relaunched"
+     *  (a dead combiner was respawned) keeps retrying with the cold-start budget. */
+    private livenessCheck: (() => Promise<Liveness>) | undefined
     /** Set by the first successful connect; switches refused-connect retries to the
      *  short reconnect budget (see ConnectRetry). */
     private everConnected = false
+    /** Auto-reconnect (see AutoReconnect): off until setAutoReconnect(); `closed`
+     *  (close()) stops it for good. */
+    private auto: AutoReconnect | undefined
+    private closed = false
+    private reconnectTimer: ReturnType<typeof setTimeout> | undefined
+    private dropDelayMs = 0
+    private failDelayMs = 0
+    private connectedAt = 0
+    /** Consecutive failed connects: only the first of an outage is reported. */
+    private failStreak = 0
 
     constructor(
         conn: ResolvedConnection,
         log: LogFn,
-        opts?: { transportFactory?: (url: URL) => McpTransport; retry?: ConnectRetry },
+        opts?: { transportFactory?: (url: URL) => McpTransport; retry?: ConnectRetry; autoReconnect?: AutoReconnect },
     ) {
         this.conn = conn
         this.log = log
         this.transportFactory = opts?.transportFactory
         this.retry = opts?.retry ?? DEFAULT_CONNECT_RETRY
+        this.autoDefaults = opts?.autoReconnect ?? DEFAULT_AUTO_RECONNECT
+    }
+    private readonly autoDefaults: AutoReconnect
+
+    /** Keep this connection up on its own: reconnect after a drop, and retry a failed
+     *  connect in the background (see AutoReconnect). index.ts turns it on per
+     *  extension instance; close() turns it off for good. */
+    setAutoReconnect(on: boolean): void {
+        this.auto = on ? this.autoDefaults : undefined
+        if (!on) this.clearReconnectTimer()
+    }
+
+    /** Reconnect now, e.g. because the combiner process went away (CombinerProcess's
+     *  watch). A connect already in progress is left alone: its refused-connect
+     *  retry asks the same questions, and a reset would throw away its budget. */
+    reconnect(reason: string): void {
+        if (this.closed || this.state === "connecting") return
+        void this.reset(reason).then(() => {
+            if (!this.closed) void this.ensureConnected().catch(() => undefined)
+        })
+    }
+
+    /** Undo close() for a host that reuses the extension instance across sessions
+     *  (pi 1.6 doesn't; harmless when nothing was closed). */
+    reopen(): void {
+        this.closed = false
+    }
+
+    /** Session shutdown / reload teardown: stop auto-reconnect for good and drop the
+     *  connection. Nothing reconnects this instance afterwards (until reopen()). */
+    async close(reason: string): Promise<void> {
+        this.closed = true
+        this.auto = undefined
+        this.clearReconnectTimer()
+        await this.reset(reason)
+    }
+
+    private clearReconnectTimer(): void {
+        if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
+        this.reconnectTimer = undefined
+    }
+
+    /** Schedule a background reconnect after `delayMs` (one at a time; unref'd). */
+    private scheduleReconnect(delayMs: number): void {
+        if (!this.auto || this.closed || this.reconnectTimer) return
+        this.reconnectTimer = setTimeout(() => {
+            this.reconnectTimer = undefined
+            if (this.auto && !this.closed) void this.ensureConnected().catch(() => undefined)
+        }, delayMs)
+        this.reconnectTimer.unref?.()
     }
 
     /** Make every connect wait for `gate` (the manage half's attach). */
@@ -215,7 +292,7 @@ export class NativeCombinerConnection implements CombinerConnection {
     }
 
     /** Install the between-retries liveness check (see livenessCheck). */
-    setLivenessCheck(check: () => Promise<boolean>): void {
+    setLivenessCheck(check: () => Promise<Liveness>): void {
         this.livenessCheck = check
     }
 
@@ -243,7 +320,11 @@ export class NativeCombinerConnection implements CombinerConnection {
             return false
         }
         this.conn = conn
-        this.everConnected = false // a different combiner: the first-connect budget applies
+        // A different combiner: the first-connect budget and a fresh outage record.
+        this.everConnected = false
+        this.failStreak = 0
+        this.failDelayMs = 0
+        this.dropDelayMs = 0
         void this.reset("connection rebound (session config changed)")
         return true
     }
@@ -264,19 +345,30 @@ export class NativeCombinerConnection implements CombinerConnection {
         // A reset while we waited at the gate (token or config changed) makes this
         // connect stale: don't open a session for the old token.
         if (this.generation !== genAtStart) throw new Error("connect superseded by a connection reset (token/config changed)")
-        const deadline = Date.now() + (this.everConnected ? this.retry.reconnectBudgetMs : this.retry.budgetMs)
+        let deadline = Date.now() + (this.everConnected ? this.retry.reconnectBudgetMs : this.retry.budgetMs)
+        let extended = false
         let delay = this.retry.firstMs
         let announced = false
         for (;;) {
             try {
                 const client = await attempt()
                 this.everConnected = true
+                this.connectedAt = Date.now()
+                this.failDelayMs = 0
+                if (this.failStreak > 0) this.log("info", `combiner reachable again at ${this.conn.baseUrl}`)
+                this.failStreak = 0
                 return client
             } catch (e) {
-                if (!isConnectionRefused(e) || this.generation !== genAtStart || Date.now() + delay > deadline) throw e
+                if (!isConnectionRefused(e) || this.generation !== genAtStart) throw e
                 // A failing check counts as alive: it must never stop a retry that would work.
-                if (this.livenessCheck && !(await this.livenessCheck().catch(() => true))) throw e
-                if (!announced) {
+                const liveness = this.livenessCheck ? await this.livenessCheck().catch((): Liveness => "alive") : "alive"
+                if (liveness === "gone") throw e
+                if (liveness === "relaunched" && !extended) {
+                    deadline = Date.now() + this.retry.budgetMs // a cold start again
+                    extended = true
+                }
+                if (Date.now() + delay > deadline) throw e
+                if (!announced && this.failStreak === 0) {
                     announced = true
                     this.log(
                         "info",
@@ -315,6 +407,7 @@ export class NativeCombinerConnection implements CombinerConnection {
     /** Connect (idempotent, single-flight). THE elicitation-relevant site: the
      *  capability + request handler live HERE, on a client we own. */
     async ensureConnected(): Promise<McpClient> {
+        if (this.closed) throw new Error("the combiner connection is closed (session ended)")
         if (this.client) return this.client
         if (this.connecting) return this.connecting
 
@@ -394,6 +487,15 @@ export class NativeCombinerConnection implements CombinerConnection {
                     this.client = undefined
                     this.state = "disconnected"
                     this.hooks.onStateChange?.(this.state)
+                    // A genuine drop (a reset clears this.client first, so it never gets
+                    // here): reconnect on our own, backing off while drops come quickly.
+                    if (this.auto) {
+                        const quick = Date.now() - this.connectedAt < this.auto.stableMs
+                        this.dropDelayMs = quick && this.dropDelayMs
+                            ? Math.min(this.dropDelayMs * 2, this.auto.dropMaxMs)
+                            : this.auto.dropMs
+                        this.scheduleReconnect(this.dropDelayMs)
+                    }
                 }
             })
 
@@ -472,8 +574,16 @@ export class NativeCombinerConnection implements CombinerConnection {
             if (!superseded) {
                 this.state = "failed"
                 this.lastError = e instanceof Error ? e.message : String(e)
-                this.log("warn", `combiner connect failed (${this.lastError})`)
+                this.failStreak++
+                // Once per outage: background retries must not repeat the warning.
+                if (this.failStreak === 1) this.log("warn", `combiner connect failed (${this.lastError})`)
                 this.hooks.onStateChange?.(this.state)
+                if (this.auto) {
+                    this.failDelayMs = this.failDelayMs
+                        ? Math.min(this.failDelayMs * 2, this.auto.failMaxMs)
+                        : this.auto.failMs
+                    this.scheduleReconnect(this.failDelayMs)
+                }
             }
             throw superseded
                 ? e

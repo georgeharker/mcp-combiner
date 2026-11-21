@@ -26,7 +26,6 @@
 // degrade-rather-than-die behaviour, so a user running several clients gets one answer
 // to "which combiner / which sharedserver am I on, and why".
 
-import { spawn, spawnSync, type ChildProcess } from "node:child_process"
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { basename, dirname, join } from "node:path"
@@ -40,7 +39,7 @@ import type {
     SessionStartEvent,
     CommandSpec,
 } from "./pi.js"
-import { resolveSharedserver } from "./sharedserver-resolve.js"
+import { CombinerProcess, DEFAULT_PORT, env, type LogFn } from "./combiner-process.js"
 import { NativeCombinerConnection, activateNativeMode, waitForRegistration } from "./native/index.js"
 // ── TOOL SURFACE ───────────────────────────────────────────────────────────────
 // The mcp router (search/describe/call on the owned connection) + the native
@@ -56,21 +55,6 @@ import { openCombinerPanel } from "./client/panel.js"
 import { syncPromptCommands } from "./client/prompts.js"
 import { updateFooter, type RegisterProgress } from "./client/footer.js"
 import { matchesKey } from "@earendil-works/pi-tui"
-
-const DEFAULT_PORT = 9741
-const DEFAULT_NAME = "mcp-combiner"
-const DEFAULT_GRACE = "30m"
-// The `--mcp` serve flag arrived in combiner 0.8.0; older versions serve with a bare
-// `--config`. That boundary is also the floor for trusting a PATH install — below it we
-// fetch a known-good release via uvx rather than limp along. NOT the lockstep release
-// version; it moves only when this extension depends on newer combiner behaviour.
-const MIN_COMBINER_VERSION: [number, number, number] = [0, 8, 0]
-// Floor-only against sharedserver's latest release: this repo consumes sharedserver
-// rather than shipping it. Kept equal to the OpenCode plugin's value (they resolve the
-// same binary the same way).
-const SHAREDSERVER_MIN_VERSION = "0.6.7"
-
-type LogFn = (level: "info" | "warn" | "error", message: string) => void
 
 // ── the tool-discovery directive ───────────────────────────────────
 // Appended to the system prompt so the agent knows combined tools arrive under a
@@ -97,216 +81,8 @@ const DIRECTIVE_MARKER = COMBINER_DIRECTIVE.split("\n", 1)[0] ?? ""
 // The PI_MCP_COMBINER_* namespace mirrors the Claude plugin's CLAUDE_MCP_COMBINER_* and
 // the OpenCode plugin's OPENCODE_MCP_COMBINER_*, so a user running several clients keeps
 // one namespace per client rather than options in one place and env vars in another.
-
-function env(name: string): string | undefined {
-    const v = process.env[name]
-    return v !== undefined && v !== "" ? v : undefined
-}
-
-function splitArgs(value: string | undefined): string[] {
-    if (!value) return []
-    return value.split(/\s+/).filter((s) => s.length > 0)
-}
-
-// ── combiner command resolution (ported from the OpenCode plugin) ──
-
-type Command = {
-    cmd: string
-    /** Structural args identifying WHAT to run. Probed with; never omitted. */
-    args: string[]
-    /** The user's own extra args. Appended at spawn time only — never probed with. */
-    extra?: string[]
-    version?: [number, number, number]
-}
-
-function parseVersion(text: string): [number, number, number] | undefined {
-    const m = text.match(/(\d+)\.(\d+)\.(\d+)/)
-    if (!m) return undefined
-    return [Number(m[1]), Number(m[2]), Number(m[3])]
-}
-
-function gte(a: [number, number, number], b: [number, number, number]): boolean {
-    for (let i = 0; i < 3; i++) {
-        if (a[i] !== b[i]) return a[i] > b[i]
-    }
-    return true
-}
-
-/** Probe a command once for BOTH facts: is it runnable, and which version. Presence is
- *  "spawn did not fail", NOT "exited 0" — a pre-0.8.0 combiner exits non-zero on
- *  `--version` (the flag did not exist), which is exactly the stale install the floor
- *  exists to catch. Probes with ONLY the structural args; the user's extras are never
- *  folded in, so one arg the CLI rejects cannot make a healthy install look absent. */
-function probe(cmd: Command): { present: boolean; version?: [number, number, number] } {
-    const r = spawnSync(cmd.cmd, [...cmd.args, "--version"], { env: process.env })
-    if (r.error) return { present: false }
-    if (r.status !== 0) return { present: true }
-    return { present: true, version: parseVersion(`${r.stdout?.toString() ?? ""}${r.stderr?.toString() ?? ""}`) }
-}
-
-function probeUsable(cmd: Command): Command | undefined {
-    const { version } = probe(cmd)
-    if (!version || !gte(version, MIN_COMBINER_VERSION)) return undefined
-    return { ...cmd, version }
-}
-
-/** This extension's own version, kept equal to the published PyPI mcp-combiner by
- *  lockstep releases (scripts/bump-version.sh). Used as the uvx pin — read from the
- *  manifest, never duplicated as a constant. */
-const PLUGIN_VERSION: string | undefined = (() => {
-    try {
-        const here = dirname(fileURLToPath(import.meta.url))
-        const pkg = JSON.parse(readFileSync(join(here, "..", "package.json"), "utf8")) as { version?: string }
-        return pkg.version
-    } catch {
-        return undefined
-    }
-})()
-
-/** Resolve how to invoke the combiner, mirroring the sibling plugins' priority:
- *  explicit env command → `mcp-combiner` on PATH (only when new enough) →
- *  `uv run --project <checkout> python -m mcp_combiner` → a pinned release via uvx. The
- *  uvx tail is what makes a bare install work with nothing installed by hand. */
-function resolveCombiner(log: LogFn): Command | undefined {
-    const extra = splitArgs(env("PI_MCP_COMBINER_ARGS"))
-
-    const command = env("PI_MCP_COMBINER_COMMAND")
-    if (command) {
-        return { cmd: command, args: [], extra }
-    }
-
-    const onPath: Command = { cmd: "mcp-combiner", args: [] }
-    const pathProbe = probe(onPath)
-    if (pathProbe.present) {
-        if (pathProbe.version && gte(pathProbe.version, MIN_COMBINER_VERSION)) {
-            return { ...onPath, extra, version: pathProbe.version }
-        }
-        log(
-            "warn",
-            `mcp-combiner on PATH reports ${pathProbe.version?.join(".") ?? "a pre-0.8.0 version"}, older than ` +
-                `${MIN_COMBINER_VERSION.join(".")} — ignoring it and fetching a pinned release instead. ` +
-                "Upgrade with: uv tool install --upgrade mcp-combiner",
-        )
-    }
-
-    const checkout = env("PI_MCP_COMBINER_CHECKOUT")
-    if (checkout && existsSync(checkout) && probe({ cmd: "uv", args: [] }).present) {
-        return { cmd: "uv", args: ["run", "--project", checkout, "python", "-m", "mcp_combiner"], extra }
-    }
-
-    // Out-of-the-box path: no install required, fetch from PyPI. Pinned to this
-    // extension's version so the pair moves in lockstep; if that exact release is
-    // missing, fall back to latest rather than failing. The probe both validates the pin
-    // and warms uv's cache, so the real spawn is a cache hit.
-    if (probe({ cmd: "uvx", args: [] }).present) {
-        if (PLUGIN_VERSION) {
-            const pinned = probeUsable({ cmd: "uvx", args: [`mcp-combiner@${PLUGIN_VERSION}`] })
-            if (pinned) return { ...pinned, extra }
-            log("warn", `pinned mcp-combiner@${PLUGIN_VERSION} unavailable or too old; trying latest from PyPI`)
-        }
-        const latest = probeUsable({ cmd: "uvx", args: ["mcp-combiner"] })
-        if (latest) return { ...latest, extra }
-    }
-
-    return undefined
-}
-
-/** True if the resolved combiner supports (needs) the `--mcp` serve flag. Unknown
- *  version → assume NO: a version we cannot read is a pre-0.8.0 build serving on a bare
- *  `--config`, and a bare `--config` still serves on newer releases (with a deprecation
- *  warning), so guessing low degrades gracefully whereas guessing high does not. */
-function combinerNeedsMcpFlag(cmd: Command): boolean {
-    const ver = cmd.version ?? probe({ cmd: cmd.cmd, args: cmd.args }).version
-    return ver ? gte(ver, MIN_COMBINER_VERSION) : false
-}
-
-// ── servers.json resolution (mirrors the sibling plugins) ──
-
-function resolveConfig(log: LogFn): string | undefined {
-    const explicit = env("PI_MCP_COMBINER_CONFIG")
-    if (explicit) return explicit
-    const user = process.env.USER ?? process.env.LOGNAME ?? ""
-    const candidates = [
-        join(homedir(), ".cache", "secrets", `${user}.mcpservers.json`),
-        join(homedir(), ".config", "mcp-combiner", "servers.json"),
-        join(homedir(), ".config", "mcp", "servers.json"),
-    ]
-    const found = candidates.find(existsSync)
-    if (!found) {
-        log(
-            "error",
-            "no combiner servers.json found; set $PI_MCP_COMBINER_CONFIG (probed " +
-                "~/.cache/secrets/<user>.mcpservers.json, ~/.config/mcp-combiner/servers.json, " +
-                "~/.config/mcp/servers.json)",
-        )
-    }
-    return found
-}
-
-// ── sharedserver lifecycle ─────────────────────────────────────────
-
-/** Attach state for exactly one live refcount. Guards `detach()` so a
- *  `session_shutdown("quit")` and a process-exit handler cannot double-`unuse` (which
- *  would over-decrement sharedserver's refcount). `identity` is the combiner process
- *  the refcount is on (read with `sharedserver info --json` just after the attach);
- *  a reconnect to a different process takes a ref on that one too. */
-type Attachment = { binary: string; name: string; identity?: Promise<CombinerIdentity | undefined> }
-/** Per pi PROCESS, not per module instance: pi re-instantiates the extension for
- *  every session (jiti moduleCache:false), and `use` runs once per process. Lives on
- *  globalThis via Symbol.for, like CLEANUP_GUARD below. `quitting` is set at
- *  session_shutdown("quit"): an attach still in flight (sleeping on a "defunct"
- *  retry) must not re-take the combiner after detach() released it. */
-const ATTACH_STATE = Symbol.for("mcp-companion:attach-state")
-type AttachState = {
-    attachment: Attachment | null
-    quitting: boolean
-    /** holdRefOnCurrentCombiner's single flight (per process). */
-    holdingRef?: Promise<void>
-    /** An `admin incref` still running; detach() kills it. */
-    increfInFlight?: ChildProcess
-}
-function attachState(): AttachState {
-    const g = globalThis as Record<symbol, AttachState | undefined>
-    return (g[ATTACH_STATE] ??= { attachment: null, quitting: false })
-}
-
-/** Process-global guard — jiti loads extensions with moduleCache:false, so every
- *  session bind (parent + each subagent child) re-instantiates this module with
- *  fresh module state. Symbol.for survives that isolation (same trick
- *  pi-permission-system's service.ts uses), so the signal handlers are installed
- *  exactly once per process no matter how many sessions bind. */
-const CLEANUP_GUARD = Symbol.for("mcp-companion:cleanup-installed")
-
-function installProcessCleanup() {
-    const g = globalThis as Record<symbol, boolean | undefined>
-    if (g[CLEANUP_GUARD]) return
-    g[CLEANUP_GUARD] = true
-    // Belt to the session_shutdown("quit") braces: if Pi is killed hard enough that
-    // session_shutdown never fires, still release the refcount. Idempotent via `detach`.
-    process.on("exit", () => detach())
-    for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as NodeJS.Signals[]) {
-        const handler = () => {
-            detach()
-            // Remove our listener before re-raising: re-killing with the handler
-            // still installed re-delivers the signal to it forever (loop verified —
-            // ctrl+c wedged pi instead of exiting). Gone, the re-raise falls through
-            // to the default disposition and terminates; the idempotent "exit"
-            // belt stays for any path that gets there.
-            process.removeListener(sig, handler)
-            process.kill(process.pid, sig)
-        }
-        process.on(sig, handler)
-    }
-}
-
-function detach() {
-    const st = attachState()
-    if (!st.attachment) return
-    const { binary, name } = st.attachment
-    st.attachment = null
-    st.increfInFlight?.kill()
-    spawnSync(binary, ["unuse", name, "--pid", String(process.pid)], { stdio: "ignore", env: process.env })
-}
+// env(), the combiner command/config/port resolution and the whole sharedserver
+// lifecycle live in combiner-process.ts.
 
 // ── the extension ──────────────────────────────────────────────────
 
@@ -377,17 +153,12 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
     }
 
     let connection: NativeCombinerConnection | undefined
-    // When we manage the combiner, connects wait until the manage half has attached
-    // (launched it, or found it running): a connect started before the attach can be
-    // refused on a cold start. Released whatever the attach's outcome, so a failed
-    // attach never parks the connection. No gate when someone else owns it.
-    let releaseAttachGate: () => void = () => undefined
-    const attachGate =
-        manage && !hostOwned
-            ? new Promise<void>((resolve) => {
-                  releaseAttachGate = resolve
-              })
-            : undefined
+    // The combiner process, when we manage it (combiner-process.ts): connects wait
+    // for its first attach (`ready`), and ask it between refused retries. Host-owned
+    // or unmanaged combiners are someone else's: connect only.
+    const combinerProcess = manage && !hostOwned ? new CombinerProcess(clientLog) : undefined
+    // Stops CombinerProcess.watch at session_shutdown / reload teardown.
+    let stopCombinerWatch: (() => void) | undefined
     let nativeSurface: ReturnType<typeof activateNativeMode> | undefined
     // Set once the footer exists (the `if (connection)` block below); the native
     // surface, created first, reports registration progress through it.
@@ -429,7 +200,12 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
         }
         g.__piMcpCombinerDispose = []
         connection = new NativeCombinerConnection(connInputsFor(sessionCfg), clientLog)
-        if (attachGate) connection.setStartGate(attachGate)
+        if (combinerProcess) {
+            const proc = combinerProcess
+            const conn = connection
+            conn.setStartGate(proc.ready)
+            conn.setLivenessCheck(() => proc.onRefused())
+        }
         // The mcp router registers alongside the per-tool native surface (the same
         // owned connection — not a second proxy): tool_call gates such as
         // pi-permission-system and pi-subagents recognize MCP calls by the tool
@@ -471,7 +247,17 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
 
     if (connection) {
         const conn = connection // captured non-optional for the handlers below
-        let connectAttachTried = false
+        // The connection keeps itself up (reconnect after a drop, background retry after
+        // a failed connect; combiner-connection.ts). The combiner process, when we
+        // manage it, reports process events: its going away triggers a reconnect, and
+        // the reconnect asks it (respawn within the cap, or attach to a new process).
+        const arm = () => {
+            conn.reopen()
+            conn.setAutoReconnect(true)
+            if (combinerProcess && !stopCombinerWatch)
+                stopCombinerWatch = combinerProcess.watch(() => conn.reconnect("the combiner process exited"))
+        }
+        arm()
         const registeredPrompts = new Set<string>()
         let footerTimer: NodeJS.Timeout | undefined
         let uiCtx: ExtensionContext["ui"] | undefined
@@ -487,8 +273,10 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
             footerTimer = undefined
             uiCtx = undefined
             uiNotify = undefined
+            stopCombinerWatch?.()
+            stopCombinerWatch = undefined
             nativeSurface?.dispose()
-            void conn.reset("superseded by a newer extension instance (reload)")
+            void conn.close("superseded by a newer extension instance (reload)")
         })
 
         // Native registration progress (undefined when no pass is registering).
@@ -533,22 +321,9 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
         conn.setHooks({
             onToolsChanged: resyncAll,
             onStateChange: (state) => {
-                // Attach once per process: session_start's attach normally holds it.
-                // This catches only the case where that attach failed (e.g. no
-                // sharedserver yet) and the combiner is reachable now. Host-owned /
-                // unmanaged combiners have nothing to attach to, and the factory
-                // returns before `attachCombiner` is declared, so calling it there
-                // would be a TDZ ReferenceError.
-                if (state === "connected" && !hostOwned && manage) {
-                    if (attachState().attachment) void holdRefOnCurrentCombiner(clientLog)
-                    else if (!connectAttachTried) {
-                        // session_start's attach failed; try once more now the
-                        // combiner is reachable, but not on every reconnect (the
-                        // attach runs synchronous probes).
-                        connectAttachTried = true
-                        void attachCombiner(clientLog, { onlyIfRunning: true }).catch(() => undefined)
-                    }
-                }
+                // A different combiner process now (someone restarted it)? Attach to
+                // it: same function, same ref (CombinerProcess.onReconnected).
+                if (state === "connected") void combinerProcess?.onReconnected().catch(() => undefined)
                 refreshFooter()
             },
             // Stage 2: the widget hold announces its UI URL mid-call — open it.
@@ -559,6 +334,9 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
 
         pi.on("session_start", (event, ctx) => {
             try {
+                // Re-arm auto-reconnect and the process watch if a host reused this
+                // instance after a session_shutdown (idempotent; pi 1.6 doesn't reuse).
+                arm()
                 // SAFETY: capture ctx.ui ONCE, first — the getter asserts staleness,
                 // the object does not; every async closure below uses the object only.
                 const ctxUi = ctx.ui
@@ -645,7 +423,7 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
             // starting up). A host-owned/unmanaged combiner that's down, or one whose
             // attach failed, would only stall the turn for the whole retry budget.
             const connecting = conn.state !== "connected"
-            if (connecting && !attachState().attachment) return
+            if (connecting && !combinerProcess?.attached) return
             const ui = ctx.ui
             const notice = setTimeout(() => {
                 if (notify)
@@ -701,8 +479,10 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
             }
             // Stop a registration pass in flight before pi retires this session's
             // extension API (pi 1.6 creates a fresh instance for the next session).
+            stopCombinerWatch?.()
+            stopCombinerWatch = undefined
             nativeSurface?.dispose()
-            void conn.reset("session shutdown")
+            void conn.close("session shutdown")
         })
     }
 
@@ -820,139 +600,21 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
     }
 
     // ── process: launch on session_start, release on session_shutdown("quit") ──
-    // Pi forbids starting background resources from the factory, so all of this is
-    // deferred to session_start. session_start fires again on reload/new/resume/fork
-    // within the same process; the `attachment` guard makes re-entry a no-op attach.
-    /** `onlyIfRunning`: attach to a combiner sharedserver already runs, never
-     *  launch one (the reconnect path; pi never relaunches from a reconnect). */
-    const attachCombiner = async (log: LogFn, opts: { onlyIfRunning?: boolean } = {}): Promise<void> => {
-        if (attachState().quitting) return
-        const binary = resolveSharedserver(
-            {
-                label: "mcp-combiner",
-                minVersion: SHAREDSERVER_MIN_VERSION,
-                installerUrl:
-                    "https://github.com/georgeharker/sharedserver/releases/latest/download/sharedserver-installer.sh",
-            },
-            env("SHAREDSERVER_BIN"),
-            process.env,
-            log,
-        )
-        if (!binary) {
-            log("error", "sharedserver binary not found; set $SHAREDSERVER_BIN, or PI_MCP_COMBINER_MANAGE=false")
-            return
-        }
-
-        const combiner = resolveCombiner(log)
-        if (!combiner) {
-            log(
-                "error",
-                "mcp-combiner could not be found or fetched; install uv and it is fetched from PyPI on demand, " +
-                    "or install mcp-combiner, or set $PI_MCP_COMBINER_COMMAND / $PI_MCP_COMBINER_CHECKOUT",
-            )
-            return
-        }
-
-        const cfgPath = resolveConfig(log)
-        if (!cfgPath) return // resolveConfig already logged the specifics
-
-        const name = env("PI_MCP_COMBINER_NAME") ?? DEFAULT_NAME
-        // `use` launches a stopped server; the reconnect path must only attach.
-        if (opts.onlyIfRunning && !(await sharedserverActive(binary, name))) return
-        const port = resolvePort(log)
-        const grace = env("PI_MCP_COMBINER_GRACE") ?? DEFAULT_GRACE
-
-        // Assemble: <combiner> [--mcp] --config <cfg> --port <port> [--host <host>]
-        const serve: string[] = []
-        const modern = combinerNeedsMcpFlag(combiner)
-        if (modern) serve.push("--mcp")
-        serve.push("--config", cfgPath, "--port", String(port))
-        const host = env("PI_MCP_COMBINER_HOST")
-        if (host) serve.push("--host", host)
-
-        // Logging parity with the sibling plugins' two-file scheme: sharedserver captures
-        // raw stdout/stderr (--log-file on `use`), and the combiner writes its own
-        // --log-file. Both default under $XDG_STATE_HOME/mcp-combiner; "none" disables.
-        // Combiner-side flags ride the same version gate as --mcp.
-        const logDir = join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "mcp-combiner")
-        const pyLogFile = env("PI_MCP_COMBINER_PYLOG") ?? join(logDir, "mcp-combiner-py.log")
-        if (modern) {
-            if (pyLogFile !== "none") serve.push("--log-file", pyLogFile)
-            serve.push("--log-level", env("PI_MCP_COMBINER_LOG_LEVEL") ?? "info")
-        }
-
-        const wrappedArgs = [...combiner.args, ...(combiner.extra ?? []), ...serve]
-        const useArgs = [
-            "use",
-            name,
-            "--pid",
-            String(process.pid),
-            "--grace-period",
-            grace,
-            "--metadata",
-            `pi-${process.pid}`,
-        ]
-        const logFile = env("PI_MCP_COMBINER_LOG") ?? join(logDir, "mcp-combiner.log")
-        if (logFile !== "none") {
-            try {
-                mkdirSync(dirname(logFile), { recursive: true })
-            } catch {
-                // best-effort — a failed mkdir just means sharedserver may drop the capture
-            }
-            useArgs.push("--log-file", logFile)
-        }
-        useArgs.push("--", combiner.cmd, ...wrappedArgs)
-
-        installProcessCleanup()
-        // A combiner that just died reads "defunct" until sharedserver's watcher has
-        // reaped it, and `use` refuses with "Retry shortly": retry a few times.
-        for (let attempt = 1; ; attempt++) {
-            const result = spawnSync(binary, useArgs, { stdio: "pipe", env: process.env })
-            if (result.error) {
-                log("error", `${name}: failed to spawn sharedserver (${result.error.message})`)
-                return
-            }
-            if (result.status === 0) break
-            const stderr = result.stderr?.toString().trim() ?? ""
-            if (attempt < ATTACH_DEFUNCT_RETRIES && /defunct|retry shortly/i.test(stderr)) {
-                await new Promise((resolve) => setTimeout(resolve, ATTACH_DEFUNCT_DELAY_MS).unref())
-                // Quit may have released the combiner while we slept: don't re-take it.
-                if (attachState().quitting) return
-                continue
-            }
-            log("error", `${name}: sharedserver use exited ${result.status}${stderr ? ` (${stderr})` : ""}`)
-            return
-        }
-
-        attachState().attachment = { binary, name, identity: combinerIdentity(binary, name) }
-        // Between refused-connect retries, ask sharedserver whether the combiner is
-        // still there, so a launch that died stops the retry at once.
-        connection?.setLivenessCheck(() => sharedserverActive(binary, name))
-        log("info", `combiner "${name}" attached on port ${port} (${combiner.cmd} ${wrappedArgs.join(" ")})`)
-    }
-
+    // Pi forbids starting background resources from the factory, so the attach is
+    // deferred to session_start. It fires again on reload/new/resume/fork within the
+    // same process; CombinerProcess keeps one ref per pi process, so re-entry is a
+    // no-op. Everything else about the process lives in combiner-process.ts.
+    const proc = combinerProcess
+    if (!proc) return // unreachable: combinerProcess exists exactly when manage && !hostOwned
     pi.on("session_start", async (_event, ctx) => {
-        try {
-            if (!attachState().attachment) await attachCombiner(makeLog(ctx, notify)) // else attached in this process
-            else {
-                // Attached by an earlier session in this process: keep the liveness
-                // check on this session's fresh connection.
-                const { binary, name } = attachState().attachment as Attachment
-                connection?.setLivenessCheck(() => sharedserverActive(binary, name))
-            }
-        } finally {
-            releaseAttachGate()
-        }
+        await proc.start(makeLog(ctx, notify))
     })
 
     pi.on("session_shutdown", (event: SessionShutdownEvent) => {
         // Only "quit" means the Pi process is actually leaving. reload/new/resume/fork
         // keep the process alive and a fresh session_start re-attaches — releasing the
         // refcount on those would needlessly drop (and re-take) the shared combiner.
-        if (event.reason === "quit") {
-            attachState().quitting = true
-            detach()
-        }
+        if (event.reason === "quit") proc.quit()
     })
 }
 
@@ -1111,130 +773,6 @@ function installConfig(ctx: ExtensionCommandContext, pathArg?: string): void {
     )
 }
 
-/** Which combiner process sharedserver is running as `name`: its pid and start
- *  time (`sharedserver info <name> --json`), so a reused pid isn't mistaken for the
- *  same process. Undefined when it isn't running or no answer comes within 2 s.
- *  Async: never blocks pi's main thread. */
-type CombinerIdentity = { pid: number; startTime: number | undefined }
-function combinerIdentity(binary: string, name: string): Promise<CombinerIdentity | undefined> {
-    return new Promise((resolve) => {
-        const child = spawn(binary, ["info", name, "--json"], { stdio: ["ignore", "pipe", "ignore"], env: process.env })
-        child.unref()
-        let out = ""
-        child.stdout?.on("data", (chunk: Buffer) => {
-            out += chunk.toString()
-        })
-        const timer = setTimeout(() => {
-            child.kill()
-            resolve(undefined)
-        }, 2_000)
-        timer.unref()
-        child.on("error", () => {
-            clearTimeout(timer)
-            resolve(undefined)
-        })
-        // "close", not "exit": stdout is only fully read by then.
-        child.on("close", (code) => {
-            clearTimeout(timer)
-            if (code !== 0) return resolve(undefined)
-            try {
-                const info = JSON.parse(out) as { pid?: unknown; start_time?: unknown }
-                if (typeof info.pid !== "number") return resolve(undefined)
-                resolve({ pid: info.pid, startTime: typeof info.start_time === "number" ? info.start_time : undefined })
-            } catch {
-                resolve(undefined)
-            }
-        })
-    })
-}
-
-function sameCombiner(a: CombinerIdentity | undefined, b: CombinerIdentity): boolean {
-    return a !== undefined && a.pid === b.pid && a.startTime === b.startTime
-}
-
-/** After a reconnect: every client of a sharedserver server holds a ref, so if the
- *  combiner is now a DIFFERENT process from the one we attached to (it died, or
- *  someone restarted it, which also drops every client's ref), take a ref on the
- *  new one. `admin incref` never launches anything: it refuses when the server
- *  isn't running. Same process -> nothing to do. One check at a time per pi
- *  process; a failed check or incref is retried once after 1 s, then warned. */
-function holdRefOnCurrentCombiner(log: LogFn): Promise<void> {
-    const st = attachState()
-    st.holdingRef ??= (async () => {
-        for (let attempt = 1; attempt <= 2; attempt++) {
-            const att = st.attachment
-            if (!att || st.quitting) return
-            // The identity recorded at attach may still be on its way: wait for it, so
-            // the comparison is with the process we attached to.
-            const attachedTo = await att.identity
-            const now = await combinerIdentity(att.binary, att.name)
-            if (st.attachment !== att || st.quitting) return
-            if (now && sameCombiner(attachedTo, now)) return
-            if (now && (await incref(att))) {
-                if (st.attachment === att) {
-                    att.identity = Promise.resolve(now)
-                    log("info", `combiner "${att.name}" is a new process (pid ${now.pid}); took a ref on it`)
-                }
-                return
-            }
-            if (attempt === 1) await new Promise((resolve) => setTimeout(resolve, 1_000).unref())
-            else log("warn", `could not take a ref on combiner "${att.name}" after it restarted; it may stop when its other clients leave`)
-        }
-    })().finally(() => {
-        st.holdingRef = undefined
-    })
-    return st.holdingRef
-}
-
-/** `sharedserver admin incref` for this pi process; resolves true on success. The
- *  child is kept on the attach state so detach() can kill one still in flight
- *  (an incref landing after quit's unuse would leave a stale ref). */
-function incref(att: Attachment): Promise<boolean> {
-    return new Promise((resolve) => {
-        const st = attachState()
-        const child = spawn(
-            att.binary,
-            ["admin", "incref", att.name, "--pid", String(process.pid), "--metadata", `pi-${process.pid}`],
-            { stdio: "ignore", env: process.env },
-        )
-        child.unref()
-        st.increfInFlight = child
-        const done = (ok: boolean) => {
-            if (st.increfInFlight === child) st.increfInFlight = undefined
-            resolve(ok)
-        }
-        child.on("error", () => done(false))
-        child.on("exit", (code) => done(code === 0))
-    })
-}
-
-/** `sharedserver use` attempts while the server reads "defunct" (being reaped). */
-const ATTACH_DEFUNCT_RETRIES = 4
-const ATTACH_DEFUNCT_DELAY_MS = 300
-
-/** `sharedserver check <name>`: exit 0 = active (running or starting). Anything else
- *  (defunct, not running) is false. Async, so it never blocks pi's main thread;
- *  after 2 s with no answer it reports true (unknown must not stop a retry). */
-function sharedserverActive(binary: string, name: string): Promise<boolean> {
-    return new Promise((resolve) => {
-        const child = spawn(binary, ["check", name], { stdio: "ignore", env: process.env })
-        child.unref() // a check in flight at quit must not hold pi open
-        const timer = setTimeout(() => {
-            child.kill()
-            resolve(true)
-        }, 2_000)
-        timer.unref()
-        child.on("error", () => {
-            clearTimeout(timer)
-            resolve(true)
-        })
-        child.on("exit", (code) => {
-            clearTimeout(timer)
-            resolve(code === 0)
-        })
-    })
-}
-
 function makeLog(ctx: ExtensionContext, notify: boolean): LogFn {
     // SAFETY: capture ctx.ui ONCE at call time (the getter asserts staleness; the
     // OBJECT does not) — a returned logger may outlive the ctx (async paths,
@@ -1258,42 +796,4 @@ function makeLog(ctx: ExtensionContext, notify: boolean): LogFn {
             process.stderr.write(`${line}\n`)
         }
     }
-}
-
-/** The port to serve on, reconciling PI_MCP_COMBINER_PORT with any explicit
- *  $MCP_COMPANION_COMBINER_URL (which is what pi-mcp-adapter registers, so serving
- *  anywhere else would be unreachable — the URL wins, same rule as the sibling plugins). */
-function resolvePort(log: LogFn): number {
-    const raw = env("PI_MCP_COMBINER_PORT")
-    let port = DEFAULT_PORT
-    if (raw !== undefined) {
-        const n = Number(raw)
-        if (Number.isInteger(n) && n > 0) port = n
-        else log("warn", `PI_MCP_COMBINER_PORT=${raw} is not a positive integer; using ${DEFAULT_PORT}`)
-    }
-    const url = env("MCP_COMPANION_COMBINER_URL")
-    if (url && raw !== undefined) {
-        let urlPort = Number.NaN
-        try {
-            urlPort = Number(new URL(url).port)
-        } catch {
-            // malformed URL — fall through to the no-usable-port warning below
-        }
-        if (!Number.isInteger(urlPort) || urlPort <= 0) {
-            log(
-                "warn",
-                `MCP_COMPANION_COMBINER_URL=${url} has no explicit port; serving on ${port}. ` +
-                    `Use an explicit port in the URL (e.g. http://127.0.0.1:${port}/mcp).`,
-            )
-        } else if (urlPort !== port) {
-            log(
-                "warn",
-                `PI_MCP_COMBINER_PORT=${port} disagrees with MCP_COMPANION_COMBINER_URL=${url}; the URL is what ` +
-                    `pi-mcp-adapter registers, so serving on ${port} would be unreachable — using ${urlPort}. ` +
-                    "Set them to the same port.",
-            )
-            port = urlPort
-        }
-    }
-    return port
 }

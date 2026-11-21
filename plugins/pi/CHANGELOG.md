@@ -28,9 +28,9 @@ entry also summarises the combiner's changes; the full list is in
   refresh happened to reconnect. Connects now wait for the attach, and a
   refused first connect is retried (100 ms backoff up to 1 s, for up to 15 s).
   Once connected, a refused reconnect (a combiner restart) is retried for up
-  to 3 s. Between retries, `sharedserver check` ends the wait early if the
-  combiner has died. In a cold start test, the tools arrived at 3.8 s instead
-  of 31.5 s.
+  to 3 s. Between retries pi checks the combiner process itself (see below:
+  it respawns a dead one, or attaches to a new one). In a cold start test, the
+  tools arrived at 3.8 s instead of 31.5 s.
 - **A prompt sent while tools are still arriving waits for them.** A turn that
   started mid-registration, or while a combiner we just launched was still
   coming up, saw only part of the catalog. Now the turn waits (up to 30 s)
@@ -40,17 +40,34 @@ entry also summarises the combiner's changes; the full list is in
   once; `/quit` and signals wait for it to finish (pi gives extensions no abort
   at this point). A combiner that is down and not ours to launch doesn't hold
   up the turn.
-- `sharedserver use` runs once per pi process; it used to run again after
-  every connect, and on every new session, re-running the combiner version
-  probes on pi's main thread. It is retried when it reports the combiner as
-  shutting down ("defunct ... Retry shortly"), and never after pi has started
-  quitting.
-- **pi keeps its reference when someone else restarts the combiner.** A
-  restart (or a crash and relaunch by another client) starts a new combiner
-  process and drops every client's reference. On reconnecting to a different
-  process, pi now takes a reference on it (`sharedserver admin incref`), so the
-  combiner isn't stopped under pi when the client that restarted it quits. pi
-  never launches a combiner from a reconnect.
+- **The combiner process is managed in one place** (`combiner-process.ts`):
+  one attach function (`sharedserver use`) is the only way pi launches the
+  combiner or takes its reference. Every pi process holds its own reference.
+  - `use` runs once per pi process, unless the combiner changes. It used to run
+    again after every connect and every new session, re-running the combiner
+    version probes each time.
+  - When the combiner becomes a different process (someone else restarted
+    it, which drops every client's reference), pi attaches to the new one with
+    the same function, so it keeps its reference.
+  - When the combiner dies, pi notices within about 2 s (it watches the
+    process it holds a reference on), reconnects, and respawns it with the
+    same function. Several pi processes respawning at once is fine: sharedserver
+    launches one and the rest attach to it. Respawning is capped at 2 a minute:
+    a third death inside the minute stops respawning and reports it, with the
+    combiner's log files. A new pi session lifts the stop.
+  - If `sharedserver info` gives no answer (it normally answers in a few ms,
+    so that's a sharedserver problem and pi says so once), pi judges the
+    combiner by its own process check: gone means dead. pi never respawns a
+    combiner it never managed to attach to.
+- **The connection keeps itself up**, for managed and host-owned combiners
+  alike: after a drop it reconnects on its own (500 ms, backing off to 30 s if
+  connections keep dropping right after connecting), and after a failed
+  connect it keeps retrying in the background (every 1 s, backing off to
+  10 s) instead of waiting for the next request. A combiner someone else
+  starts is picked up within seconds. A connect failure is reported once per
+  outage, and recovery is logged.
+  - `use` is retried when sharedserver reports the combiner as shutting down
+    ("defunct ... Retry shortly"), and never after pi has started quitting.
 - The footer could keep showing a stale `registering tools N/M` when an
   earlier refresh finished after a later one.
 
