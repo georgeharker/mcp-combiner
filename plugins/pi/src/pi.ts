@@ -37,6 +37,11 @@ export type ExtensionUIContext = {
     input?: (title: string, placeholder?: string, opts?: unknown) => Promise<string | undefined>
     /** Set footer/status-bar text; undefined clears the slot. */
     setStatus?: (key: string, text: string | undefined) => void
+    /** Raw terminal input (interactive mode only; a no-op elsewhere). Return
+     *  undefined to leave the key to pi. Returns an unsubscribe function. */
+    onTerminalInput?: (handler: (data: string) => { consume?: boolean; data?: string } | undefined) => () => void
+    /** The editor's current text (pi ≥ 1.0). */
+    getEditorText?: () => string
 }
 
 /** Context handed to a command handler. Superset of ExtensionContext in practice; we

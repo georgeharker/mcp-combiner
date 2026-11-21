@@ -46,6 +46,64 @@ export type NativeActivationOptions = {
     log: (level: "info" | "warn" | "error", message: string) => void
 }
 
+/** The native surface's lifecycle, as returned by activateNativeMode. */
+export type NativeSurface = {
+    /** Start a registration pass against the current catalog (supersedes one in flight). */
+    run(): void
+    /** True while a tool registration pass is running (connecting, listing, or
+     *  registering). */
+    busy(): boolean
+    /** Resolves when no tool pass is running: the newest pass has ended, however it
+     *  ended (finished, failed, stopped). Never rejects. */
+    settled(): Promise<void>
+    /** Stop: in-flight passes end at their next check; run() becomes a no-op. */
+    dispose(): void
+}
+
+/** How long a turn waits for tool registration before starting with what it has.
+ *  Covers the worst cold start: the connect retry (15 s budget) plus a full
+ *  registration pass (~10 s for ~1,000 tools). */
+export const TURN_WAIT_MS = 30_000
+
+/** Wait until `surface` has no registration pass running, at most `timeoutMs`, or
+ *  until `signal` aborts or `onInterrupt` fires (it receives a callback that ends
+ *  the wait and returns an unsubscribe; index.ts wires it to Esc / Ctrl+C / Ctrl+D,
+ *  since pi has no abort signal at before_agent_start). Never rejects; the timer is
+ *  cleared (and unref'd) and the listeners removed, so a wait that ends early never
+ *  holds pi open. */
+export async function waitForRegistration(
+    surface: Pick<NativeSurface, "busy" | "settled">,
+    opts: { timeoutMs?: number; signal?: AbortSignal; onInterrupt?: (interrupt: () => void) => () => void } = {},
+): Promise<"idle" | "settled" | "timeout" | "aborted"> {
+    if (!surface.busy()) return "idle"
+    if (opts.signal?.aborted) return "aborted"
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let onAbort: (() => void) | undefined
+    let unsubscribe: (() => void) | undefined
+    try {
+        return await Promise.race([
+            surface.settled().then(() => "settled" as const),
+            new Promise<"timeout">((resolve) => {
+                timer = setTimeout(() => resolve("timeout"), opts.timeoutMs ?? TURN_WAIT_MS)
+                timer.unref?.()
+            }),
+            new Promise<"aborted">((resolve) => {
+                onAbort = () => resolve("aborted")
+                opts.signal?.addEventListener("abort", onAbort, { once: true })
+                try {
+                    unsubscribe = opts.onInterrupt?.(onAbort)
+                } catch {
+                    // an interrupt source that fails just isn't one
+                }
+            }),
+        ])
+    } finally {
+        if (timer) clearTimeout(timer)
+        if (onAbort) opts.signal?.removeEventListener("abort", onAbort)
+        unsubscribe?.()
+    }
+}
+
 /** Register the declared tool surface + interactive-resource read_* tools + the
  *  list_changed re-registration handler. Called once at session_start; the
  *  list_changed hook re-syncs both surfaces on the same names. One shared
@@ -54,7 +112,7 @@ export type NativeActivationOptions = {
 export function activateNativeMode(
     pi: ExtensionAPI,
     opts: NativeActivationOptions,
-): { run(): void; dispose(): void } {
+): NativeSurface {
     let active = true
     const toolState: NativeToolSurfaceState = { names: new Set(), signatures: new Map() }
     // Cross-pass memory for the read_* tools (skip re-registration of unchanged
@@ -65,45 +123,62 @@ export function activateNativeMode(
     // `generation`, and a pass whose generation is stale stops at its next check.
     // That is enough on its own: a pass checks shouldContinue() after every await
     // (listTools and each slice yield), and every state change happens synchronously
-    // between those checks, so a superseded pass never touches state again. A
-    // dispose() stops the pass the same way (pi's registerTool throws once the
-    // extension API is invalidated).
+    // between those checks, so a superseded pass never touches state again.
+    // index.ts calls dispose() at session_shutdown and on reload teardown, which
+    // stops a pass the same way before pi retires the session's extension API.
     let generation = 0
+    // The newest tool pass, until it ends; undefined when no pass is running. A
+    // superseded pass doesn't count: settled() follows whichever pass is newest.
+    let latest: Promise<void> | undefined
     const run = () => {
         if (!active) return
         const mine = ++generation
-        void activateNativeTools(pi, {
+        const current = () => active && generation === mine
+        // A pass that fails after this surface was disposed or superseded (pi's
+        // registerTool throws once the session's extension API is retired) is not
+        // news: only the newest live pass reports failures.
+        const failed = (what: string) => (e: unknown) => {
+            if (current()) opts.log("warn", `${what} failed: ${e instanceof Error ? e.message : String(e)}`)
+        }
+        const tools = activateNativeTools(pi, {
             connection: opts.connection,
             serverFilter: opts.serverFilter,
             directSpec: opts.directSpec,
             state: toolState,
             warnLargeDirectExposure: opts.warnLargeDirectExposure,
             maxResultChars: opts.maxResultChars,
-            shouldContinue: () => active && generation === mine,
+            shouldContinue: current,
             onProgress: opts.onToolProgress,
             log: opts.log,
-        })
-            .catch((e) => opts.log("warn", `native tool surface failed: ${e instanceof Error ? e.message : String(e)}`))
-            // The newest pass always ends with a "done" report, even when it had
-            // nothing to register or failed, so a "registering" left by a superseded
-            // pass never sticks in the footer.
-            .finally(() => {
-                if (active && generation === mine) opts.onToolProgress?.(0, 0)
-            })
-        if (opts.exposeResources !== false) {
-            void activateNativeResources(
-                pi,
-                {
-                    connection: opts.connection,
-                    serverFilter: opts.serverFilter,
-                    directSpec: opts.directSpec,
-                    uiAutoOpen: opts.uiAutoOpen,
-                    maxResultChars: opts.maxResultChars,
-                    log: opts.log,
-                },
-                resourceRegistered,
-            ).catch((e) => opts.log("warn", `native resource surface failed: ${e instanceof Error ? e.message : String(e)}`))
-        }
+        }).then(() => undefined, failed("native tool surface"))
+        const resources =
+            opts.exposeResources !== false
+                ? activateNativeResources(
+                      pi,
+                      {
+                          connection: opts.connection,
+                          serverFilter: opts.serverFilter,
+                          directSpec: opts.directSpec,
+                          uiAutoOpen: opts.uiAutoOpen,
+                          maxResultChars: opts.maxResultChars,
+                          shouldContinue: current,
+                          log: opts.log,
+                      },
+                      resourceRegistered,
+                  ).then(() => undefined, failed("native resource surface"))
+                : Promise.resolve()
+        // The pass is both surfaces: a turn that waits on settled() gets the read_*
+        // tools too. The newest pass always ends with a "done" report, even when it
+        // had nothing to register or failed, so a "registering" left by a superseded
+        // pass never sticks in the footer.
+        const pass: Promise<void> = Promise.all([tools, resources]).then(
+            () => {
+                // Clear first: a throwing progress hook must not leave busy() true.
+                if (latest === pass) latest = undefined
+                if (current()) opts.onToolProgress?.(0, 0)
+            },
+        )
+        latest = pass
     }
     // The FIRST run is the caller's to schedule: the grouping token only exists
     // after session_start (the connection refuses to connect without it), so a
@@ -115,6 +190,12 @@ export function activateNativeMode(
     // ONE hook set, index.ts's.
     return {
         run,
+        busy: () => latest !== undefined,
+        async settled() {
+            // A pass that ends because a newer one superseded it hands over: keep
+            // waiting until no pass is running.
+            while (latest) await latest
+        },
         dispose() {
             active = false
         },

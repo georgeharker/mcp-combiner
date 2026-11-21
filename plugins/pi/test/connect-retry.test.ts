@@ -89,7 +89,7 @@ class FailingTransport implements McpTransport {
 
 const inputs: ResolvedConnection = { baseUrl: "http://127.0.0.1:9741/mcp" }
 const quiet: LogFn = () => undefined
-const fastRetry: ConnectRetry = { budgetMs: 2_000, firstMs: 10, maxMs: 20 }
+const fastRetry: ConnectRetry = { budgetMs: 2_000, reconnectBudgetMs: 2_000, firstMs: 10, maxMs: 20 }
 
 function connection(combiner: Combiner, retry: ConnectRetry = fastRetry): NativeCombinerConnection {
     const conn = new NativeCombinerConnection(inputs, quiet, { transportFactory: () => combiner.transport(), retry })
@@ -126,7 +126,7 @@ describe("connect retry", () => {
 
     it("gives up when the budget is spent", async () => {
         const combiner = new Combiner(Number.POSITIVE_INFINITY)
-        const conn = connection(combiner, { budgetMs: 150, firstMs: 20, maxMs: 40 })
+        const conn = connection(combiner, { budgetMs: 150, reconnectBudgetMs: 150, firstMs: 20, maxMs: 40 })
         const started = Date.now()
         await expect(conn.ensureConnected()).rejects.toThrow(/cannot reach the combiner/)
         expect(combiner.attempts).toBeGreaterThan(1)
@@ -157,7 +157,7 @@ describe("connect retry", () => {
 
     it("a reset during the retry stops it", async () => {
         const combiner = new Combiner(Number.POSITIVE_INFINITY)
-        const conn = connection(combiner, { budgetMs: 5_000, firstMs: 50, maxMs: 50 })
+        const conn = connection(combiner, { budgetMs: 5_000, reconnectBudgetMs: 5_000, firstMs: 50, maxMs: 50 })
         const pending = conn.ensureConnected()
         pending.catch(() => undefined)
         await new Promise((r) => setTimeout(r, 10)) // first attempt refused, now backing off
@@ -166,6 +166,20 @@ describe("connect retry", () => {
         await expect(pending).rejects.toThrow()
         await new Promise((r) => setTimeout(r, 150))
         expect(combiner.attempts).toBe(attemptsAtReset)
+    })
+})
+
+describe("reconnect budget", () => {
+    it("after a first successful connect, a refused reconnect gives up on the short budget", async () => {
+        const combiner = new Combiner()
+        const conn = connection(combiner, { budgetMs: 5_000, reconnectBudgetMs: 100, firstMs: 20, maxMs: 20 })
+        await conn.ensureConnected()
+        await conn.reset("combiner restarted")
+        combiner.refuse = Number.POSITIVE_INFINITY
+        const started = Date.now()
+        await expect(conn.ensureConnected()).rejects.toThrow(/cannot reach the combiner/)
+        // The 5 s first-connect budget would still be retrying.
+        expect(Date.now() - started).toBeLessThan(1_000)
     })
 })
 
@@ -186,5 +200,22 @@ describe("start gate", () => {
         await pending
         expect(combiner.attempts).toBe(1)
         await conn.reset("test done")
+    })
+
+    it("a reset while waiting at the gate: no connect for the old token", async () => {
+        const combiner = new Combiner()
+        const conn = connection(combiner)
+        let open: () => void = () => undefined
+        conn.setStartGate(
+            new Promise<void>((resolve) => {
+                open = resolve
+            }),
+        )
+        const pending = conn.ensureConnected()
+        pending.catch(() => undefined)
+        conn.setToken("pi-other-session") // resets
+        open()
+        await expect(pending).rejects.toThrow(/superseded/)
+        expect(combiner.attempts).toBe(0)
     })
 })

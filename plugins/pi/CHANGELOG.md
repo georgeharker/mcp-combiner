@@ -13,26 +13,46 @@ entry also summarises the combiner's changes; the full list is in
 - **No more typing freeze after startup.** pi rebuilds its whole tool registry
   on every `registerTool`, and with codemode on that re-renders every tool's
   declaration, so registering the combiner's ~1,000 tools in one go froze the
-  editor for 10 seconds or more. Tools now register in slices of about 50 ms
-  each, yielding to pi between them. A time budget rather than a fixed count
-  keeps the slices even, since each call gets slower as the registry grows.
-  Typing lag during registration is now about 55 ms (worst seen: 156 ms); all
-  the tools arrive over about 10 s.
+  editor for 10 seconds or more. Tools (and removals of tools) now register in
+  batches of about 50 ms each, yielding to pi between them. A time budget
+  rather than a fixed count keeps the batches even, since each call gets
+  slower as the registry grows. Typing lag during registration is now about
+  55 ms (worst seen: 156 ms); all the tools arrive over about 10 s.
 - A newer catalog (a `tools/list_changed` mid-registration) supersedes the
-  pass in progress at its next slice, and `/new`, `/resume` or `/reload` stops
-  it, so it never calls the retired extension API.
-
+  pass in progress at its next batch, and `/new`, `/resume`, `/fork` or
+  `/reload` stops it before pi retires the session's extension API.
 - **Cold start no longer leaves the session without tools for 30 seconds.** The
   first connect used to start before the combiner was attached, and
   `sharedserver use` returns once the combiner is launched, not once it
   listens. A refused connect then failed for good until the 30-second footer
   refresh happened to reconnect. Connects now wait for the attach, and a
-  refused connect is retried (100 ms backoff up to 1 s, for up to 15 s), which
-  also covers reconnecting after a combiner restart. Between retries,
-  `sharedserver check` ends the wait early if the combiner has died. In a cold
-  start test, the tools arrived at 3.9 s instead of 31.5 s.
-- `sharedserver use` is retried when it reports the combiner as shutting down
-  ("defunct ... Retry shortly").
+  refused first connect is retried (100 ms backoff up to 1 s, for up to 15 s).
+  Once connected, a refused reconnect (a combiner restart) is retried for up
+  to 3 s. Between retries, `sharedserver check` ends the wait early if the
+  combiner has died. In a cold start test, the tools arrived at 3.8 s instead
+  of 31.5 s.
+- **A prompt sent while tools are still arriving waits for them.** A turn that
+  started mid-registration, or while a combiner we just launched was still
+  coming up, saw only part of the catalog. Now the turn waits (up to 30 s)
+  until registration finishes. Waits longer than 250 ms show a notice (unless
+  `PI_MCP_COMBINER_NOTIFY=false`). The registration keeps yielding while it
+  waits, so the UI stays live. Esc, Ctrl+D or a double Ctrl+C end the wait at
+  once; `/quit` and signals wait for it to finish (pi gives extensions no abort
+  at this point). A combiner that is down and not ours to launch doesn't hold
+  up the turn.
+- `sharedserver use` runs once per pi process; it used to run again after
+  every connect, and on every new session, re-running the combiner version
+  probes on pi's main thread. It is retried when it reports the combiner as
+  shutting down ("defunct ... Retry shortly"), and never after pi has started
+  quitting.
+- **pi keeps its reference when someone else restarts the combiner.** A
+  restart (or a crash and relaunch by another client) starts a new combiner
+  process and drops every client's reference. On reconnecting to a different
+  process, pi now takes a reference on it (`sharedserver admin incref`), so the
+  combiner isn't stopped under pi when the client that restarted it quits. pi
+  never launches a combiner from a reconnect.
+- The footer could keep showing a stale `registering tools N/M` when an
+  earlier refresh finished after a later one.
 
 ### Changed
 

@@ -117,9 +117,13 @@ const CONNECT_TIMEOUT_MS = 8_000
  *  not once it listens, and a combiner another client launched a moment ago may
  *  still be booting. So a refused connect right after an attach is expected, and
  *  this retry is what waits for the port. Backoff doubles from `firstMs` to `maxMs`
- *  within `budgetMs`. Other errors (timeouts, HTTP errors) are not retried here. */
-export type ConnectRetry = { budgetMs: number; firstMs: number; maxMs: number }
-const DEFAULT_CONNECT_RETRY: ConnectRetry = { budgetMs: 15_000, firstMs: 100, maxMs: 1_000 }
+ *  within `budgetMs` until the first successful connect; after that, a refused
+ *  connect means the combiner went away (a restart, or it's down), so callers (tool
+ *  calls, footer refreshes) wait only `reconnectBudgetMs`: enough to ride out a
+ *  restart, short enough not to stall when it's down. Other errors (timeouts, HTTP
+ *  errors) are not retried here. */
+export type ConnectRetry = { budgetMs: number; reconnectBudgetMs: number; firstMs: number; maxMs: number }
+const DEFAULT_CONNECT_RETRY: ConnectRetry = { budgetMs: 15_000, reconnectBudgetMs: 3_000, firstMs: 100, maxMs: 1_000 }
 
 /** True for a connect refused at the socket (Node's fetch: TypeError "fetch failed"
  *  whose cause chain carries code ECONNREFUSED). */
@@ -187,8 +191,12 @@ export class NativeCombinerConnection implements CombinerConnection {
      *  someone else owns the combiner (host-owned / unmanaged): nothing to wait for. */
     private startGate: Promise<void> | undefined
     /** Between refused-connect retries: false means the combiner process is gone
-     *  (stop retrying now instead of waiting out the budget). */
+     *  (stop retrying now instead of waiting out the budget). pi never relaunches a
+     *  combiner that died: the next session's attach starts one. */
     private livenessCheck: (() => Promise<boolean>) | undefined
+    /** Set by the first successful connect; switches refused-connect retries to the
+     *  short reconnect budget (see ConnectRetry). */
+    private everConnected = false
 
     constructor(
         conn: ResolvedConnection,
@@ -235,6 +243,7 @@ export class NativeCombinerConnection implements CombinerConnection {
             return false
         }
         this.conn = conn
+        this.everConnected = false // a different combiner: the first-connect budget applies
         void this.reset("connection rebound (session config changed)")
         return true
     }
@@ -252,12 +261,17 @@ export class NativeCombinerConnection implements CombinerConnection {
      *  the last error is rethrown for ensureConnected's failure path. */
     private async connectWithRetry(attempt: () => Promise<McpClient>, genAtStart: number): Promise<McpClient> {
         if (this.startGate) await this.startGate
-        const deadline = Date.now() + this.retry.budgetMs
+        // A reset while we waited at the gate (token or config changed) makes this
+        // connect stale: don't open a session for the old token.
+        if (this.generation !== genAtStart) throw new Error("connect superseded by a connection reset (token/config changed)")
+        const deadline = Date.now() + (this.everConnected ? this.retry.reconnectBudgetMs : this.retry.budgetMs)
         let delay = this.retry.firstMs
         let announced = false
         for (;;) {
             try {
-                return await attempt()
+                const client = await attempt()
+                this.everConnected = true
+                return client
             } catch (e) {
                 if (!isConnectionRefused(e) || this.generation !== genAtStart || Date.now() + delay > deadline) throw e
                 // A failing check counts as alive: it must never stop a retry that would work.
@@ -266,7 +280,7 @@ export class NativeCombinerConnection implements CombinerConnection {
                     announced = true
                     this.log(
                         "info",
-                        `combiner not listening yet at ${this.conn.baseUrl}; retrying for up to ${Math.round(this.retry.budgetMs / 1000)} s`,
+                        `combiner not listening at ${this.conn.baseUrl}; retrying for up to ${Math.round((deadline - Date.now()) / 1000)} s`,
                     )
                 }
                 await sleep(delay)

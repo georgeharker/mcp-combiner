@@ -28,6 +28,9 @@ import type { ServerFilter } from "../client/config-ladder.js"
 
 export type NativeResourceOptions = {
     connection: NativeCombinerConnection
+    /** Checked after listing: false means this pass should stop (see
+     *  NativeToolSurfaceOptions.shouldContinue). */
+    shouldContinue?: () => boolean
     /** Per-project server filter, same semantics as legacy filterResources; a getter
      *  resolves per call (worktrees/project switches re-resolve session config). */
     serverFilter?: ServerFilter | (() => ServerFilter | undefined)
@@ -136,9 +139,13 @@ export async function activateNativeResources(
     try {
         resources = filterInteractiveResources(await opts.connection.listResources(true), resolveFilter(opts.serverFilter))
     } catch (e) {
-        opts.log("warn", `interactive resource discovery failed (${e instanceof Error ? e.message : String(e)})`)
+        // A pass stopped by dispose() or a newer pass fails here harmlessly
+        // (e.g. "connect superseded"): not news.
+        if (!opts.shouldContinue || opts.shouldContinue())
+            opts.log("warn", `interactive resource discovery failed (${e instanceof Error ? e.message : String(e)})`)
         return []
     }
+    if (opts.shouldContinue && !opts.shouldContinue()) return []
     const added: string[] = []
     for (const resource of resources) {
         const toolName = `read_${resourceNameToToolName(resource.name ?? resource.uri)}`

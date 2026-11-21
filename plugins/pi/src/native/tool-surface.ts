@@ -65,7 +65,8 @@ export type NativeToolSurfaceOptions = {
      *  registerTool throws once the extension API is invalidated (/new, /resume,
      *  /reload), and a superseded pass would only redo work the next one does. */
     shouldContinue?: () => boolean
-    /** Registration progress for this pass: (registered so far, total to register).
+    /** Registration progress for this pass: (changes applied so far, total changes;
+     *  a change is a registration or a removal).
      *  Called after each slice; not called when the pass has nothing to register.
      *  done >= total means finished (activateNativeMode also reports (0, 0) when its
      *  newest pass ends, however it ends). */
@@ -215,9 +216,11 @@ function removedToolDefinition(name: string): ToolDefinition {
  *  Registration runs in time-boxed slices (REGISTER_SLICE_MS) with an event-loop
  *  yield between them, so a large catalog never holds pi's main thread for long. `state` is updated per registerTool, never ahead of it, so a
  *  pass that stops early (shouldContinue() false) leaves state matching exactly what
- *  pi holds and the next pass's diff resumes from there. Callers must not run two
- *  passes over the same state at once (native/index.ts serialises them). Returns the
- *  names currently active (for status/panel surfaces). */
+ *  pi holds and the next pass's diff resumes from there. Two passes over the same
+ *  state may overlap in time only if the older one's shouldContinue() turns false
+ *  once the newer starts (native/index.ts's generation check); every state change
+ *  happens between those checks. Returns the names currently active (for
+ *  status/panel surfaces). */
 export async function activateNativeTools(pi: ExtensionAPI, opts: NativeToolSurfaceOptions): Promise<string[]> {
     const state: NativeToolSurfaceState = opts.state ?? { names: new Set(), signatures: new Map() }
     const keepGoing = opts.shouldContinue ?? (() => true)
@@ -226,7 +229,7 @@ export async function activateNativeTools(pi: ExtensionAPI, opts: NativeToolSurf
     const allowlist = Array.isArray(resolveDirectSpec(opts.directSpec)) ? (resolveDirectSpec(opts.directSpec) as string[]) : []
     const reserved: ReadonlySet<string> = new Set(RESERVED_TOOL_NAMES)
 
-    // Diff first, register second: the slices then hold only real registrations.
+    // Diff first, register second: the slices then hold only real changes.
     const currentNames = new Set(tools.map((t) => t.name))
     const directNames: string[] = []
     const toRegister: Array<{ def: ToolDefinition; sig: string | null }> = []
@@ -248,36 +251,44 @@ export async function activateNativeTools(pi: ExtensionAPI, opts: NativeToolSurf
         toRegister.push({ def: toNativeTool(sum, opts.connection, exposure, opts.maxResultChars), sig })
     }
 
-    // Removals first: hide them (never unregister silently — pi has no unregister; a
-    // hidden re-register at the same name retires the declaration). They also shrink
-    // the registry, which makes every later rebuild cheaper.
-    let removed = 0
-    for (const goneName of [...state.names]) {
-        if (currentNames.has(goneName)) continue
-        pi.registerTool(removedToolDefinition(goneName))
-        state.names.delete(goneName)
-        state.signatures.delete(goneName)
-        removed++
-    }
-
+    // One queue, removals first: a removal is a hidden re-register (pi has no
+    // unregister; a hidden re-register at the same name retires the declaration).
+    // It replaces the registry entry rather than deleting it, so it costs a full
+    // rebuild like any registration, and a large removal (a disabled server, a
+    // narrower filter) must be time-boxed too.
+    type Op = { kind: "remove"; name: string } | { kind: "register"; def: ToolDefinition; sig: string | null }
+    const ops: Op[] = [
+        ...[...state.names].filter((n) => !currentNames.has(n)).map((name): Op => ({ kind: "remove", name })),
+        ...toRegister.map(({ def, sig }): Op => ({ kind: "register", def, sig })),
+    ]
+    let done = 0
     let fresh = 0
-    while (fresh < toRegister.length) {
-        if (fresh > 0) {
+    let removed = 0
+    while (done < ops.length) {
+        if (done > 0) {
             await yieldToEventLoop()
             if (!keepGoing()) {
-                opts.log("info", `native tool surface: pass stopped after ${fresh}/${toRegister.length} (superseded or session ended)`)
+                opts.log("info", `native tool surface: pass stopped after ${done}/${ops.length} (superseded or session ended)`)
                 return [...state.names]
             }
         }
         const sliceStart = performance.now()
         do {
-            const { def, sig } = toRegister[fresh]
-            pi.registerTool(def)
-            state.signatures.set(def.name, sig)
-            state.names.add(def.name)
-            fresh++
-        } while (fresh < toRegister.length && performance.now() - sliceStart < REGISTER_SLICE_MS)
-        opts.onProgress?.(fresh, toRegister.length)
+            const op = ops[done]
+            if (op.kind === "remove") {
+                pi.registerTool(removedToolDefinition(op.name))
+                state.names.delete(op.name)
+                state.signatures.delete(op.name)
+                removed++
+            } else {
+                pi.registerTool(op.def)
+                state.signatures.set(op.def.name, op.sig)
+                state.names.add(op.def.name)
+                fresh++
+            }
+            done++
+        } while (done < ops.length && performance.now() - sliceStart < REGISTER_SLICE_MS)
+        opts.onProgress?.(done, ops.length)
     }
     if (
         directNames.length > DIRECT_EXPOSURE_WARN_THRESHOLD &&

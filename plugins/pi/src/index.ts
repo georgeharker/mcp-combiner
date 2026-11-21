@@ -26,7 +26,7 @@
 // degrade-rather-than-die behaviour, so a user running several clients gets one answer
 // to "which combiner / which sharedserver am I on, and why".
 
-import { spawn, spawnSync } from "node:child_process"
+import { spawn, spawnSync, type ChildProcess } from "node:child_process"
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { basename, dirname, join } from "node:path"
@@ -41,7 +41,7 @@ import type {
     CommandSpec,
 } from "./pi.js"
 import { resolveSharedserver } from "./sharedserver-resolve.js"
-import { NativeCombinerConnection, activateNativeMode } from "./native/index.js"
+import { NativeCombinerConnection, activateNativeMode, waitForRegistration } from "./native/index.js"
 // ── TOOL SURFACE ───────────────────────────────────────────────────────────────
 // The mcp router (search/describe/call on the owned connection) + the native
 // per-tool registration (pi-1.0 exposure/namespace/annotations) + interactive
@@ -55,6 +55,7 @@ import { metaToolCall, statusText as controlStatusText } from "./client/control.
 import { openCombinerPanel } from "./client/panel.js"
 import { syncPromptCommands } from "./client/prompts.js"
 import { updateFooter, type RegisterProgress } from "./client/footer.js"
+import { matchesKey } from "@earendil-works/pi-tui"
 
 const DEFAULT_PORT = 9741
 const DEFAULT_NAME = "mcp-combiner"
@@ -246,9 +247,28 @@ function resolveConfig(log: LogFn): string | undefined {
 
 /** Attach state for exactly one live refcount. Guards `detach()` so a
  *  `session_shutdown("quit")` and a process-exit handler cannot double-`unuse` (which
- *  would over-decrement sharedserver's refcount). */
-type Attachment = { binary: string; name: string }
-let attachment: Attachment | null = null
+ *  would over-decrement sharedserver's refcount). `identity` is the combiner process
+ *  the refcount is on (read with `sharedserver info --json` just after the attach);
+ *  a reconnect to a different process takes a ref on that one too. */
+type Attachment = { binary: string; name: string; identity?: Promise<CombinerIdentity | undefined> }
+/** Per pi PROCESS, not per module instance: pi re-instantiates the extension for
+ *  every session (jiti moduleCache:false), and `use` runs once per process. Lives on
+ *  globalThis via Symbol.for, like CLEANUP_GUARD below. `quitting` is set at
+ *  session_shutdown("quit"): an attach still in flight (sleeping on a "defunct"
+ *  retry) must not re-take the combiner after detach() released it. */
+const ATTACH_STATE = Symbol.for("mcp-companion:attach-state")
+type AttachState = {
+    attachment: Attachment | null
+    quitting: boolean
+    /** holdRefOnCurrentCombiner's single flight (per process). */
+    holdingRef?: Promise<void>
+    /** An `admin incref` still running; detach() kills it. */
+    increfInFlight?: ChildProcess
+}
+function attachState(): AttachState {
+    const g = globalThis as Record<symbol, AttachState | undefined>
+    return (g[ATTACH_STATE] ??= { attachment: null, quitting: false })
+}
 
 /** Process-global guard — jiti loads extensions with moduleCache:false, so every
  *  session bind (parent + each subagent child) re-instantiates this module with
@@ -280,9 +300,11 @@ function installProcessCleanup() {
 }
 
 function detach() {
-    if (!attachment) return
-    const { binary, name } = attachment
-    attachment = null
+    const st = attachState()
+    if (!st.attachment) return
+    const { binary, name } = st.attachment
+    st.attachment = null
+    st.increfInFlight?.kill()
     spawnSync(binary, ["unuse", name, "--pid", String(process.pid)], { stdio: "ignore", env: process.env })
 }
 
@@ -449,6 +471,7 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
 
     if (connection) {
         const conn = connection // captured non-optional for the handlers below
+        let connectAttachTried = false
         const registeredPrompts = new Set<string>()
         let footerTimer: NodeJS.Timeout | undefined
         let uiCtx: ExtensionContext["ui"] | undefined
@@ -464,6 +487,7 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
             footerTimer = undefined
             uiCtx = undefined
             uiNotify = undefined
+            nativeSurface?.dispose()
             void conn.reset("superseded by a newer extension instance (reload)")
         })
 
@@ -472,7 +496,7 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
         let lastProgressPaint = 0
         const refreshFooter = () => {
             if (uiCtx)
-                void updateFooter(conn, uiCtx, settings.mcpFooterKey, settings.mcpFooterStatus, registering).catch(
+                void updateFooter(conn, uiCtx, settings.mcpFooterKey, settings.mcpFooterStatus, () => registering).catch(
                     () => undefined,
                 )
         }
@@ -480,7 +504,11 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
         // repaint fetches /health) and always on the final slice.
         onToolProgress = (done, total) => {
             const finished = done >= total
+            // A pass's last slice reports (total, total) and its end reports (0, 0):
+            // repaint for the first "finished" only.
+            const wasRegistering = registering !== undefined
             registering = finished ? undefined : { done, total }
+            if (finished && !wasRegistering) return
             const now = Date.now()
             if (finished || now - lastProgressPaint >= 500) {
                 lastProgressPaint = now
@@ -505,14 +533,22 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
         conn.setHooks({
             onToolsChanged: resyncAll,
             onStateChange: (state) => {
-                // Re-attach on (re)connect: a combiner bounce kills the instance our
-                // sharedserver reference was attached to, and nothing else re-takes
-                // ownership until the next session_start — an orphaned combiner then
-                // grace-stops 30m later (sharedserver `use` is idempotent per pid, so
-                // re-attaching on every connect is safe and cheap). Host-owned / unmanaged
-                // combiners have nothing to attach to, and the factory returns before
-                // `attachCombiner` is declared — calling it there is a TDZ ReferenceError.
-                if (state === "connected" && !hostOwned && manage) void attachCombiner(clientLog)
+                // Attach once per process: session_start's attach normally holds it.
+                // This catches only the case where that attach failed (e.g. no
+                // sharedserver yet) and the combiner is reachable now. Host-owned /
+                // unmanaged combiners have nothing to attach to, and the factory
+                // returns before `attachCombiner` is declared, so calling it there
+                // would be a TDZ ReferenceError.
+                if (state === "connected" && !hostOwned && manage) {
+                    if (attachState().attachment) void holdRefOnCurrentCombiner(clientLog)
+                    else if (!connectAttachTried) {
+                        // session_start's attach failed; try once more now the
+                        // combiner is reachable, but not on every reconnect (the
+                        // attach runs synchronous probes).
+                        connectAttachTried = true
+                        void attachCombiner(clientLog, { onlyIfRunning: true }).catch(() => undefined)
+                    }
+                }
                 refreshFooter()
             },
             // Stage 2: the widget hold announces its UI URL mid-call — open it.
@@ -595,11 +631,77 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
                 clientLog("error", `session setup failed: ${e instanceof Error ? e.message : String(e)}`)
             }
         })
+        // A turn that starts while tools are still registering (or the first connect
+        // is still retrying) would see only part of the catalog. pi awaits
+        // before_agent_start handlers and reads the live tool set afterwards, so
+        // waiting here puts every tool in the turn. The registration keeps yielding
+        // while we wait, so the UI stays live. pi has no abort for this hook today
+        // (Esc during the wait takes effect when it ends); ctx.signal is honoured if
+        // a future pi provides one.
+        pi.on("before_agent_start", async (_event, ctx) => {
+            const surface = nativeSurface
+            if (!surface?.busy()) return
+            // Still connecting: wait only for a combiner we just attached (it is
+            // starting up). A host-owned/unmanaged combiner that's down, or one whose
+            // attach failed, would only stall the turn for the whole retry budget.
+            const connecting = conn.state !== "connected"
+            if (connecting && !attachState().attachment) return
+            const ui = ctx.ui
+            const notice = setTimeout(() => {
+                if (notify)
+                    ui?.notify?.(
+                        connecting
+                            ? "mcp-combiner: waiting for the combiner to come up…"
+                            : "mcp-combiner: waiting for MCP tools to finish registering…",
+                        "info",
+                    )
+            }, 250) // brief waits (a list_changed resync) stay silent
+            notice.unref()
+            const started = Date.now()
+            const outcome = await waitForRegistration(surface, {
+                signal: ctx.signal,
+                // pi has no abort for this hook: end the wait on Esc / Ctrl+C / Ctrl+D
+                // ourselves (pi still sees the key and cancels or quits as usual).
+                // A single Ctrl+C only clears the editor in pi; its second press within
+                // 500 ms quits, so that is what ends the wait.
+                onInterrupt: (interrupt) => {
+                    let lastCtrlC = 0
+                    return (
+                        ui?.onTerminalInput?.((data) => {
+                            if (matchesKey(data, "ctrl+c")) {
+                                const now = Date.now()
+                                if (now - lastCtrlC < 500) interrupt()
+                                lastCtrlC = now
+                            } else if (matchesKey(data, "escape")) interrupt()
+                            // Ctrl+D quits only on an empty editor; with text it deletes forward.
+                            else if (matchesKey(data, "ctrl+d") && !(ui?.getEditorText?.() ?? "")) interrupt()
+                            return undefined
+                        }) ?? (() => undefined)
+                    )
+                },
+            })
+            clearTimeout(notice)
+            const waitedMs = Date.now() - started
+            const waited = `${(waitedMs / 1000).toFixed(1)} s`
+            if (outcome === "timeout") {
+                clientLog(
+                    "warn",
+                    `tool registration still running after ${waited}; the rest join from the turn's next model request`,
+                )
+            } else if (waitedMs >= 250) {
+                // Brief waits (a list_changed resync) stay silent, like the notice.
+                clientLog("info", `turn waited ${waited} for tool registration (${outcome})`)
+            }
+        })
+
         pi.on("session_shutdown", () => {
             if (footerTimer) {
                 clearInterval(footerTimer)
                 footerTimer = undefined
             }
+            // Stop a registration pass in flight before pi retires this session's
+            // extension API (pi 1.6 creates a fresh instance for the next session).
+            nativeSurface?.dispose()
             void conn.reset("session shutdown")
         })
     }
@@ -721,7 +823,10 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
     // Pi forbids starting background resources from the factory, so all of this is
     // deferred to session_start. session_start fires again on reload/new/resume/fork
     // within the same process; the `attachment` guard makes re-entry a no-op attach.
-    const attachCombiner = async (log: LogFn): Promise<void> => {
+    /** `onlyIfRunning`: attach to a combiner sharedserver already runs, never
+     *  launch one (the reconnect path; pi never relaunches from a reconnect). */
+    const attachCombiner = async (log: LogFn, opts: { onlyIfRunning?: boolean } = {}): Promise<void> => {
+        if (attachState().quitting) return
         const binary = resolveSharedserver(
             {
                 label: "mcp-combiner",
@@ -752,6 +857,8 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
         if (!cfgPath) return // resolveConfig already logged the specifics
 
         const name = env("PI_MCP_COMBINER_NAME") ?? DEFAULT_NAME
+        // `use` launches a stopped server; the reconnect path must only attach.
+        if (opts.onlyIfRunning && !(await sharedserverActive(binary, name))) return
         const port = resolvePort(log)
         const grace = env("PI_MCP_COMBINER_GRACE") ?? DEFAULT_GRACE
 
@@ -809,33 +916,43 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
             const stderr = result.stderr?.toString().trim() ?? ""
             if (attempt < ATTACH_DEFUNCT_RETRIES && /defunct|retry shortly/i.test(stderr)) {
                 await new Promise((resolve) => setTimeout(resolve, ATTACH_DEFUNCT_DELAY_MS).unref())
+                // Quit may have released the combiner while we slept: don't re-take it.
+                if (attachState().quitting) return
                 continue
             }
             log("error", `${name}: sharedserver use exited ${result.status}${stderr ? ` (${stderr})` : ""}`)
             return
         }
 
-        attachment = { binary, name }
+        attachState().attachment = { binary, name, identity: combinerIdentity(binary, name) }
+        // Between refused-connect retries, ask sharedserver whether the combiner is
+        // still there, so a launch that died stops the retry at once.
+        connection?.setLivenessCheck(() => sharedserverActive(binary, name))
         log("info", `combiner "${name}" attached on port ${port} (${combiner.cmd} ${wrappedArgs.join(" ")})`)
     }
 
     pi.on("session_start", async (_event, ctx) => {
         try {
-            if (!attachment) await attachCombiner(makeLog(ctx, notify)) // else already attached in this process
+            if (!attachState().attachment) await attachCombiner(makeLog(ctx, notify)) // else attached in this process
+            else {
+                // Attached by an earlier session in this process: keep the liveness
+                // check on this session's fresh connection.
+                const { binary, name } = attachState().attachment as Attachment
+                connection?.setLivenessCheck(() => sharedserverActive(binary, name))
+            }
         } finally {
             releaseAttachGate()
         }
-        // Between refused-connect retries, ask sharedserver whether the combiner is
-        // still there, so a launch that died stops the retry at once.
-        const att = attachment
-        if (att) connection?.setLivenessCheck(() => sharedserverActive(att.binary, att.name))
     })
 
     pi.on("session_shutdown", (event: SessionShutdownEvent) => {
         // Only "quit" means the Pi process is actually leaving. reload/new/resume/fork
         // keep the process alive and a fresh session_start re-attaches — releasing the
         // refcount on those would needlessly drop (and re-take) the shared combiner.
-        if (event.reason === "quit") detach()
+        if (event.reason === "quit") {
+            attachState().quitting = true
+            detach()
+        }
     })
 }
 
@@ -994,6 +1111,103 @@ function installConfig(ctx: ExtensionCommandContext, pathArg?: string): void {
     )
 }
 
+/** Which combiner process sharedserver is running as `name`: its pid and start
+ *  time (`sharedserver info <name> --json`), so a reused pid isn't mistaken for the
+ *  same process. Undefined when it isn't running or no answer comes within 2 s.
+ *  Async: never blocks pi's main thread. */
+type CombinerIdentity = { pid: number; startTime: number | undefined }
+function combinerIdentity(binary: string, name: string): Promise<CombinerIdentity | undefined> {
+    return new Promise((resolve) => {
+        const child = spawn(binary, ["info", name, "--json"], { stdio: ["ignore", "pipe", "ignore"], env: process.env })
+        child.unref()
+        let out = ""
+        child.stdout?.on("data", (chunk: Buffer) => {
+            out += chunk.toString()
+        })
+        const timer = setTimeout(() => {
+            child.kill()
+            resolve(undefined)
+        }, 2_000)
+        timer.unref()
+        child.on("error", () => {
+            clearTimeout(timer)
+            resolve(undefined)
+        })
+        // "close", not "exit": stdout is only fully read by then.
+        child.on("close", (code) => {
+            clearTimeout(timer)
+            if (code !== 0) return resolve(undefined)
+            try {
+                const info = JSON.parse(out) as { pid?: unknown; start_time?: unknown }
+                if (typeof info.pid !== "number") return resolve(undefined)
+                resolve({ pid: info.pid, startTime: typeof info.start_time === "number" ? info.start_time : undefined })
+            } catch {
+                resolve(undefined)
+            }
+        })
+    })
+}
+
+function sameCombiner(a: CombinerIdentity | undefined, b: CombinerIdentity): boolean {
+    return a !== undefined && a.pid === b.pid && a.startTime === b.startTime
+}
+
+/** After a reconnect: every client of a sharedserver server holds a ref, so if the
+ *  combiner is now a DIFFERENT process from the one we attached to (it died, or
+ *  someone restarted it, which also drops every client's ref), take a ref on the
+ *  new one. `admin incref` never launches anything: it refuses when the server
+ *  isn't running. Same process -> nothing to do. One check at a time per pi
+ *  process; a failed check or incref is retried once after 1 s, then warned. */
+function holdRefOnCurrentCombiner(log: LogFn): Promise<void> {
+    const st = attachState()
+    st.holdingRef ??= (async () => {
+        for (let attempt = 1; attempt <= 2; attempt++) {
+            const att = st.attachment
+            if (!att || st.quitting) return
+            // The identity recorded at attach may still be on its way: wait for it, so
+            // the comparison is with the process we attached to.
+            const attachedTo = await att.identity
+            const now = await combinerIdentity(att.binary, att.name)
+            if (st.attachment !== att || st.quitting) return
+            if (now && sameCombiner(attachedTo, now)) return
+            if (now && (await incref(att))) {
+                if (st.attachment === att) {
+                    att.identity = Promise.resolve(now)
+                    log("info", `combiner "${att.name}" is a new process (pid ${now.pid}); took a ref on it`)
+                }
+                return
+            }
+            if (attempt === 1) await new Promise((resolve) => setTimeout(resolve, 1_000).unref())
+            else log("warn", `could not take a ref on combiner "${att.name}" after it restarted; it may stop when its other clients leave`)
+        }
+    })().finally(() => {
+        st.holdingRef = undefined
+    })
+    return st.holdingRef
+}
+
+/** `sharedserver admin incref` for this pi process; resolves true on success. The
+ *  child is kept on the attach state so detach() can kill one still in flight
+ *  (an incref landing after quit's unuse would leave a stale ref). */
+function incref(att: Attachment): Promise<boolean> {
+    return new Promise((resolve) => {
+        const st = attachState()
+        const child = spawn(
+            att.binary,
+            ["admin", "incref", att.name, "--pid", String(process.pid), "--metadata", `pi-${process.pid}`],
+            { stdio: "ignore", env: process.env },
+        )
+        child.unref()
+        st.increfInFlight = child
+        const done = (ok: boolean) => {
+            if (st.increfInFlight === child) st.increfInFlight = undefined
+            resolve(ok)
+        }
+        child.on("error", () => done(false))
+        child.on("exit", (code) => done(code === 0))
+    })
+}
+
 /** `sharedserver use` attempts while the server reads "defunct" (being reaped). */
 const ATTACH_DEFUNCT_RETRIES = 4
 const ATTACH_DEFUNCT_DELAY_MS = 300
@@ -1004,6 +1218,7 @@ const ATTACH_DEFUNCT_DELAY_MS = 300
 function sharedserverActive(binary: string, name: string): Promise<boolean> {
     return new Promise((resolve) => {
         const child = spawn(binary, ["check", name], { stdio: "ignore", env: process.env })
+        child.unref() // a check in flight at quit must not hold pi open
         const timer = setTimeout(() => {
             child.kill()
             resolve(true)

@@ -84,7 +84,9 @@ export async function updateFooter(
     ui: ExtensionUIContext | undefined,
     key: string,
     mode: FooterStatus,
-    registering?: RegisterProgress,
+    /** Read AFTER the /health and tools/list awaits, so a slow paint that resolves
+     *  last shows the progress as it is then, not as it was when it started. */
+    registering?: () => RegisterProgress | undefined,
 ): Promise<void> {
     if (mode === "off") return
     const setStatus = ui?.setStatus
@@ -101,7 +103,7 @@ export async function updateFooter(
     try {
         const [health, tools] = await Promise.all([connection.health(), connection.listTools().catch(() => undefined)])
         const toolCount = tools?.length
-        text = footerText(mode, countsFromHealth(health), connection.state, toolCount, registering)
+        text = footerText(mode, countsFromHealth(health), connection.state, toolCount, registering?.())
     } catch {
         // Combiner unreachable: report our connection state honestly, still occupying
         // the slot so the label never silently vanishes.
