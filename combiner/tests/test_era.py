@@ -281,11 +281,14 @@ async def _reverse_combiner(
     protocol: str | None = None,
     offer_downstream: bool = False,
     sessions: bool = False,
+    permissions: dict[str, Any] | None = None,
 ) -> CombinerHandle:
     mock = await procs.start_http_mock("mockup", offer_2026=mock_offers_2026, sessions=sessions)
     entry: dict[str, Any] = {**http_mock_entry(mock.port), "isolate": True}
     if protocol is not None:
         entry["protocol"] = protocol
+    if permissions is not None:
+        entry["permissions"] = permissions
     config = write_servers_config(tmp_path / "servers.json", {"mockup": entry})
     env = {OFFER_2026_ENV: "1"} if offer_downstream else None
     combiner = await procs.start_combiner(
@@ -343,6 +346,31 @@ class TestReverseBridge:
             assert c.protocol_version in MODERN_PROTOCOL_VERSIONS
             payload = _guard_saw(await c.call_tool("mockup_mock__ask_guard", {}))
         assert payload == {"action": "accept", "content": ANSWER}
+
+    async def test_consent_then_an_upstream_ask_on_2026(
+        self, procs: ProcFactory, tmp_path: Path
+    ) -> None:
+        """2026 client, 2026 upstream, consent answered 'Allow once': the
+        combiner's consent state never reaches the upstream, and the client's
+        answer to the upstream's own ask is not mistaken for a new call."""
+        combiner = await _reverse_combiner(
+            procs,
+            tmp_path,
+            mock_offers_2026=True,
+            offer_downstream=True,
+            permissions={"elicit": ["mock__ask_guard"]},
+        )
+        asked: list[str] = []
+
+        async def answer(message: str, response_type: Any, params: Any, context: object) -> Any:
+            asked.append(message)
+            return {"value": "Allow once"} if message.startswith("Allow") else ANSWER
+
+        async with Client(f"{combiner.mcp_url}/chat-rev-0003", elicitation_handler=answer) as c:
+            assert c.protocol_version in MODERN_PROTOCOL_VERSIONS
+            payload = _guard_saw(await c.call_tool("mockup_mock__ask_guard", {}))
+        assert payload == {"action": "accept", "content": ANSWER}
+        assert [m.startswith("Allow") for m in asked] == [True, False], asked
 
     async def test_a_pinned_upstream_stays_on_the_handshake(
         self, procs: ProcFactory, tmp_path: Path

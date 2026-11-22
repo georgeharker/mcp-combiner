@@ -193,6 +193,7 @@ class MockState:
     start_time: float = field(default_factory=time.time)
     boot_count: int = 1
     calls_total: int = 0
+    url_required_calls: int = 0
     tool_calls: dict[str, int] = field(default_factory=dict)
     session_calls: dict[str, int] = field(default_factory=dict)
     session_ids: list[str] = field(default_factory=list)
@@ -422,6 +423,45 @@ def parse_tool_specs(text: str) -> list[ToolSpec]:
     return [ToolSpec.from_dict(entry) for entry in raw]
 
 
+class _UrlRequiredMiddleware(Middleware):
+    """Fail ``mock__url_required`` with -32042 for its first ``times`` calls.
+    In middleware, so the error reaches the wire as itself (a tool body's
+    exception would be masked into an isError result)."""
+
+    def __init__(self, state: MockState, url: str) -> None:
+        self._state = state
+        self._url = url
+
+    async def on_call_tool(
+        self,
+        context: MiddlewareContext[mcp.types.CallToolRequestParams],
+        call_next: CallNext[mcp.types.CallToolRequestParams, ToolResult],
+    ) -> ToolResult:
+        message = context.message
+        if message is not None and message.name == "mock__url_required":
+            from mcp.shared.exceptions import UrlElicitationRequiredError
+
+            self._state.url_required_calls += 1
+            times = (message.arguments or {}).get("times", 1)
+            if isinstance(times, int) and self._state.url_required_calls <= times:
+                raise UrlElicitationRequiredError(
+                    [
+                        mcp.types.ElicitRequestURLParams(
+                            message="Authorize the step", url=self._url, elicitation_id="step-1"
+                        )
+                    ]
+                )
+        return await call_next(context)
+
+
+#: A small form the era-ask fixtures ask for.
+_ERA_FORM_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"name": {"type": "string"}},
+    "required": ["name"],
+}
+
+
 class MockServer:
     """The assembled mock: FastMCP instance + state + runtime catalog control."""
 
@@ -433,6 +473,7 @@ class MockServer:
         state_dir: Path | None = None,
         oauth: MockOAuthProvider | None = None,
         sessions: bool = False,
+        era_asks: bool = False,
     ) -> None:
         self.state = MockState(server_name=name, transport=transport, state_dir=state_dir)
         if state_dir is not None:
@@ -451,6 +492,8 @@ class MockServer:
         self._register_listen()
         if sessions:
             self._register_session_tools()
+        if era_asks:
+            self._register_era_asks()
         self._register_routes()
         if oauth is not None:
             oauth.register_routes(self.mcp)
@@ -474,6 +517,194 @@ class MockServer:
         self.mcp._mcp_server.add_request_handler(
             "subscriptions/listen", mcp.types.SubscriptionsListenRequestParams, serve
         )
+
+    def _register_era_asks(self) -> None:
+        """``--era-asks``: one fixture per kind of input ask, in each era, for
+        the combiner's era-bridge tests. Every fixture echoes what its answer
+        carried, so a test sees exactly what reached the upstream.
+
+        2026-era guards ask by RETURNING ``InputRequiredResult`` (a handshake
+        connection can't receive that: the combiner's reverse bridge answers
+        it); handshake-era fixtures ask with a server-initiated request (a
+        2026 connection can't receive that: the combiner holds the call).
+        """
+        state = self.state
+        mcp_srv = self.mcp
+        types = mcp.types
+        url = "https://example.invalid/step"
+
+        def _foreign(ctx: Context, *mine: str) -> None:
+            st = ctx.request_state
+            if st is not None and not any(st == m or st.startswith(m + ":") for m in mine):
+                raise ToolError(f"foreign request_state {st!r}")
+
+        def _url_ask(n: int) -> mcp.types.InputRequiredResult:
+            return types.InputRequiredResult(
+                input_requests={
+                    "open": types.ElicitRequest(
+                        params=types.ElicitRequestURLParams(message="Open the step", url=url)
+                    )
+                },
+                request_state=f"url-guard:{n}",
+            )
+
+        @mcp_srv.tool(
+            name="mock__ask_url_guard",
+            description=(
+                "2026 guard: asks for a URL to be opened; after an accept it asks "
+                "for the same URL again `polls` more times (a browser step still "
+                "running), then answers how many retries it took."
+            ),
+        )
+        async def mock__ask_url_guard(ctx: Context, polls: int = 0) -> Any:
+            _foreign(ctx, "url-guard")
+            answer = (ctx.input_responses or {}).get("open")
+            st = ctx.request_state
+            if not isinstance(answer, types.ElicitResult) or st is None:
+                return _url_ask(0)
+            if answer.action != "accept":
+                return f"url: {answer.action}"
+            try:
+                n = int(st.partition(":")[2])
+            except ValueError:
+                n = 0
+            if n < polls:
+                return _url_ask(n + 1)
+            return f"url: accept after {n} polls"
+
+        @mcp_srv.tool(
+            name="mock__ask_sample_guard",
+            description="2026 guard: asks the client to sample, echoes the text.",
+        )
+        async def mock__ask_sample_guard(ctx: Context) -> Any:
+            _foreign(ctx, "sample-guard")
+            answer = (ctx.input_responses or {}).get("sample")
+            if (
+                isinstance(answer, types.CreateMessageResult)
+                and ctx.request_state == "sample-guard"
+            ):
+                content = answer.content
+                text = content.text if isinstance(content, types.TextContent) else str(content)
+                return f"sample: {text}"
+            return types.InputRequiredResult(
+                input_requests={
+                    "sample": types.CreateMessageRequest(
+                        params=types.CreateMessageRequestParams(
+                            messages=[
+                                types.SamplingMessage(
+                                    role="user",
+                                    content=types.TextContent(type="text", text="say hi"),
+                                )
+                            ],
+                            max_tokens=16,
+                        )
+                    )
+                },
+                request_state="sample-guard",
+            )
+
+        @mcp_srv.tool(
+            name="mock__ask_roots_guard",
+            description="2026 guard: asks the client for its roots, echoes them.",
+        )
+        async def mock__ask_roots_guard(ctx: Context) -> Any:
+            _foreign(ctx, "roots-guard")
+            answer = (ctx.input_responses or {}).get("roots")
+            if isinstance(answer, types.ListRootsResult) and ctx.request_state == "roots-guard":
+                return "roots: " + json.dumps([str(r.uri) for r in answer.roots])
+            return types.InputRequiredResult(
+                input_requests={"roots": types.ListRootsRequest()},
+                request_state="roots-guard",
+            )
+
+        def _form_guard(ctx: Context, tag: str) -> Any:
+            _foreign(ctx, tag)
+            answer = (ctx.input_responses or {}).get("form")
+            if isinstance(answer, types.ElicitResult) and ctx.request_state == tag:
+                return f"{tag}: " + json.dumps({"action": answer.action, "content": answer.content})
+            return types.InputRequiredResult(
+                input_requests={
+                    "form": types.ElicitRequest(
+                        params=types.ElicitRequestFormParams(
+                            message=f"{tag} confirmation", requested_schema=_ERA_FORM_SCHEMA
+                        )
+                    )
+                },
+                request_state=tag,
+            )
+
+        @mcp_srv.resource("data://mock/guard", name="guard", mime_type="text/plain")
+        async def mock_guard_resource(ctx: Context) -> Any:
+            return _form_guard(ctx, "resource-guard")
+
+        @mcp_srv.prompt(name="guard_prompt", description="2026 guard prompt (asks a form).")
+        async def mock_guard_prompt(ctx: Context) -> Any:
+            return _form_guard(ctx, "prompt-guard")
+
+        # ── handshake era: server-initiated asks ──
+
+        @mcp_srv.tool(
+            name="mock__elicit_url",
+            description="Handshake: asks for a URL to be opened (URL-mode elicitation).",
+        )
+        async def mock__elicit_url(ctx: Context) -> str:
+            result = await ctx.session.elicit_url(
+                message="Open the step",
+                url=url,
+                elicitation_id=uuid.uuid4().hex,
+                related_request_id=ctx.request_id,
+            )
+            return f"elicit-url: {result.action}"
+
+        @mcp_srv.tool(name="mock__sample", description="Handshake: asks the client to sample.")
+        async def mock__sample(ctx: Context) -> str:
+            result = await ctx.session.create_message(
+                messages=[
+                    types.SamplingMessage(
+                        role="user", content=types.TextContent(type="text", text="say hi")
+                    )
+                ],
+                max_tokens=16,
+                related_request_id=ctx.request_id,
+            )
+            content = result.content
+            text = content.text if isinstance(content, types.TextContent) else str(content)
+            return f"sample: {text}"
+
+        @mcp_srv.tool(name="mock__list_roots", description="Handshake: asks for the roots.")
+        async def mock__list_roots(ctx: Context) -> str:
+            result = await ctx.session.list_roots()
+            return "roots: " + json.dumps([str(r.uri) for r in result.roots])
+
+        @mcp_srv.tool(
+            name="mock__url_required",
+            description=(
+                "Handshake: fails with -32042 (a URL the user must open) the first "
+                "`times` calls of this process, then succeeds."
+            ),
+        )
+        async def mock__url_required(ctx: Context, times: int = 1) -> str:
+            # The -32042 itself is raised by _UrlRequiredMiddleware: fastmcp
+            # masks an error raised inside a tool into an isError result.
+            return f"url-required: done after {state.url_required_calls} calls"
+
+        mcp_srv.add_middleware(_UrlRequiredMiddleware(state, url))
+
+        async def _elicit_form(ctx: Context, tag: str) -> str:
+            result = await ctx.session.elicit(
+                message=f"{tag} confirmation",
+                requested_schema=_ERA_FORM_SCHEMA,
+                related_request_id=ctx.request_id,
+            )
+            return f"{tag}: " + json.dumps({"action": result.action, "content": result.content})
+
+        @mcp_srv.resource("data://mock/elicit", name="elicit", mime_type="text/plain")
+        async def mock_elicit_resource(ctx: Context) -> str:
+            return await _elicit_form(ctx, "resource-elicit")
+
+        @mcp_srv.prompt(name="elicit_prompt", description="Handshake prompt that elicits a form.")
+        async def mock_elicit_prompt(ctx: Context) -> str:
+            return await _elicit_form(ctx, "prompt-elicit")
 
     def _register_session_tools(self) -> None:
         """``--sessions``: model a server that owns its sessions (svg-mcp's
@@ -722,6 +953,9 @@ class MockServer:
         )
         async def mock__ask_guard(ctx: Context) -> Any:
             state.record_call("mock__ask_guard", ctx.session_id)
+            if ctx.request_state not in (None, "guard-form"):
+                # Proves the combiner never leaks its own continuation state.
+                raise ToolError(f"guard: foreign request_state {ctx.request_state!r}")
             answer = (ctx.input_responses or {}).get("form")
             if isinstance(answer, mcp.types.ElicitResult) and ctx.request_state == "guard-form":
                 return "guard: " + json.dumps(
@@ -1449,9 +1683,10 @@ def build_server(
     state_dir: Path | None = None,
     oauth: MockOAuthProvider | None = None,
     sessions: bool = False,
+    era_asks: bool = False,
 ) -> tuple[FastMCP, MockState]:
     """Assemble the mock server; returns (FastMCP instance, observable state)."""
-    server = MockServer(name, transport, specs, state_dir, oauth, sessions)
+    server = MockServer(name, transport, specs, state_dir, oauth, sessions, era_asks)
     return server.mcp, server.state
 
 
@@ -1496,6 +1731,14 @@ def main(argv: list[str] | None = None) -> None:
         help=(
             "Own sessions like a 2026-era stateful server: adds mock__create_session / "
             "mock__end_session and a visible session_id on mock__remember / mock__recall."
+        ),
+    )
+    parser.add_argument(
+        "--era-asks",
+        action="store_true",
+        help=(
+            "Add one fixture per kind of input ask (form, URL, sampling, roots; "
+            "tools, resources, prompts) in each protocol era, for era-bridge tests."
         ),
     )
     parser.add_argument(
@@ -1549,7 +1792,12 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     mcp_srv, _state = build_server(
-        args.name, args.transport, specs, state_dir, sessions=args.sessions
+        args.name,
+        args.transport,
+        specs,
+        state_dir,
+        sessions=args.sessions,
+        era_asks=args.era_asks,
     )
     if args.transport != "stdio" and not args.offer_2026:
         pin_handshake_only(mcp_srv)

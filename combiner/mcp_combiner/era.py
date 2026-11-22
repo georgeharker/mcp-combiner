@@ -7,15 +7,14 @@ session, server-initiated requests, unsolicited notifications) and the
 ``subscriptions/listen`` streams). A client probes ``server/discover`` and uses
 the new revision when the server lists it.
 
-The combiner does not yet translate between the eras for a new-revision client:
-it has no ``subscriptions/listen`` handler (so no ``tools/list_changed``), its
-consent prompts and forwarded upstream elicitations rely on server-initiated
-requests, and its broadcast set holds only long-lived connections. Until that
-translation layer exists (design: "Support both MCP eras downstream"), the HTTP
-app answers ``server/discover`` with no supported versions, so a client that
-probes (Claude Code does) falls back to the handshake \u2014 exactly the
-pre-fastmcp-4 behaviour. ``MCP_COMBINER_OFFER_2026=1`` lifts the pin (for
-developing and testing the translation layer).
+The combiner translates between the eras for a new-revision client (design:
+"Support both MCP eras downstream"): ``subscriptions/listen`` streams per chat
+(:mod:`mcp_combiner.listen`), consent and restart prompts as
+``InputRequiredResult``, and every kind of upstream input ask bridged both ways
+(:mod:`mcp_combiner.asks`, :mod:`mcp_combiner.heldcalls`). It is still offered
+only on request: by default the HTTP app answers ``server/discover`` with no
+supported versions, so a client that probes (Claude Code does) falls back to
+the handshake. ``MCP_COMBINER_OFFER_2026=1`` lifts the pin.
 
 Only the HTTP app is pinned: on an in-memory transport one duplex stream would
 carry both the probe and the session, and the probe opens a new-era connection
@@ -58,8 +57,7 @@ def pin_handshake_era(combiner: FastMCP[Any], *, force: bool = False) -> None:
     """
     if offers_2026_era() and not force:
         logger.warning(
-            "%s set: offering the 2026-07-28 revision to clients \u2014 the era "
-            "translation layer is incomplete (no list_changed, no elicitation)",
+            "%s set: offering the 2026-07-28 revision to clients",
             OFFER_2026_ENV,
         )
         return

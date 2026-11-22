@@ -4,6 +4,31 @@ All notable changes to the combiner are documented here. The version moves in
 lockstep with the rest of the repo (`scripts/bump-version.sh`); releases are
 tagged `vX.Y.Z`.
 
+## [Unreleased]
+
+### Added
+
+- **Every kind of input question is bridged across MCP protocol revisions.**
+  Before, only form questions crossed between a handshake-era side and a
+  2026-07-28 side, and only on tool calls. Now URL questions, sampling and roots
+  cross as well, in both directions, on tool calls, resource reads and prompts.
+  A URL the user agreed to open isn't asked again while the browser step runs:
+  the combiner re-polls the server for up to `MCP_COMBINER_URL_ASK_WAIT` seconds
+  (default 300), then returns `-32042` so the client can call again. A 2026
+  client gets an upstream's `-32042`, or the combiner's own OAuth link, as a URL
+  question.
+- Mock server `--era-asks`: one fixture per kind of question in each revision.
+
+### Fixed
+
+- **A 2026 client, a 2026 server and a consent prompt no longer loop.**
+  The retry that answered "Allow once" carried the combiner's own consent state
+  on to the server, which rejected it (`Invalid or expired requestState`). Had
+  it got through, the server's own question would have triggered consent again.
+  A server's `requestState` now reaches 2026 clients wrapped as
+  `up:<server>:<state>`. The combiner's own continuations never go upstream, and
+  a state can't be replayed against another server.
+
 ## [0.24.5] — 2026-11-21
 
 No combiner changes. This release is the Pi extension (startup typing freeze

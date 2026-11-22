@@ -17,7 +17,9 @@ from collections.abc import Sequence
 from typing import Any, ClassVar, TypeGuard, cast
 
 import mcp.types as mt
-from fastmcp.exceptions import FastMCPError, NotFoundError, ToolError
+from fastmcp.exceptions import FastMCPError, NotFoundError, PromptError, ResourceError, ToolError
+from fastmcp.prompts.base import InputRequiredPromptResult, PromptResult
+from fastmcp.resources.base import InputRequiredResourceResult, ResourceResult
 from fastmcp.server.context import Context
 from fastmcp.server.dependencies import get_http_headers
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
@@ -26,9 +28,10 @@ from fastmcp.tools import Tool, ToolResult
 from fastmcp.tools.base import InputRequiredToolResult
 from mcp.server.connection import Connection
 from mcp.shared.exceptions import MCPError, UrlElicitationRequiredError
+from mcp.types import URL_ELICITATION_REQUIRED
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 
-from mcp_combiner import authprompt, fastvalidate, heldcalls, nvim_proxy, permissions
+from mcp_combiner import asks, authprompt, fastvalidate, heldcalls, nvim_proxy, permissions
 from mcp_combiner.auth import clear_oauth_cache, is_stale_client_error
 from mcp_combiner.connections import AuthenticationError
 from mcp_combiner.isolated import TOKEN_HEADER
@@ -46,6 +49,7 @@ from mcp_combiner.toolcache import (
     _is_transport_dead,
     _merge_stale_server_tools,
     namespace_uri,
+    un_namespace_uri,
 )
 
 logger = logging.getLogger("mcp-combiner")
@@ -431,6 +435,87 @@ class ToolProcessingMiddleware(Middleware):
         context: MiddlewareContext[mt.CallToolRequestParams],
         call_next: CallNext[mt.CallToolRequestParams, ToolResult],
     ) -> ToolResult:
+        """Route a tool call (:meth:`_call_tool`), translating for 2026 clients.
+
+        A 2026-era request's ``requestState`` says which leg it continues
+        (:func:`asks.classify`), decided once here. A ``-32042`` (a URL the
+        user must open: an upstream's, or the combiner's own OAuth prompt) has
+        no 2026 form, so it goes back as an ``InputRequiredResult`` with the
+        URL; the retry (``redo:``) runs the call again, re-polling for up to
+        :func:`asks.url_ask_wait` while the browser step is still running.
+        """
+        fctx = context.fastmcp_context
+        if not _is_2026_request(fctx) or fctx is None:
+            return await self._call_tool(context, call_next, asks.Continuation("first"))
+        cont = asks.classify(fctx.request_state)
+        server = _server_of_tool(str(context.message.name if context.message else ""))
+        if cont.kind in ("up", "redo") and not cont.owned_by(server):
+            raise ToolError(
+                "This answer belongs to a different call and can't be used here. "
+                "Call the tool again."
+            )
+        accepted = cont.kind == "redo" and _all_accepted(fctx.input_responses)
+        if cont.kind == "redo" and not accepted:
+            raise ToolError("The link wasn't opened. Call the tool again to be asked again.")
+        loop = asyncio.get_running_loop()
+        deadline: float | None = None
+        delay = 0.5
+        while True:
+            try:
+                return await self._call_tool(context, call_next, cont)
+            except UrlElicitationRequiredError as e:
+                if server is None:
+                    raise
+                if not accepted:
+                    return InputRequiredToolResult(asks.url_asks(e, server))
+                # The user opened the link; the step it starts isn't done yet.
+                now = loop.time()
+                if deadline is None:
+                    deadline = now + asks.url_ask_wait()
+                if now >= deadline:
+                    raise ToolError(
+                        "Still waiting for the step in the browser to finish. "
+                        "Call the tool again once it is done."
+                    ) from e
+                await asyncio.sleep(min(delay, deadline - now))
+                delay = min(delay * 2, 10.0)
+
+    async def on_read_resource(
+        self,
+        context: MiddlewareContext[mt.ReadResourceRequestParams],
+        call_next: CallNext[mt.ReadResourceRequestParams, ResourceResult],
+    ) -> ResourceResult:
+        """Bridge input asks across eras on resource reads (as for tools)."""
+        uri = str(context.message.uri) if context.message else ""
+        try:
+            result: ResourceResult = await _bridge_asks(
+                context, call_next, _server_of_uri(uri), InputRequiredResourceResult
+            )
+        except ToolError as e:
+            raise ResourceError(str(e)) from e
+        return result
+
+    async def on_get_prompt(
+        self,
+        context: MiddlewareContext[mt.GetPromptRequestParams],
+        call_next: CallNext[mt.GetPromptRequestParams, PromptResult],
+    ) -> PromptResult:
+        """Bridge input asks across eras on prompts (as for tools)."""
+        name = str(context.message.name) if context.message else ""
+        try:
+            result: PromptResult = await _bridge_asks(
+                context, call_next, _server_of_tool(name), InputRequiredPromptResult
+            )
+        except ToolError as e:
+            raise PromptError(str(e)) from e
+        return result
+
+    async def _call_tool(
+        self,
+        context: MiddlewareContext[mt.CallToolRequestParams],
+        call_next: CallNext[mt.CallToolRequestParams, ToolResult],
+        cont: asks.Continuation,
+    ) -> ToolResult:
         """Wrap tool calls with error handling for resilience.
 
         Error strategy:
@@ -492,13 +577,16 @@ class ToolProcessingMiddleware(Middleware):
                     call_server = sname
                     break
 
-        # A 2026-era retry of a held call (mcp_combiner.heldcalls) resumes the
-        # upstream call already in flight: the first leg already passed the
-        # gates below, so they are not run again.
+        # A 2026-era retry continuing an earlier leg (cont, see on_call_tool):
+        # a held call's retry resumes the upstream call already in flight; an
+        # upstream ask's (up:) or a URL step's (redo:) runs the call again. The
+        # first leg already passed the consent and validation gates; only a
+        # redo re-checks a pending authorization (that is what it waits on).
         fctx = context.fastmcp_context
         era_2026 = _is_2026_request(fctx)
         request_state = fctx.request_state if fctx is not None and era_2026 else None
-        resuming = heldcalls.resumes(request_state)
+        resuming = cont.kind == "held"
+        skip_gates = cont.skips_gates
 
         # A server waiting on an out-of-band OAuth authorization can't serve the
         # call: hand the caller the authorization link (-32042) before the
@@ -506,7 +594,7 @@ class ToolProcessingMiddleware(Middleware):
         # flow first (a no-op for inline OAuth) — this has to happen here, not
         # on the call's failure: a server that never authorized has no listed
         # tools, so the call itself would fail as an unknown tool.
-        if call_server and not resuming:
+        if call_server and cont.kind not in ("held", "up"):
             pending = authprompt.pending_for(call_server)
             conns = RUNTIME.conn_manager
             if pending is None and conns is not None and conns.is_auth_failed(call_server):
@@ -528,7 +616,7 @@ class ToolProcessingMiddleware(Middleware):
         # client was shown fails here, before any permission prompt or
         # upstream round trip (validation.input, on by default).
         published = RUNTIME.tools.published(str(tool_name)) if call_server else None
-        if published is not None and RUNTIME.input_validation and not resuming:
+        if published is not None and RUNTIME.input_validation and not skip_gates:
             arguments = context.message.arguments if context.message else None
             problem = fastvalidate.first_error(arguments or {}, published.parameters)
             if problem is not None:
@@ -539,7 +627,7 @@ class ToolProcessingMiddleware(Middleware):
         # declined elicitation short-circuits before the upstream ever runs.
         if (
             call_server
-            and not resuming
+            and not skip_gates
             and RUNTIME.config is not None
             and context.fastmcp_context is not None
         ):
@@ -554,34 +642,45 @@ class ToolProcessingMiddleware(Middleware):
                     # the client retries with the answer (upstream not called).
                     return InputRequiredToolResult(ask)
 
+        if era_2026 and not resuming and call_server:
+            # Only the upstream's own state goes upstream (never consent:/redo:).
+            _forward_continuation(fctx, cont, call_server)
         try:
             if resuming and request_state is not None and fctx is not None:
                 result = await heldcalls.resume(request_state, _chat_token(), fctx.input_responses)
             elif era_2026 and call_server and fctx is not None:
                 # A handshake-era upstream may ask for input mid-call; hold the
-                # call so the question can go back to this 2026-era client.
-                result = await heldcalls.start(
-                    lambda: _call_healing(context, call_next, call_server),
-                    _chat_token(),
-                    str(fctx.request_id),
-                )
+                # call so the question can go back to this 2026-era client. A
+                # 2026-era upstream's own ask passes through, its state wrapped.
+                server = call_server
+
+                async def _run_upstream() -> ToolResult:
+                    return asks.wrap_upstream(
+                        await _call_healing(context, call_next, server), server
+                    )
+
+                result = await heldcalls.start(_run_upstream, _chat_token(), str(fctx.request_id))
             else:
                 result = await _call_healing(context, call_next, call_server)
                 if fctx is not None and not era_2026:
                     # A 2026-era upstream asks by returning InputRequiredResult,
                     # which this handshake-era client can't take: ask it live.
-                    result = await _answer_upstream_asks(context, call_next, fctx, result)
+                    result = await asks.drive_upstream_asks(
+                        fctx, result, lambda: call_next(context)
+                    )
         except NotFoundError:
             # Protocol error — wrong tool name or server disabled. Re-raise
             # so the MCP layer returns a -32002 JSON-RPC error, not a tool result.
             raise
+        except UrlElicitationRequiredError:
+            raise  # a URL the user must open: -32042 (on_call_tool translates for 2026)
         except ToolError as e:
             # fastmcp masks an MCPError raised inside a tool as a ToolError; a
             # URL elicitation (combiner__authorize_server) must reach the client
             # as itself (-32042 + its elicitations), as the gate above sends it.
-            cause = e.__cause__
-            if isinstance(cause, UrlElicitationRequiredError):
-                raise cause from None
+            url_required = _url_required_in(e)
+            if url_required is not None:
+                raise url_required from None
             # Already a proper tool error — re-raise unchanged, unless the
             # call's own 401 sent the server out-of-band: fastmcp's proxy wraps
             # the resulting closed upstream session as a ToolError, and the
@@ -608,6 +707,10 @@ class ToolProcessingMiddleware(Middleware):
                 f"failed. Use combiner__enable_server to retry authentication."
             ) from e
         except Exception as e:
+            # An upstream's own -32042 arrives as a plain MCPError (code only).
+            url_required = _url_required_in(e)
+            if url_required is not None:
+                raise url_required from None
             server_name = call_server
             error_str = str(e)
 
@@ -857,75 +960,93 @@ def _chat_token() -> str | None:
         return None
 
 
-#: Bound on reverse-bridge rounds for one call (an upstream that keeps asking).
-_MAX_INPUT_ROUNDS = 8
+def _url_required_in(exc: BaseException) -> UrlElicitationRequiredError | None:
+    """A ``-32042`` (URL elicitation required) anywhere in *exc*'s chain: the
+    combiner's own, or an upstream's as it arrived over the wire."""
+    seen: BaseException | None = exc
+    while seen is not None:
+        if isinstance(seen, UrlElicitationRequiredError):
+            return seen
+        if isinstance(seen, MCPError) and seen.error.code == URL_ELICITATION_REQUIRED:
+            try:
+                return UrlElicitationRequiredError.from_error(seen.error)
+            except (ValueError, TypeError, KeyError):
+                return None
+        seen = seen.__cause__ or seen.__context__
+    return None
 
 
-async def _answer_upstream_asks(
-    context: MiddlewareContext[mt.CallToolRequestParams],
-    call_next: CallNext[mt.CallToolRequestParams, ToolResult],
-    fctx: Context,
-    result: ToolResult,
-) -> ToolResult:
-    """The reverse bridge: a handshake-era client, a 2026-era upstream.
-
-    The upstream asks for input by returning an ``InputRequiredResult``. Each
-    request in it is put to this client live (``elicitation/create`` on its
-    session); the call is then repeated with the answers — fastmcp's proxy
-    forwards ``input_responses`` / ``request_state`` to a 2026-era backend —
-    until the upstream returns a real result.
-
-    The answers ride the current wire request's raw params: every fastmcp
-    ``Context`` (the mounted proxy server runs the tool under its own) parses
-    ``input_responses`` / ``request_state`` from there, so that is the one
-    place a retry's answers reach the proxy. Restored afterwards.
-    """
-    params = _raw_request_params(fctx)
-    if params is None:
-        return result  # no wire request to carry answers on: the ask stands
-    rounds = 0
-    try:
-        while isinstance(result, InputRequiredToolResult):
-            rounds += 1
-            if rounds > _MAX_INPUT_ROUNDS:
-                raise ToolError(f"The upstream asked for input more than {_MAX_INPUT_ROUNDS} times")
-            ask = result.input_required
-            answers: dict[str, Any] = {}
-            for key, request in (ask.input_requests or {}).items():
-                answer = await _ask_live(fctx, request)
-                answers[key] = answer.model_dump(by_alias=True, mode="json", exclude_none=True)
-            params["inputResponses"] = answers
-            if ask.request_state is not None:
-                params["requestState"] = ask.request_state
-            else:
-                params.pop("requestState", None)
-            result = await call_next(context)
-    finally:
-        params.pop("inputResponses", None)
-        params.pop("requestState", None)
-    return result
+def _server_of_tool(name: str) -> str | None:
+    """The upstream owning tool or prompt *name* (longest prefix wins)."""
+    if RUNTIME.config is None:
+        return None
+    for sname in sorted(RUNTIME.config.servers, key=len, reverse=True):
+        if name.startswith(sname + "_"):
+            return sname
+    return None
 
 
-def _raw_request_params(fctx: Context) -> dict[str, Any] | None:
-    """The current wire request's raw params dict (shared by every fastmcp
-    ``Context`` of this request), or ``None`` outside one."""
-    rc = fctx.request_context
-    params = rc._srctx.params if rc is not None else None
-    return params if isinstance(params, dict) else None
+def _server_of_uri(uri: str) -> str | None:
+    """The upstream owning namespaced resource *uri* (longest prefix wins)."""
+    if RUNTIME.config is None:
+        return None
+    for sname in sorted(RUNTIME.config.servers, key=len, reverse=True):
+        if un_namespace_uri(uri, sname) is not None:
+            return sname
+    return None
 
 
-async def _ask_live(fctx: Context, request: mt.InputRequest) -> mt.InputResponse:
-    """Put one upstream input request to the handshake-era client."""
-    if not isinstance(request, mt.ElicitRequest) or not isinstance(
-        request.params, mt.ElicitRequestFormParams
-    ):
-        raise ToolError(
-            "The upstream asked for input this client can't be asked for here "
-            f"({type(request).__name__}); only form elicitation is bridged"
-        )
-    answer = await fctx.session.elicit(
-        message=request.params.message,
-        requested_schema=request.params.requested_schema,
-        related_request_id=fctx.request_id,
+def _all_accepted(responses: mt.InputResponses | None) -> bool:
+    """Whether every answer in a retry accepted its ask."""
+    return bool(responses) and all(
+        isinstance(r, mt.ElicitResult) and r.action == "accept" for r in (responses or {}).values()
     )
-    return mt.ElicitResult(action=answer.action, content=answer.content)
+
+
+def _forward_continuation(fctx: Context | None, cont: asks.Continuation, server: str) -> None:
+    """Leave only what *server* should see on the wire request: its own state
+    unwrapped (and its answers) for an ``up:`` retry; nothing otherwise — the
+    combiner's own continuations (consent:, restart:, redo:) never go upstream."""
+    params = asks.wire_params(fctx)
+    if params is None:
+        return
+    if cont.kind == "up":
+        inner = cont.inner(server)
+        if inner is None:
+            params.pop("requestState", None)
+        else:
+            params["requestState"] = inner
+    else:
+        asks.set_continuation(params, None, None)
+
+
+async def _bridge_asks(
+    context: MiddlewareContext[Any],
+    call_next: CallNext[Any, Any],
+    server: str | None,
+    wrap: heldcalls.Wrap,
+) -> Any:
+    """Input asks across eras for a request other than ``tools/call``
+    (resources/read, prompts/get): a handshake client is asked live; a 2026
+    client's request is held while a handshake upstream asks, and a 2026
+    upstream's own ask passes through with its state wrapped."""
+    fctx = context.fastmcp_context
+    if server is None or fctx is None:
+        return await call_next(context)
+    if not _is_2026_request(fctx):
+        result = await call_next(context)
+        return await asks.drive_upstream_asks(fctx, result, lambda: call_next(context))
+    cont = asks.classify(fctx.request_state)
+    if cont.kind in ("up", "redo") and not cont.owned_by(server):
+        raise ToolError("This answer belongs to a different request. Make the request again.")
+    if cont.kind == "held":
+        return await heldcalls.resume(fctx.request_state or "", _chat_token(), fctx.input_responses)
+    _forward_continuation(fctx, cont, server)
+
+    async def _run_upstream() -> Any:
+        return asks.wrap_upstream(await call_next(context), server)
+
+    try:
+        return await heldcalls.start(_run_upstream, _chat_token(), str(fctx.request_id), wrap)
+    except UrlElicitationRequiredError as e:
+        return wrap(asks.url_asks(e, server))

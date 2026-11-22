@@ -35,22 +35,35 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from fastmcp.client.elicitation import create_elicitation_callback
+from fastmcp.client.roots import RootsList, create_roots_callback
+from fastmcp.client.sampling import create_sampling_callback
 from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_context
 from fastmcp.server.providers.proxy import (
     ProxyClient,
     _make_restoring_handler,
     default_proxy_elicitation_handler,
+    default_proxy_roots_handler,
+    default_proxy_sampling_handler,
 )
-from fastmcp.tools import ToolResult
 from fastmcp.tools.base import InputRequiredToolResult
 from mcp.types import (
+    CreateMessageRequest,
+    CreateMessageRequestParams,
+    CreateMessageResult,
+    CreateMessageResultWithTools,
     ElicitRequest,
     ElicitRequestFormParams,
     ElicitRequestParams,
+    ElicitRequestURLParams,
     ElicitResult,
+    InputRequest,
     InputRequiredResult,
+    InputResponse,
     InputResponses,
+    ListRootsRequest,
+    ListRootsResult,
+    SamplingMessage,
 )
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 
@@ -73,11 +86,16 @@ _TOKEN_HEADER = "x-mcp-combiner-session"
 
 @dataclass
 class _Ask:
-    """One question the upstream is blocked on."""
+    """One question the upstream is blocked on (elicitation, sampling or roots)."""
 
     key: str
-    request: ElicitRequest
-    answer: asyncio.Future[ElicitResult]
+    request: InputRequest
+    answer: asyncio.Future[InputResponse | None]
+
+
+#: Wraps a held call's question in the fastmcp result type of its request
+#: (tools/call, resources/read or prompts/get).
+Wrap = Callable[[InputRequiredResult], Any]
 
 
 @dataclass
@@ -86,8 +104,9 @@ class HeldCall:
 
     token: str | None
     origin_request_id: str
+    wrap: Wrap = InputRequiredToolResult
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
-    task: asyncio.Task[ToolResult] | None = None
+    task: asyncio.Task[Any] | None = None
     asks: asyncio.Queue[_Ask] = field(default_factory=asyncio.Queue)
     pending: dict[str, _Ask] = field(default_factory=dict)
     expiry: asyncio.TimerHandle | None = None
@@ -138,22 +157,24 @@ def resumes(request_state: str | None) -> bool:
 
 
 async def start(
-    run: Callable[[], Awaitable[ToolResult]], token: str | None, request_id: str
-) -> ToolResult:
-    """Run an upstream call for a 2026-era request, holding it if it asks."""
-    held = HeldCall(token=token, origin_request_id=request_id)
+    run: Callable[[], Awaitable[Any]],
+    token: str | None,
+    request_id: str,
+    wrap: Wrap = InputRequiredToolResult,
+) -> Any:
+    """Run an upstream request for a 2026-era client, holding it if it asks.
+    *wrap* puts a question in the request's own fastmcp result type."""
+    held = HeldCall(token=token, origin_request_id=request_id, wrap=wrap)
     _register(held)
 
-    async def _run() -> ToolResult:
+    async def _run() -> Any:
         return await run()
 
     held.task = asyncio.create_task(_run(), name=f"held-call-{held.id[:8]}")
     return await _await_outcome(held)
 
 
-async def resume(
-    request_state: str, token: str | None, responses: InputResponses | None
-) -> ToolResult:
+async def resume(request_state: str, token: str | None, responses: InputResponses | None) -> Any:
     """Continue a held call from its client's retry."""
     held = _by_id.get(request_state.removeprefix(STATE_PREFIX))
     if held is None or held.token != token:
@@ -169,16 +190,13 @@ async def resume(
         {k: (type(v).__name__, getattr(v, "action", None)) for k, v in answered.items()},
     )
     for key, ask in list(held.pending.items()):
-        response = answered.get(key)
         if not ask.answer.done():
-            ask.answer.set_result(
-                response if isinstance(response, ElicitResult) else ElicitResult(action="cancel")
-            )
+            ask.answer.set_result(answered.get(key))
         del held.pending[key]
     return await _await_outcome(held)
 
 
-async def _await_outcome(held: HeldCall) -> ToolResult:
+async def _await_outcome(held: HeldCall) -> Any:
     """The call's result, or an InputRequiredResult for its next question."""
     task = held.task
     if task is None:
@@ -192,7 +210,7 @@ async def _await_outcome(held: HeldCall) -> ToolResult:
     if next_ask in done and not task.done():
         ask = next_ask.result()
         held.pending[ask.key] = ask
-        return InputRequiredToolResult(
+        return held.wrap(
             InputRequiredResult(
                 input_requests={ask.key: ask.request},
                 request_state=STATE_PREFIX + held.id,
@@ -204,6 +222,21 @@ async def _await_outcome(held: HeldCall) -> ToolResult:
             ask.answer.cancel()
     _forget(held)
     return task.result()  # re-raises the upstream call's own exception
+
+
+async def _park(held: HeldCall, kind: str, request: InputRequest) -> InputResponse | None:
+    """Hand *request* to the held call's client; its answer, or ``None`` when
+    it never came (expired, abandoned, or the retry didn't answer it)."""
+    ask = _Ask(
+        key=f"{kind}-{uuid.uuid4().hex[:8]}",
+        request=request,
+        answer=asyncio.get_running_loop().create_future(),
+    )
+    await held.asks.put(ask)
+    try:
+        return await ask.answer
+    except asyncio.CancelledError:
+        return None
 
 
 async def bridged_elicitation_handler(
@@ -218,24 +251,48 @@ async def bridged_elicitation_handler(
     held = _held_for_current_request()
     if held is None:
         return await default_proxy_elicitation_handler(message, response_type, params, context)
-    requested_schema = (
-        params.requested_schema
-        if isinstance(params, ElicitRequestFormParams)
-        else {"type": "object", "properties": {}}
-    )
-    ask = _Ask(
-        key=f"elicit-{uuid.uuid4().hex[:8]}",
-        request=ElicitRequest(
-            params=ElicitRequestFormParams(message=message, requested_schema=requested_schema)
-        ),
-        answer=asyncio.get_running_loop().create_future(),
-    )
-    await held.asks.put(ask)
-    try:
-        return await ask.answer
-    except asyncio.CancelledError:
-        # Expired or abandoned: tell the upstream the user didn't answer.
-        return ElicitResult(action="cancel")
+    if isinstance(params, ElicitRequestURLParams):
+        # 2026 URL asks carry no elicitationId: the upstream's stays here.
+        request = ElicitRequest(params=ElicitRequestURLParams(message=message, url=params.url))
+    else:
+        request = ElicitRequest(
+            params=ElicitRequestFormParams(
+                message=message, requested_schema=params.requested_schema
+            )
+        )
+    answer = await _park(held, "elicit", request)
+    # Unanswered: tell the upstream the user didn't answer.
+    return answer if isinstance(answer, ElicitResult) else ElicitResult(action="cancel")
+
+
+async def bridged_sampling_handler(
+    messages: list[SamplingMessage],
+    params: CreateMessageRequestParams,
+    context: Any,
+) -> CreateMessageResult | CreateMessageResultWithTools:
+    """The proxy client's sampling handler: parked on a 2026-era request's
+    held call, forwarded live otherwise."""
+    held = _held_for_current_request()
+    if held is None:
+        return await default_proxy_sampling_handler(messages, params, context)
+    answer = await _park(held, "sample", CreateMessageRequest(params=params))
+    if isinstance(answer, (CreateMessageResult, CreateMessageResultWithTools)):
+        return answer
+    # create_sampling_callback turns this into an error for the upstream.
+    raise RuntimeError("The client did not answer the sampling request")
+
+
+async def bridged_roots_handler(context: Any) -> RootsList:
+    """The proxy client's roots handler: parked on a 2026-era request's held
+    call, forwarded live otherwise."""
+    held = _held_for_current_request()
+    if held is None:
+        return await default_proxy_roots_handler(context)
+    answer = await _park(held, "roots", ListRootsRequest())
+    if isinstance(answer, ListRootsResult):
+        roots: RootsList = list(answer.roots)
+        return roots
+    raise RuntimeError("The client did not answer the roots request")
 
 
 def _held_for_current_request() -> HeldCall | None:
@@ -251,16 +308,30 @@ def _held_for_current_request() -> HeldCall | None:
     return _by_origin.get((token or None, str(rc.request_id)))
 
 
-def bind_bridged_elicitation(client: ProxyClient[Any]) -> None:
-    """Route *client*'s upstream elicitations through :func:`bridged_elicitation_handler`.
+def bind_bridged_asks(client: ProxyClient[Any]) -> None:
+    """Route *client*'s upstream elicitation, sampling and roots requests
+    through the bridged handlers above.
 
-    Only when fastmcp installed its own default forwarding handler (a caller
-    that passed an explicit ``elicitation_handler`` keeps it). Call after
+    Only for the ones fastmcp installed its own default forwarding handler for
+    (a caller that passed an explicit handler keeps it). Call after
     construction AND from ``_bind_restoring_handlers`` overrides, since a
     per-chat ``Client.new()`` clone rebinds the defaults.
     """
-    if "elicitation_handler" not in client._proxy_restoring_handler_keys:
-        return
-    client._session_kwargs["elicitation_callback"] = create_elicitation_callback(
-        _make_restoring_handler(bridged_elicitation_handler, client._proxy_rc_ref)
-    )
+    keys = client._proxy_restoring_handler_keys
+    rc_ref = client._proxy_rc_ref
+    if "elicitation_handler" in keys:
+        client._session_kwargs["elicitation_callback"] = create_elicitation_callback(
+            _make_restoring_handler(bridged_elicitation_handler, rc_ref)
+        )
+    if "sampling_handler" in keys:
+        client._session_kwargs["sampling_callback"] = create_sampling_callback(
+            _make_restoring_handler(bridged_sampling_handler, rc_ref)
+        )
+    if "roots" in keys:
+        client._session_kwargs["list_roots_callback"] = create_roots_callback(
+            _make_restoring_handler(bridged_roots_handler, rc_ref)
+        )
+
+
+#: The pre-0.25 name (elicitation was the only ask held calls carried).
+bind_bridged_elicitation = bind_bridged_asks
