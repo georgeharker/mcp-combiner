@@ -4,7 +4,7 @@ All notable changes to the combiner are documented here. The version moves in
 lockstep with the rest of the repo (`scripts/bump-version.sh`); releases are
 tagged `vX.Y.Z`.
 
-## [Unreleased]
+## [0.25.0] — 2026-11-22
 
 ### Added
 
@@ -18,6 +18,14 @@ tagged `vX.Y.Z`.
   client gets an upstream's `-32042`, or the combiner's own OAuth link, as a URL
   question.
 - Mock server `--era-asks`: one fixture per kind of question in each revision.
+
+### Changed
+
+- **An upstream's own `-32042` (URL elicitation required) reaches the client as
+  itself.** It used to become a tool error saying "URL elicitation required",
+  without the URL. A client that declared URL-mode elicitation now gets the
+  real `-32042` with the URL, as it would over a direct connection. Any other
+  client gets a tool error that includes the link to open.
 
 ### Fixed
 

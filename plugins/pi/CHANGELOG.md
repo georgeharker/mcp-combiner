@@ -6,6 +6,14 @@ tagged `vX.Y.Z`. The extension runs the matching mcp-combiner release, so each
 entry also summarises the combiner's changes; the full list is in
 [the combiner's changelog](https://github.com/georgeharker/mcp-combiner/blob/main/combiner/CHANGELOG.md).
 
+## [0.25.0] - 2026-11-22
+
+No extension changes. The combiner now carries every kind of server question
+(a form, a URL to open, sampling, roots) between protocol revisions, on tool
+calls, resource reads and prompts. A URL you agreed to open isn't asked again
+while the browser step runs. It also fixes a consent-prompt loop between 2026
+clients and 2026 servers. See the combiner's changelog.
+
 ## [0.24.5] - 2026-11-21
 
 ### Fixed
