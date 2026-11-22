@@ -648,12 +648,22 @@ class MockServer:
             description="Handshake: asks for a URL to be opened (URL-mode elicitation).",
         )
         async def mock__elicit_url(ctx: Context) -> str:
+            eid = uuid.uuid4().hex
             result = await ctx.session.elicit_url(
                 message="Open the step",
                 url=url,
-                elicitation_id=uuid.uuid4().hex,
+                elicitation_id=eid,
                 related_request_id=ctx.request_id,
             )
+            if result.action == "accept":
+                # The handshake signal that the out-of-band step finished; a
+                # 2026 client has no such notification and must never get it.
+                await ctx.session.send_notification(
+                    types.ElicitCompleteNotification(
+                        params=types.ElicitCompleteNotificationParams(elicitation_id=eid)
+                    ),
+                    related_request_id=ctx.request_id,
+                )
             return f"elicit-url: {result.action}"
 
         @mcp_srv.tool(name="mock__sample", description="Handshake: asks the client to sample.")

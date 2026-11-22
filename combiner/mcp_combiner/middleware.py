@@ -680,7 +680,7 @@ class ToolProcessingMiddleware(Middleware):
             # as itself (-32042 + its elicitations), as the gate above sends it.
             url_required = _url_required_in(e)
             if url_required is not None:
-                raise url_required from None
+                raise _for_client(url_required, context.fastmcp_context) from None
             # Already a proper tool error — re-raise unchanged, unless the
             # call's own 401 sent the server out-of-band: fastmcp's proxy wraps
             # the resulting closed upstream session as a ToolError, and the
@@ -710,7 +710,7 @@ class ToolProcessingMiddleware(Middleware):
             # An upstream's own -32042 arrives as a plain MCPError (code only).
             url_required = _url_required_in(e)
             if url_required is not None:
-                raise url_required from None
+                raise _for_client(url_required, context.fastmcp_context) from None
             server_name = call_server
             error_str = str(e)
 
@@ -976,6 +976,28 @@ def _url_required_in(exc: BaseException) -> UrlElicitationRequiredError | None:
     return None
 
 
+def _url_supported(fctx: Context | None) -> bool:
+    """Whether the requesting client declared URL-mode elicitation (on the
+    handshake at initialize; on 2026 in each request's envelope)."""
+    if fctx is None:
+        return False
+    try:
+        caps = fctx.session.client_capabilities
+    except (RuntimeError, AttributeError):
+        return False
+    return caps is not None and caps.elicitation is not None and caps.elicitation.url is not None
+
+
+def _for_client(error: UrlElicitationRequiredError, fctx: Context | None) -> Exception:
+    """*error* for a client that can take it (``-32042``); for one that can't
+    open URLs on request, a tool error carrying the link(s) instead, since the
+    text is the only channel such a client has to the user."""
+    if _url_supported(fctx):
+        return error
+    steps = "; ".join(f"{e.message}: {e.url}" for e in error.elicitations) or str(error)
+    return ToolError(f"A step in the browser is needed first ({steps}). Open it, then retry.")
+
+
 def _server_of_tool(name: str) -> str | None:
     """The upstream owning tool or prompt *name* (longest prefix wins)."""
     if RUNTIME.config is None:
@@ -1049,4 +1071,6 @@ async def _bridge_asks(
     try:
         return await heldcalls.start(_run_upstream, _chat_token(), str(fctx.request_id), wrap)
     except UrlElicitationRequiredError as e:
+        if not _url_supported(fctx):
+            raise _for_client(e, fctx) from None
         return wrap(asks.url_asks(e, server))

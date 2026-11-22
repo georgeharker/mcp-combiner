@@ -26,6 +26,7 @@ from conftest import CombinerHandle, ProcFactory, http_mock_entry, write_servers
 from fakes import content_text
 from fastmcp import Client
 from fastmcp.client.elicitation import ElicitResult
+from fastmcp.client.messages import MessageHandler
 from fastmcp.exceptions import ToolError
 from mcp.shared.exceptions import MCPError
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
@@ -111,6 +112,17 @@ def _echo(text: str, tag: str) -> dict[str, Any]:
 
 
 FORM = {"action": "accept", "content": {"name": "Ada"}}
+
+
+class _Notes(MessageHandler):
+    """Records the methods of the notifications a client receives."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.seen: list[str] = []
+
+    async def on_notification(self, message: mt.ServerNotification) -> None:
+        self.seen.append(str(getattr(message, "method", type(message).__name__)))
 
 
 # ── a handshake client, a 2026 upstream (the reverse bridge) ────────
@@ -220,6 +232,26 @@ class Test2026ClientHandshakeUpstream:
         assert text == "elicit-url: accept"
         assert user.urls == ["https://example.invalid/step"]
 
+    async def test_an_upstream_url_complete_notice_never_reaches_a_2026_client(
+        self, procs: ProcFactory, tmp_path: Path
+    ) -> None:
+        combiner = await self._start(procs, tmp_path)
+        user = _User()
+        notes = _Notes()
+        url = f"{combiner.mcp_url}/chat-nh-url3"
+        async with user.client(url, handshake=False, message_handler=notes) as c:
+            text = content_text(await c.call_tool("mockup_mock__elicit_url", {}))
+        assert text == "elicit-url: accept"
+        assert not [n for n in notes.seen if "elicitation/complete" in n], notes.seen
+
+    async def test_an_upstream_32042_to_a_client_without_url_support_is_a_readable_error(
+        self, procs: ProcFactory, tmp_path: Path
+    ) -> None:
+        combiner = await self._start(procs, tmp_path)
+        async with Client(f"{combiner.mcp_url}/chat-nh-url4") as c:  # no elicitation handler
+            with pytest.raises(ToolError, match=r"https://example\.invalid/step"):
+                await c.call_tool("mockup_mock__url_required", {"times": 1})
+
     async def test_sampling(self, procs: ProcFactory, tmp_path: Path) -> None:
         combiner = await self._start(procs, tmp_path)
         user = _User()
@@ -287,3 +319,59 @@ class Test2026Both:
             prompt = _prompt_text(await c.get_prompt("mockup_guard_prompt"))
         assert _echo(resource, "resource-guard") == FORM
         assert _echo(prompt, "prompt-guard") == FORM
+
+
+# ── both on the handshake: everything passes straight through ──────
+
+
+class TestHandshakeBoth:
+    """The pre-0.25 path, pinned: the bridged proxy callbacks hand handshake
+    requests to fastmcp's own forwarding, unchanged."""
+
+    async def _start(self, procs: ProcFactory, tmp_path: Path) -> CombinerHandle:
+        return await _combiner(procs, tmp_path, upstream_2026=False, offer_downstream=False)
+
+    async def test_every_kind_on_tools(self, procs: ProcFactory, tmp_path: Path) -> None:
+        combiner = await self._start(procs, tmp_path)
+        user = _User()
+        async with user.client(f"{combiner.mcp_url}/chat-hh-all1", handshake=True) as c:
+            assert c.protocol_version not in MODERN_PROTOCOL_VERSIONS
+            url = content_text(await c.call_tool("mockup_mock__elicit_url", {}))
+            sample = content_text(await c.call_tool("mockup_mock__sample", {}))
+            roots = content_text(await c.call_tool("mockup_mock__list_roots", {}))
+        assert url == "elicit-url: accept"
+        assert sample == "sample: hi there"
+        assert roots == "roots: " + json.dumps(ROOTS)
+        assert user.urls == ["https://example.invalid/step"]
+        assert user.samples == 1
+
+    async def test_resource_and_prompt(self, procs: ProcFactory, tmp_path: Path) -> None:
+        combiner = await self._start(procs, tmp_path)
+        user = _User()
+        async with user.client(f"{combiner.mcp_url}/chat-hh-rp1", handshake=True) as c:
+            resource = _resource_text(await c.read_resource(ELICIT_URI))
+            prompt = _prompt_text(await c.get_prompt("mockup_elicit_prompt"))
+        assert _echo(resource, "resource-elicit") == FORM
+        assert _echo(prompt, "prompt-elicit") == FORM
+
+    async def test_an_upstream_32042_reaches_a_url_capable_client_as_itself(
+        self, procs: ProcFactory, tmp_path: Path
+    ) -> None:
+        combiner = await self._start(procs, tmp_path)
+        user = _User()
+        async with user.client(f"{combiner.mcp_url}/chat-hh-url2", handshake=True) as c:
+            with pytest.raises(MCPError) as caught:
+                await c.call_tool("mockup_mock__url_required", {"times": 1})
+        assert caught.value.error.code == -32042
+        assert isinstance(caught.value.error.data, dict)
+        (elicitation,) = caught.value.error.data["elicitations"]
+        assert elicitation["url"] == "https://example.invalid/step"
+
+    async def test_an_upstream_32042_to_a_client_without_url_support_is_a_readable_error(
+        self, procs: ProcFactory, tmp_path: Path
+    ) -> None:
+        combiner = await self._start(procs, tmp_path)
+        url = f"{combiner.mcp_url}/chat-hh-url3"
+        async with Client(url, mode=CLIENT_CONNECT_MODE) as c:  # no elicitation handler
+            with pytest.raises(ToolError, match=r"https://example\.invalid/step"):
+                await c.call_tool("mockup_mock__url_required", {"times": 1})
