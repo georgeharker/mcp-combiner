@@ -122,3 +122,14 @@ def test_effective_disabled_joins_the_blocklist_and_collections(cfg: CombinerCon
     RUNTIME.sessions.set_collection((False, "sid-z"), "work", False)
     RUNTIME.sessions.disable("sid-z", "plain")
     assert RUNTIME.sessions.effective_disabled("sid-z") == {"plain", "ableton", "jira"}
+
+
+def test_a_server_enabled_for_everyone_is_visible_to_chats_that_follow_the_combiner(
+    cfg: CombinerConfig,
+) -> None:
+    """combiner__enable_server on a server whose collection is off: it runs,
+    and every chat that hasn't set that collection itself sees it."""
+    RUNTIME.server_overrides["ableton"] = True
+    assert "ableton" not in chatcollections.hidden_for(cfg, {}, set())
+    # A chat that turned the collection off still doesn't see it.
+    assert "ableton" in chatcollections.hidden_for(cfg, {"music": False}, set())

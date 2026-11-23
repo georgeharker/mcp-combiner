@@ -44,10 +44,14 @@ def governed(config: CombinerConfig) -> Iterator[tuple[str, ServerConfig]]:
             yield name, srv
 
 
-def on_for_chat(config: CombinerConfig, srv: ServerConfig, state: dict[str, bool]) -> bool:
-    """Whether any of *srv*'s collections is on for a chat with *state*."""
+def on_for_chat(
+    config: CombinerConfig, srv: ServerConfig, state: dict[str, bool], forced_on: bool = False
+) -> bool:
+    """Whether any of *srv*'s collections is on for a chat with *state*. A
+    server turned on explicitly for everyone (*forced_on*: combiner__enable_server)
+    counts as on for every collection the chat hasn't set itself."""
     return any(
-        state.get(c, config.collections[c].enabled)
+        state.get(c, forced_on or config.collections[c].enabled)
         for c in srv.collections
         if c in config.collections
     )
@@ -56,10 +60,12 @@ def on_for_chat(config: CombinerConfig, srv: ServerConfig, state: dict[str, bool
 def hidden_for(config: CombinerConfig, state: dict[str, bool], forced: set[str]) -> set[str]:
     """The servers a chat with collection *state* and explicitly-on *forced*
     servers doesn't see because of collections."""
+    overrides = RUNTIME.server_overrides
     return {
         name
         for name, srv in governed(config)
-        if name not in forced and not on_for_chat(config, srv, state)
+        if name not in forced
+        and not on_for_chat(config, srv, state, forced_on=overrides.get(name) is True)
     }
 
 
