@@ -68,44 +68,59 @@ end)
 print("=== chat_tools.plan ===")
 
 local P = "mcp:"
+local NONE = {}
 
-test("first sync only removes what the chat can't see", function()
-    local current = { ["mcp:github"] = {}, ["mcp:ableton"] = {} }
-    local add, remove = chat_tools.plan(current, set({ "github" }), nil, set({ "github", "ableton" }), P)
+test("a server missing from the list (still warming up) keeps its group", function()
+    local current = { ["mcp:github"] = {}, ["mcp:slow-oauth"] = {} }
+    local add, remove = chat_tools.plan(current, set({ "github" }), nil, NONE, NONE, P)
     assert_eq(add, {}, "nothing added on a first sync")
-    assert_eq(remove, { "mcp:ableton" }, "hidden server's group removed")
+    assert_eq(remove, {}, "nothing removed: slow-oauth isn't off, just not listed yet")
+end)
+
+test("a server the combiner has off for this chat loses its group", function()
+    local current = { ["mcp:github"] = {}, ["mcp:ableton"] = {} }
+    local _, remove = chat_tools.plan(current, set({ "github" }), nil, set({ "ableton" }), NONE, P)
+    assert_eq(remove, { "mcp:ableton" }, "removed")
 end)
 
 test("a server newly visible gains its group", function()
     local current = { ["mcp:github"] = {} }
-    local add, remove =
-        chat_tools.plan(current, set({ "github", "ableton" }), set({ "github" }), set({ "github", "ableton" }), P)
+    local add, remove = chat_tools.plan(current, set({ "github", "ableton" }), set({ "github" }), NONE, NONE, P)
     assert_eq(add, { "mcp:ableton" }, "added")
     assert_eq(remove, {}, "nothing removed")
 end)
 
 test("a visible server the user never added stays out", function()
-    local add = chat_tools.plan({}, set({ "github" }), set({ "github" }), set({ "github" }), P)
+    local add = chat_tools.plan({}, set({ "github" }), set({ "github" }), NONE, NONE, P)
     assert_eq(add, {}, "no forced groups")
 end)
 
-test("the aggregate stays while the chat sees what the registry has", function()
+test("the aggregate stays while none of its servers is off", function()
     local current = { ["mcp:combiner"] = {} }
-    local add, remove = chat_tools.plan(current, set({ "github", "jira" }), nil, set({ "github", "jira" }), P)
-    assert_eq(add, {}, "no per-server groups")
+    local agg = set({ "github", "jira" })
+    local add, remove = chat_tools.plan(current, set({ "github" }), nil, NONE, agg, P)
+    assert_eq(add, {}, "no per-server groups (jira just isn't listed yet)")
     assert_eq(remove, {}, "aggregate kept")
 end)
 
-test("the aggregate becomes per-server groups once the chat's view differs", function()
+test("the aggregate becomes per-server groups once one of its servers is off", function()
     local current = { ["mcp:combiner"] = {} }
-    local add, remove = chat_tools.plan(current, set({ "github" }), nil, set({ "github", "jira" }), P)
-    assert_eq(add, { "mcp:github" }, "per-server group for what it sees")
+    local agg = set({ "github", "jira" })
+    local add, remove = chat_tools.plan(current, set({ "github" }), nil, set({ "jira" }), agg, P)
+    assert_eq(add, { "mcp:github" }, "per-server groups for the rest")
     assert_eq(remove, { "mcp:combiner" }, "aggregate dropped")
+end)
+
+test("an aggregate chat also gets servers the aggregate doesn't cover", function()
+    local current = { ["mcp:combiner"] = {} }
+    local add, remove = chat_tools.plan(current, set({ "github", "ableton" }), nil, NONE, set({ "github" }), P)
+    assert_eq(add, { "mcp:ableton" }, "collection turned on just for this chat")
+    assert_eq(remove, {}, "aggregate kept")
 end)
 
 test("non-MCP groups are left alone", function()
     local current = { ["files"] = {}, ["mcp:gone"] = {} }
-    local _, remove = chat_tools.plan(current, set({}), nil, set({}), P)
+    local _, remove = chat_tools.plan(current, set({}), nil, set({ "gone", "files" }), NONE, P)
     assert_eq(remove, { "mcp:gone" }, "only mcp groups")
 end)
 
