@@ -50,7 +50,12 @@ import { createMcpTool } from "./client/proxy-tool.js"
 import { openInBrowser } from "./client/widget-support.js"
 import { agentDir, loadSettings, settingsPath } from "./client/settings.js"
 import { resolveSessionConfig, type SessionConfig } from "./client/config-ladder.js"
-import { metaToolCall, statusText as controlStatusText } from "./client/control.js"
+import {
+    collectionCall,
+    collectionsText,
+    metaToolCall,
+    statusText as controlStatusText,
+} from "./client/control.js"
 import { openCombinerPanel } from "./client/panel.js"
 import { syncPromptCommands } from "./client/prompts.js"
 import { updateFooter, type RegisterProgress } from "./client/footer.js"
@@ -496,12 +501,13 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
 
     // ── /mcp-combiner command: inspect + drive the extension and the combiner ──
     // verbs: status (combiner health + this session's view), enable/disable/
-    // restart-server <srv> (combiner meta-tools through our client), system-prompt
+    // restart-server <srv> (combiner meta-tools through our client), collections /
+    // collection on|off|reset <name> (collections for this chat only), system-prompt
     // (show the injected directive), install-config [path] (write the shared mcp.json
     // combiner entry — legacy pairing with pi-mcp-adapter, now also read by our ladder).
     const combinerCommandSpec: CommandSpec = {
         description:
-            "mcp-combiner — verbs: status, enable <srv>, disable <srv>, restart-server <srv>, system-prompt, install-config [path]",
+            "mcp-combiner — verbs: status, enable <srv>, disable <srv>, restart-server <srv>, collections, collection on|off|reset <name>, system-prompt, install-config [path]",
         getArgumentCompletions: (prefix) => completeVerbs(prefix),
         handler: (args, ctx) => {
             const [verb, ...rest] = args.trim().split(/\s+/)
@@ -570,6 +576,35 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
                 void metaToolCall(connection, v, server)
                     .then((t) => uiNotifySafe(t, "info"))
                     .catch((e) => uiNotifySafe(`${v} failed (${e instanceof Error ? e.message : String(e)})`, "error"))
+                return
+            }
+            if (v === "collections" || v === "collection") {
+                if (!connection) {
+                    ctx.ui?.notify?.("mcp-combiner: client half disabled", "warn")
+                    return
+                }
+                const [action, name] = rest
+                if (v === "collections" || !action) {
+                    void collectionsText(connection)
+                        .then((t) => uiNotifySafe(t, "info"))
+                        .catch((e) =>
+                            uiNotifySafe(`collections failed (${e instanceof Error ? e.message : String(e)})`, "error"),
+                        )
+                    return
+                }
+                if (action !== "on" && action !== "off" && action !== "reset") {
+                    ctx.ui?.notify?.("mcp-combiner: collection on|off|reset <name>", "warn")
+                    return
+                }
+                if (!name) {
+                    ctx.ui?.notify?.(`mcp-combiner: collection ${action} needs a collection name`, "warn")
+                    return
+                }
+                void collectionCall(connection, action, name)
+                    .then((t) => uiNotifySafe(t, "info"))
+                    .catch((e) =>
+                        uiNotifySafe(`collection ${action} failed (${e instanceof Error ? e.message : String(e)})`, "error"),
+                    )
                 return
             }
             if (v === "system-prompt") {
@@ -645,7 +680,17 @@ function sessionToken(event: SessionStartEvent, ctx: ExtensionContext): string {
 // directive this extension injects — the show-command pattern from pi-custom-system-prompt,
 // since `before_agent_start` injections are per-turn and never appear in Pi's own
 // `/system-prompt` (which reports the base prompt only).
-const COMMAND_VERBS = ["status", "panel", "enable", "disable", "restart-server", "system-prompt", "install-config"]
+const COMMAND_VERBS = [
+    "status",
+    "panel",
+    "enable",
+    "disable",
+    "restart-server",
+    "collections",
+    "collection",
+    "system-prompt",
+    "install-config",
+]
 function completeVerbs(prefix: string): AutocompleteItem[] | null {
     const p = prefix.trim()
     const matches = COMMAND_VERBS.filter((v) => v.startsWith(p))
