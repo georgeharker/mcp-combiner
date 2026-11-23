@@ -239,6 +239,8 @@ refreshed on connect/changes and every 30s; honest degradation when unreachable.
 | _(none)_ / `status`                           | Connection state, per-server glyph table, session view       |
 | `panel`                                       | Interactive panel (below)                                    |
 | `enable` / `disable` / `restart-server <srv>` | Drive the combiner's meta-tools                              |
+| `collections`                                 | Each collection: on or off for this chat and for the combiner, and its servers |
+| `collection on\|off\|reset <name>`            | A collection on or off for this chat only, or back to the combiner's setting |
 | `system-prompt`                               | Show the injected directive                                  |
 | `install-config [path]`                       | Legacy: write the shared-`mcp.json` entry for pi-mcp-adapter |
 
