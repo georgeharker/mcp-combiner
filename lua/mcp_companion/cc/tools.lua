@@ -153,6 +153,87 @@ local function _make_output(display_name)
     }
 end
 
+--- Register one server's tools (and its group) in CodeCompanion's MCP registry.
+--- Shared by the global registration and the per-chat sync (cc/chat_tools.lua),
+--- which registers servers only some chats see. Returns the tool count.
+--- @param server table state.servers entry ({ name, tools = { {_namespaced, _display, ...} } })
+--- @param client table the combiner client calls fall back to (a chat's own client wins)
+--- @param sysp_enabled boolean whether to attach the per-tool system prompts
+--- @return integer
+function M.register_server(server, client, sysp_enabled)
+    local cc_mcp_ok, cc_mcp = pcall(require, "codecompanion.mcp")
+    if not cc_mcp_ok then
+        return 0
+    end
+    local server_tools = {} -- tool_name -> tool_config
+    local tool_keys = {}
+
+    for _, tool in ipairs(server.tools or {}) do
+        -- tool._display = short name (e.g. "echo")
+        -- tool._namespaced = full combiner name (e.g. "everything_echo")
+        local display = tool._display or tool.name
+        local namespaced = tool._namespaced or tool.name
+        -- Use the namespaced name as the key (already unique and matches combiner)
+        local key = namespaced
+
+        -- Capture loop variables for the closure
+        local captured_display = display
+        local captured_namespaced = namespaced
+        local captured_description = tool.description or ("MCP tool: " .. display)
+        local captured_input_schema = schema.normalize(tool.inputSchema)
+
+        server_tools[key] = {
+            description = captured_description,
+            callback = function()
+                return {
+                    name = key,
+                    cmds = {
+                        _make_combiner_cmd(client, captured_namespaced, captured_display, server.name),
+                    },
+                    system_prompt = sysp_enabled and function(_group_config, _ctx)
+                        return string.format(
+                            "You can use the `%s` tool from the `%s` MCP server to: %s\n",
+                            captured_display,
+                            server.name,
+                            captured_description
+                        )
+                    end or nil,
+                    output = _make_output(captured_display),
+                    schema = {
+                        type = "function",
+                        ["function"] = {
+                            name = key,
+                            description = captured_description,
+                            parameters = captured_input_schema,
+                        },
+                    },
+                }
+            end,
+        }
+
+        table.insert(tool_keys, key)
+    end
+
+    -- Register this server's tools with CC's MCP registry
+    if #tool_keys > 0 then
+        local group = {
+            description = string.format("All tools from the `%s` MCP server", server.name),
+            tools = tool_keys,
+            system_prompt = sysp_enabled and function(_group_config, _ctx)
+                return string.format(
+                    "You have access to the `%s` MCP server with %d tool(s).\n",
+                    server.name,
+                    #tool_keys
+                )
+            end or nil,
+            opts = { collapse_tools = true },
+        }
+
+        cc_mcp.register_tools(server.name, server_tools, group)
+    end
+    return #tool_keys
+end
+
 --- Register all MCP tools from the combiner into CodeCompanion's MCP registry.
 --- Uses CC's `mcp.register_tools()` API which persists across config reloads.
 function M.register()
@@ -191,80 +272,13 @@ function M.register()
 
     for _, server in ipairs(servers) do
         -- Skip the internal _combiner pseudo-server
-        if server.name == "_combiner" then
-            goto continue
+        if server.name ~= "_combiner" then
+            local n = M.register_server(server, client, sysp_enabled)
+            if n > 0 then
+                registered_servers = registered_servers + 1
+                registered_tools = registered_tools + n
+            end
         end
-
-        local server_tools = {} -- tool_name -> tool_config
-        local tool_keys = {}
-
-        for _, tool in ipairs(server.tools or {}) do
-            -- tool._display = short name (e.g. "echo")
-            -- tool._namespaced = full combiner name (e.g. "everything_echo")
-            local display = tool._display or tool.name
-            local namespaced = tool._namespaced or tool.name
-            -- Use the namespaced name as the key (already unique and matches combiner)
-            local key = namespaced
-
-            -- Capture loop variables for the closure
-            local captured_display = display
-            local captured_namespaced = namespaced
-            local captured_description = tool.description or ("MCP tool: " .. display)
-            local captured_input_schema = schema.normalize(tool.inputSchema)
-
-            server_tools[key] = {
-                description = captured_description,
-                callback = function()
-                    return {
-                        name = key,
-                        cmds = {
-                            _make_combiner_cmd(client, captured_namespaced, captured_display, server.name),
-                        },
-                        system_prompt = sysp_enabled and function(_group_config, _ctx)
-                            return string.format(
-                                "You can use the `%s` tool from the `%s` MCP server to: %s\n",
-                                captured_display,
-                                server.name,
-                                captured_description
-                            )
-                        end or nil,
-                        output = _make_output(captured_display),
-                        schema = {
-                            type = "function",
-                            ["function"] = {
-                                name = key,
-                                description = captured_description,
-                                parameters = captured_input_schema,
-                            },
-                        },
-                    }
-                end,
-            }
-
-            table.insert(tool_keys, key)
-            registered_tools = registered_tools + 1
-        end
-
-        -- Register this server's tools with CC's MCP registry
-        if #tool_keys > 0 then
-            local group = {
-                description = string.format("All tools from the `%s` MCP server", server.name),
-                tools = tool_keys,
-                system_prompt = sysp_enabled and function(_group_config, _ctx)
-                    return string.format(
-                        "You have access to the `%s` MCP server with %d tool(s).\n",
-                        server.name,
-                        #tool_keys
-                    )
-                end or nil,
-                opts = { collapse_tools = true },
-            }
-
-            cc_mcp.register_tools(server.name, server_tools, group)
-            registered_servers = registered_servers + 1
-        end
-
-        ::continue::
     end
 
     log.info("CC tools registered: %d tools across %d servers", registered_tools, registered_servers)

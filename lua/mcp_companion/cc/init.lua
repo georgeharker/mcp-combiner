@@ -872,6 +872,7 @@ function M._apply_token_filter(chat)
     -- Nothing to do if no server filter is needed
     if allowed == nil then
         log.debug("CC: no filter, all servers enabled (token=%s)", token)
+        require("mcp_companion.cc.chat_tools").sync(chat)
         return
     end
 
@@ -892,6 +893,8 @@ function M._apply_token_filter(chat)
         if sc_ok and sc.set_session_state and chat.bufnr then
             sc.set_session_state(chat.bufnr, sessions.disabled_set(data))
         end
+        -- The chat's groups follow its own tool list from here on.
+        require("mcp_companion.cc.chat_tools").sync(chat)
     end)
 end
 

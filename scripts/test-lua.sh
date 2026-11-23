@@ -20,6 +20,7 @@ SELF_CONTAINED=(
     test_cc_resolve_session
     test_acp_tools_filter
     test_list_paging
+    test_chat_tools
 )
 
 run_one() {

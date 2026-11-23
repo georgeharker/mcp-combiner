@@ -26,67 +26,17 @@ local function _get_disabled(bufnr)
     return _session_state[bufnr]
 end
 
---- Sync CC tool registry after a session toggle.
---- On disable: remove the server's tool group from the chat's tool_registry
---- and unregister from the global CC MCP registry.
---- On enable: re-register the server's tools and re-add the group.
+--- Bring the chat's CodeCompanion tool groups in line with what the combiner
+--- shows THIS chat (cc/chat_tools.lua): its own client lists its tools; servers
+--- it can't see lose their group here, ones it newly sees gain theirs. Nothing
+--- is unregistered globally — other chats are unaffected.
 --- @param chat table CC chat object
---- @param server_name string
---- @param is_disabling boolean true if disabling, false if re-enabling
-local function _sync_cc_tool_group(chat, server_name, is_disabling)
-    local cc_mcp_ok, cc_mcp = pcall(require, "codecompanion.mcp")
-    if not cc_mcp_ok then
-        return
-    end
-
-    local group_name = cc_mcp.tool_prefix() .. server_name
-    local combiner_group_name = cc_mcp.tool_prefix() .. "combiner"
-
-    if is_disabling then
-        -- Remove the per-server group from this chat's tool_registry
-        if chat.tool_registry and chat.tool_registry.remove then
-            pcall(chat.tool_registry.remove, chat.tool_registry, group_name)
+local function _sync_cc_tool_groups(chat)
+    require("mcp_companion.cc.chat_tools").sync(chat, function(err)
+        if err then
+            log.debug("CC: per-chat tool sync skipped: %s", err)
         end
-        -- Also remove the aggregate combiner group — it contains tools from the
-        -- now-disabled server and needs to be rebuilt
-        if chat.tool_registry and chat.tool_registry.remove then
-            pcall(chat.tool_registry.remove, chat.tool_registry, combiner_group_name)
-        end
-        -- Unregister from the global MCP registry so new chats don't see it
-        if cc_mcp.unregister_tools then
-            pcall(cc_mcp.unregister_tools, server_name)
-        end
-        log.debug("CC: removed tool group '%s' for session-disabled server", group_name)
-    else
-        -- Re-enabling: trigger a full re-registration which will pick up
-        -- the re-enabled server from the combiner's tools/list
-        local cc_init_ok, cc_init = pcall(require, "mcp_companion.cc")
-        if cc_init_ok and cc_init._register_all then
-            -- Clear tools fingerprint so re-registration isn't skipped
-            local tools_ok, cc_tools = pcall(require, "mcp_companion.cc.tools")
-            if tools_ok and cc_tools.clear_fingerprint then
-                cc_tools.clear_fingerprint()
-            end
-            cc_init._register_all()
-        end
-        -- Re-add the per-server group to this chat
-        if chat.tool_registry then
-            chat.tool_registry:add(group_name, {
-                config = chat.tools and chat.tools.tools_config,
-            })
-        end
-        -- Re-add the aggregate combiner group
-        if chat.tool_registry then
-            chat.tool_registry:add(combiner_group_name, {
-                config = chat.tools and chat.tools.tools_config,
-            })
-        end
-        -- Refresh tools display
-        if chat.tools and chat.tools.refresh then
-            chat.tools:refresh({ adapter = chat.adapter })
-        end
-        log.debug("CC: re-added tool group '%s' for session-enabled server", group_name)
-    end
+    end)
 end
 
 --- Call the session toggle for the given chat via the token filter endpoint.
@@ -186,9 +136,8 @@ function M.toggle_server_for_session(chat, server_name, done)
             disabled[server_name] = nil
         end
 
-        -- Update CC tool registry so @-mention and context block reflect
-        -- the session-disabled state.
-        _sync_cc_tool_group(chat, server_name, new_state)
+        -- Bring the chat's tool groups in line with its new view.
+        _sync_cc_tool_groups(chat)
 
         -- Refresh the status window if it's open (it shows session state).
         local ui_ok, ui = pcall(require, "mcp_companion.ui")
@@ -199,6 +148,161 @@ function M.toggle_server_for_session(chat, server_name, done)
         local action_label = new_state and "disabled" or "enabled"
         log.info("Session toggle: %s %s — %s", action_label, server_name, msg)
         done(nil, { action = action_label, server = server_name })
+    end)
+end
+
+--- List the collections for *chat*: on/off for it and for the combiner, and
+--- their servers (combiner__collections, naming the chat by its token).
+--- @param chat table CC chat object
+--- @param done fun(err: string|nil, collections: table<string, table>|nil)
+function M.list_collections(chat, done)
+    local combiner = require("mcp_companion.combiner")
+    if not combiner.client then
+        done("Combiner not connected", nil)
+        return
+    end
+    local chat_id = chat and (chat._mcp_token or (chat.bufnr and tostring(chat.bufnr))) or nil
+    combiner.client:call_tool("combiner__collections", { chat_id = chat_id }, function(err, result)
+        vim.schedule(function()
+            if err then
+                done(tostring(err), nil)
+                return
+            end
+            local text = result and result.content and result.content[1] and result.content[1].text
+            local ok, data = pcall(vim.json.decode, text or "")
+            if not ok or type(data) ~= "table" then
+                done(text or "Empty response", nil)
+                return
+            end
+            done(nil, data)
+        end)
+    end)
+end
+
+--- Turn a collection on or off for *chat* only, or back to following the
+--- combiner (`on == nil`), then refresh the chat's server state and tools.
+--- @param chat table CC chat object
+--- @param name string collection name
+--- @param on boolean|nil true = on here, false = off here, nil = follow the combiner
+--- @param done? fun(err: string|nil, info: table|nil)
+function M.set_collection_for_session(chat, name, on, done)
+    done = done or function() end
+    if not chat or not chat.bufnr then
+        done("no chat available", nil)
+        return
+    end
+    local function after(err, data)
+        if err then
+            done(err, nil)
+            return
+        end
+        -- The chat's server view changed: refresh the picker state and tools.
+        M.fetch_session_status(chat, function()
+            _sync_cc_tool_groups(chat)
+            local ui_ok, ui = pcall(require, "mcp_companion.ui")
+            if ui_ok and ui.is_open() then
+                ui.render()
+            end
+            done(nil, data)
+        end)
+    end
+
+    local token = chat._mcp_token
+    if token then
+        require("mcp_companion.combiner.sessions").set_collection(token, name, on, after)
+        return
+    end
+    local combiner = require("mcp_companion.combiner")
+    if not combiner.client then
+        done("Combiner not connected", nil)
+        return
+    end
+    local tool = on == true and "combiner__session_enable_collection"
+        or on == false and "combiner__session_disable_collection"
+        or "combiner__session_reset_collection"
+    combiner.client:call_tool(tool, { collection = name, chat_id = tostring(chat.bufnr) }, function(err, result)
+        vim.schedule(function()
+            if err then
+                after(tostring(err), nil)
+                return
+            end
+            local text = result and result.content and result.content[1] and result.content[1].text or ""
+            if text:sub(1, 6) == "Error:" then
+                after(text, nil)
+                return
+            end
+            after(nil, { text = text })
+        end)
+    end)
+end
+
+--- The /mcp-collection picker: choose a collection, then on / off / follow
+--- the combiner for this chat.
+--- @param chat table CC chat object
+function M.pick_collection(chat)
+    M.list_collections(chat, function(err, collections)
+        if err then
+            vim.notify("mcp-companion: collections unavailable: " .. err, vim.log.levels.ERROR)
+            return
+        end
+        local names = vim.tbl_keys(collections or {})
+        table.sort(names)
+        if #names == 0 then
+            vim.notify("mcp-companion: no collections are configured on this machine", vim.log.levels.WARN)
+            return
+        end
+        local items = {}
+        for _, name in ipairs(names) do
+            local c = collections[name]
+            local servers = vim.tbl_keys(c.servers or {})
+            table.sort(servers)
+            table.insert(items, {
+                name = name,
+                label = string.format(
+                    "[%s] %s — %s; combiner %s (%s)",
+                    c.this_chat and " ON" or "OFF",
+                    name,
+                    c.this_chat_set and "set for this chat" or "following the combiner",
+                    c.enabled and "on" or "off",
+                    table.concat(servers, ", ")
+                ),
+            })
+        end
+        vim.ui.select(items, {
+            prompt = "Collection for this chat:",
+            format_item = function(item)
+                return item.label
+            end,
+        }, function(choice)
+            if not choice then
+                return
+            end
+            local actions = {
+                { label = "On for this chat", on = true },
+                { label = "Off for this chat", on = false },
+                { label = "Follow the combiner", on = nil, reset = true },
+            }
+            vim.ui.select(actions, {
+                prompt = string.format("'%s' in this chat:", choice.name),
+                format_item = function(a)
+                    return a.label
+                end,
+            }, function(action)
+                if not action then
+                    return
+                end
+                M.set_collection_for_session(chat, choice.name, action.on, function(e)
+                    if e then
+                        vim.notify("mcp-companion: collection change failed: " .. e, vim.log.levels.ERROR)
+                        return
+                    end
+                    vim.notify(
+                        string.format("mcp-companion: '%s' %s", choice.name, action.label:lower()),
+                        vim.log.levels.INFO
+                    )
+                end)
+            end)
+        end)
     end)
 end
 
@@ -274,6 +378,14 @@ function M.register()
         end,
     }
 
+    slash_cmds["mcp-collection"] = {
+        description = "Turn a server collection on or off for this chat",
+        ---@param chat table CodeCompanion chat object
+        callback = function(chat)
+            M.pick_collection(chat)
+        end,
+    }
+
     slash_cmds["mcp-session-save"] = {
         description = "Save current MCP server visibility as .mcp-companion.json",
         ---@param chat table CodeCompanion chat object
@@ -294,7 +406,7 @@ function M.register()
         end,
     }
 
-    log.debug("Registered /mcp-session and /mcp-session-save slash commands")
+    log.debug("Registered /mcp-session, /mcp-collection and /mcp-session-save slash commands")
 end
 
 --- Return the session-disabled set for a chat buffer (read-only view).
@@ -364,10 +476,7 @@ function M.fetch_session_status(chat, callback)
                 callback("JSON parse error", nil)
                 return
             end
-            local disabled = {}
-            for _, name in ipairs(data.disabled_servers or {}) do
-                disabled[name] = true
-            end
+            local disabled = require("mcp_companion.combiner.sessions").disabled_set(data)
             if chat and chat.bufnr then
                 _session_state[chat.bufnr] = disabled
             end

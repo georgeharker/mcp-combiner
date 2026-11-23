@@ -79,12 +79,27 @@ function M.clear_filter(token, done)
     })
 end
 
---- Convert a response's disabled_servers list into a set keyed by name.
+--- Turn a collection on or off for a token's chat, or back to following the
+--- combiner (`on == nil`).
+--- @param token string
+--- @param name string collection name
+--- @param on boolean|nil
+--- @param done? fun(err: string|nil, data: table|nil)
+function M.set_collection(token, name, on, done)
+    local field = on == true and "collection_on" or on == false and "collection_off" or "collection_unset"
+    M.set_filter(token, { [field] = name }, done)
+end
+
+--- The servers that are off for a chat, as a set: the ones it turned off
+--- (disabled_servers) and the ones its collections hide (hidden_by_collections).
 --- @param data table|nil
 --- @return table<string, boolean>
 function M.disabled_set(data)
     local out = {}
     for _, name in ipairs(data and data.disabled_servers or {}) do
+        out[name] = true
+    end
+    for _, name in ipairs(data and data.hidden_by_collections or {}) do
         out[name] = true
     end
     return out
