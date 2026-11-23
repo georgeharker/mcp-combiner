@@ -4,6 +4,54 @@ All notable changes to the combiner are documented here. The version moves in
 lockstep with the rest of the repo (`scripts/bump-version.sh`); releases are
 tagged `vX.Y.Z`.
 
+## [0.26.0] — 2026-11-23
+
+### Changed — breaking
+
+- **Server profiles are now *collections*.** They overlap: a server can be in
+  several, and any one that's on runs it. "Profile" suggested mutually
+  exclusive modes. Rename in your config:
+  - the top-level `"profiles"` block → `"collections"`;
+  - each server's `"profiles": [...]` → `"collections": [...]`;
+  - `MCP_COMBINER_PROFILES` → `MCP_COMBINER_COLLECTIONS`.
+
+  The tools are `combiner__collections` / `combiner__enable_collection` /
+  `combiner__disable_collection`, and the CLI is `mcp-combiner collection
+  list|enable|disable`. There are no aliases. A config that still says
+  `profiles` fails to load with an error naming the new key.
+
+### Added
+
+- **A chat can turn a collection on or off for itself.**
+  `combiner__session_enable_collection` / `_disable_collection` /
+  `_reset_collection`. Turning one on in a chat starts its servers if they
+  weren't running; only the chats that want them see them, and they stop
+  once nothing does. Turning one off hides its servers from that chat only.
+  - A per-chat toggle of a single server wins over the chat's collections.
+  - A global `combiner__disable_server` wins over every chat.
+  - Also available on the token route (`collection_on` / `collection_off` /
+    `collection_unset`, `collections: {name: true|false|null}`) and in the CLI
+    (`mcp-combiner session enable-collection|disable-collection|reset-collection
+    <name> --token <t>`).
+  - A tokened chat keeps its collections across reconnects and sanctioned
+    restarts (they ride the handover). A tokenless chat's go with its session.
+  - `combiner__collections` and `combiner__session_status` show what the
+    calling chat sees.
+- **Neovim plugin:** `/mcp-collection` turns a collection on or off for the
+  current chat. CodeCompanion HTTP-adapter chats now take their tools from
+  their own per-chat combiner client: servers only some chats see are
+  registered once, and each chat's tool groups follow its own list.
+
+### Fixed
+
+- **Neovim plugin:** turning a server off for one chat no longer unregisters
+  it for every chat (new chats lost it until the next re-registration).
+  Removing a chat's tool group also works now. It called a method that
+  doesn't exist, and a `pcall` hid the error, so the group never left the
+  chat.
+- `mcp-combiner session` no longer calls its per-chat verbs "WIP"; they have
+  applied live since the token store became canonical.
+
 ## [0.25.0] — 2026-11-22
 
 ### Added

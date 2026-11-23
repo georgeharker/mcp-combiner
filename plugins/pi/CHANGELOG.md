@@ -6,6 +6,20 @@ tagged `vX.Y.Z`. The extension runs the matching mcp-combiner release, so each
 entry also summarises the combiner's changes; the full list is in
 [the combiner's changelog](https://github.com/georgeharker/mcp-combiner/blob/main/combiner/CHANGELOG.md).
 
+## [0.26.0] - 2026-11-23
+
+### Added
+
+- **`/mcp-combiner collections`** lists each server collection: on or off for
+  this chat and for the combiner, and its servers.
+- **`/mcp-combiner collection on|off|reset <name>`** turns one on or off for
+  this chat only, or back to the combiner's setting. Turning one on starts
+  its servers for this chat if they weren't running.
+
+The combiner renamed server profiles to *collections* in this release, and a
+config that still says `profiles` no longer loads. See the combiner's
+changelog.
+
 ## [0.25.0] - 2026-11-22
 
 No extension changes. The combiner now carries every kind of server question
