@@ -77,6 +77,12 @@ async def write_handover(path: str) -> None:
             token: sorted(patterns)
             for token, patterns in RUNTIME.sessions.token_hidden_tools.items()
         },
+        "token_collections": {
+            token: dict(state) for token, state in RUNTIME.sessions.token_collections.items()
+        },
+        "token_enabled_servers": {
+            token: sorted(servers) for token, servers in RUNTIME.sessions.token_forced.items()
+        },
         "token_instances": token_instances,
         "instances": instances,
         "grants": RUNTIME.sessions.grants_snapshot(),
@@ -159,6 +165,13 @@ def load_handover(path: str) -> bool:
         RUNTIME.sessions.set_hidden(
             RUNTIME.sessions.token_hidden_tools, str(token), {str(p) for p in patterns}
         )
+
+    for token, state in dict(payload.get("token_collections", {})).items():
+        for name, on in dict(state).items():
+            RUNTIME.sessions.set_collection((True, str(token)), str(name), bool(on))
+    for token, servers in dict(payload.get("token_enabled_servers", {})).items():
+        for server in servers:
+            RUNTIME.sessions.set_forced((True, str(token)), str(server), True)
 
     restored_grants = RUNTIME.sessions.restore_grants(payload.get("grants", {}))
     logger.info("handover: restored %d consent grant(s)", restored_grants)

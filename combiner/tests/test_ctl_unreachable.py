@@ -60,7 +60,7 @@ def test_connection_failures_are_recognised_however_wrapped() -> None:
         (("authorize", "gws"), True),
         (("enable", "gws"), False),
         (("status",), False),
-        (("profile", "list"), False),
+        (("collection", "list"), False),
     ],
 )
 def test_commands_explain_an_unreachable_combiner(

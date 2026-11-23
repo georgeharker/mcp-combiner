@@ -317,6 +317,15 @@ def register_meta_tools(
         """
         if server_name not in config.servers:
             return f"Error: Server '{server_name}' not found"
+        # An explicit global toggle: wins over the server's collections.
+        RUNTIME.server_overrides[server_name] = True
+        return await _start_server(server_name)
+
+    async def _start_server(server_name: str) -> str:
+        """Start and mount one server (combiner__enable_server without the
+        explicit intent; what collection reconciling drives)."""
+        if server_name not in config.servers:
+            return f"Error: Server '{server_name}' not found"
         srv = config.servers[server_name]
 
         # Allow re-enable even if not disabled (manual retry for auth-failed).
@@ -376,6 +385,15 @@ def register_meta_tools(
         Returns:
             Status message.
         """
+        if server_name not in config.servers:
+            return f"Error: Server '{server_name}' not found"
+        # An explicit global toggle: no chat's collections bring it back.
+        RUNTIME.server_overrides[server_name] = False
+        return await _stop_server(server_name)
+
+    async def _stop_server(server_name: str) -> str:
+        """Stop and unmount one server (combiner__disable_server without the
+        explicit intent)."""
         if server_name not in config.servers:
             return f"Error: Server '{server_name}' not found"
         srv = config.servers[server_name]
@@ -626,86 +644,189 @@ def register_meta_tools(
         return summary
 
     RUNTIME.restart_server = restart_server
+    RUNTIME.start_server = _start_server
+    RUNTIME.stop_server = _stop_server
 
-    async def _set_profile(name: str, on: bool) -> str:
-        """Turn profile *name* on or off: start or stop each member server
-        whose should-run state changes (on-wins: a server stays up while any
-        of its other loaded profiles is on). Memory-only, like enable_server:
-        a restart or reload reapplies the config file."""
-        from mcp_combiner.config import server_runs
+    async def _set_collection(name: str, on: bool) -> str:
+        """Turn collection *name* on or off for the whole combiner, then start
+        or stop servers to match (chatcollections.reconcile: on-wins across
+        collections, and chats that turned it on keep theirs). Resets its
+        servers' explicit global toggles. Memory-only, like enable_server: a
+        restart or reload reapplies the config file."""
+        from mcp_combiner import chatcollections
 
-        profile = config.profiles.get(name)
-        if profile is None:
-            known = ", ".join(sorted(config.profiles)) or "none"
-            return f"Error: profile '{name}' isn't loaded here (loaded: {known})"
-        config.profiles[name] = profile.model_copy(update={"enabled": on})
-        started: list[str] = []
-        stopped: list[str] = []
-        failed: list[str] = []
-        for srv_name, srv in list(config.servers.items()):
-            if name not in srv.profiles:
-                continue
-            should_run = server_runs(srv, config.profiles)
-            if should_run and srv.disabled:
-                result = await combiner__enable_server(srv_name)
-                (failed if went_wrong(result) else started).append(srv_name)
-            elif not should_run and not srv.disabled:
-                result = await combiner__disable_server(srv_name)
-                (failed if went_wrong(result) else stopped).append(srv_name)
-        parts = [f"Profile '{name}' {'on' if on else 'off'}"]
-        if started:
-            parts.append(f"started {', '.join(started)}")
-        if stopped:
-            parts.append(f"stopped {', '.join(stopped)}")
-        if failed:
-            parts.append(f"failed: {', '.join(failed)} (see combiner__status)")
-        if not (started or stopped or failed):
-            parts.append("no servers changed")
-        logger.info("; ".join(parts))
-        return "; ".join(parts) + "."
+        collection = config.collections.get(name)
+        if collection is None:
+            known = ", ".join(sorted(config.collections)) or "none"
+            return f"Error: collection '{name}' isn't loaded here (loaded: {known})"
+        config.collections[name] = collection.model_copy(update={"enabled": on})
+        for srv_name, srv in config.servers.items():
+            if name in srv.collections:
+                RUNTIME.server_overrides.pop(srv_name, None)
+        outcome = await chatcollections.reconcile()
+        summary = f"Collection '{name}' {'on' if on else 'off'}; {outcome.describe()}."
+        logger.info(summary)
+        return summary
 
     @combiner.tool()
-    async def combiner__enable_profile(profile: str) -> str:
-        """Turn a server profile on: start its servers.
+    async def combiner__enable_collection(collection: str) -> str:
+        """Turn a server collection on for every chat: start its servers.
 
-        A profile is a named group of servers from the config's ``profiles``.
-        A server runs while ANY of its profiles is on. The change lasts until
-        the combiner restarts or reloads its config.
+        A collection is a named group of servers from the config's ``collections``.
+        A server runs while ANY of its collections is on. The change lasts until
+        the combiner restarts or reloads its config. To turn one on for the
+        current chat only, use combiner__session_enable_collection.
 
         Args:
-            profile: the profile's name (see combiner__profiles).
+            collection: the collection's name (see combiner__collections).
         """
-        return await _set_profile(profile, True)
+        return await _set_collection(collection, True)
 
     @combiner.tool()
-    async def combiner__disable_profile(profile: str) -> str:
-        """Turn a server profile off: stop its servers, except those that
-        another profile that's on still needs.
+    async def combiner__disable_collection(collection: str) -> str:
+        """Turn a server collection off for every chat: stop its servers,
+        except those another collection that's on (or a chat that turned this
+        one on for itself) still needs.
 
         Args:
-            profile: the profile's name (see combiner__profiles).
+            collection: the collection's name (see combiner__collections).
         """
-        return await _set_profile(profile, False)
+        return await _set_collection(collection, False)
 
     @combiner.tool()
-    async def combiner__profiles() -> str:
-        """List the server profiles loaded on this machine: whether each is
-        on, and its servers (with whether each is running)."""
+    async def combiner__collections(ctx: Context, chat_id: str | None = None) -> str:
+        """List the server collections loaded on this machine: whether each is
+        on for the combiner and for this chat, and its servers (whether each is
+        running, and whether this chat sees it).
+
+        Args:
+            chat_id: Optional chat identifier when the calling session has no
+                     token binding of its own.
+        """
         import json
 
+        from mcp_combiner import chatcollections
+
+        ref = RUNTIME.sessions.chat_ref(ctx.session_id, chat_id)
+        state = RUNTIME.sessions.collections_of(ref)
+        visible = chatcollections.visibility(config, ref)
         return json.dumps(
             {
                 name: {
-                    "enabled": profile.enabled,
+                    "enabled": collection.enabled,
+                    "this_chat": state.get(name, collection.enabled),
+                    "this_chat_set": name in state,
                     "servers": {
-                        srv_name: not srv.disabled
+                        srv_name: {
+                            "running": not srv.disabled,
+                            "this_chat": visible.get(srv_name, False),
+                        }
                         for srv_name, srv in sorted(config.servers.items())
-                        if name in srv.profiles
+                        if name in srv.collections
                     },
                 }
-                for name, profile in sorted(config.profiles.items())
+                for name, collection in sorted(config.collections.items())
             }
         )
+
+    async def _set_chat_collection(
+        ctx: Context, chat_id: str | None, name: str, on: bool | None
+    ) -> str:
+        """Turn collection *name* on/off for one chat (``None``: follow the
+        global state again), start/stop servers to match, refresh the chat."""
+        import json
+
+        from mcp_combiner import chatcollections
+
+        if name not in config.collections:
+            known = ", ".join(sorted(config.collections)) or "none"
+            return f"Error: collection '{name}' isn't loaded here (loaded: {known})"
+        ref = RUNTIME.sessions.chat_ref(ctx.session_id, chat_id)
+        if ref is None:
+            return "Error: no chat to apply this to (no session or chat_id)"
+        RUNTIME.sessions.set_collection(ref, name, on)
+        outcome = await chatcollections.reconcile()
+        await _refresh_chat(ctx, chat_id, ref)
+        state = RUNTIME.sessions.collections_of(ref)
+        action = {True: "on", False: "off", None: "follows the combiner"}[on]
+        logger.info("Chat %s: collection '%s' %s; %s", ref[1], name, action, outcome.describe())
+        return json.dumps(
+            {
+                "chat": ref[1],
+                "collection": name,
+                "this_chat": state.get(name, config.collections[name].enabled),
+                "this_chat_set": name in state,
+                "servers": {
+                    srv: seen
+                    for srv, seen in chatcollections.visibility(config, ref).items()
+                    if name in config.servers[srv].collections
+                },
+                "started": outcome.started,
+                "stopped": outcome.stopped,
+                "failed": outcome.failed,
+            }
+        )
+
+    async def _refresh_chat(ctx: Context, chat_id: str | None, ref: Any) -> None:
+        """Tell a chat its tool list changed (its own session directly; a
+        token's 2026 listen streams through the hub)."""
+        from mcp_combiner import nvim_proxy
+        from mcp_combiner.toolcache import notify_chat_tools_changed
+
+        if not chat_id or chat_id == nvim_proxy.token_for_session(ctx.session_id):
+            try:
+                await ctx.session.send_tool_list_changed()
+            except Exception:
+                logger.debug("Failed to notify session of tool list change", exc_info=True)
+        if ref is not None and ref[0]:
+            await notify_chat_tools_changed(ref[1])
+
+    @combiner.tool()
+    async def combiner__session_enable_collection(
+        collection: str, ctx: Context, chat_id: str | None = None
+    ) -> str:
+        """Turn a server collection on for the current chat only.
+
+        Its servers appear in this chat; ones that weren't running start, and
+        other chats don't see them unless the collection is on for them too.
+        Lasts for the chat (a tokened chat keeps it across reconnects and
+        combiner restarts). See combiner__collections.
+
+        Args:
+            collection: the collection's name.
+            chat_id: Optional chat identifier when the calling session has no
+                     token binding of its own.
+        """
+        return await _set_chat_collection(ctx, chat_id, collection, True)
+
+    @combiner.tool()
+    async def combiner__session_disable_collection(
+        collection: str, ctx: Context, chat_id: str | None = None
+    ) -> str:
+        """Turn a server collection off for the current chat only: its servers
+        disappear from this chat (unless another collection that's on for it
+        includes them, or the chat turned the server on itself).
+
+        Args:
+            collection: the collection's name.
+            chat_id: Optional chat identifier when the calling session has no
+                     token binding of its own.
+        """
+        return await _set_chat_collection(ctx, chat_id, collection, False)
+
+    @combiner.tool()
+    async def combiner__session_reset_collection(
+        collection: str, ctx: Context, chat_id: str | None = None
+    ) -> str:
+        """Make a collection follow the combiner's setting again in the current
+        chat (undo session_enable/disable_collection).
+
+        Args:
+            collection: the collection's name.
+            chat_id: Optional chat identifier when the calling session has no
+                     token binding of its own.
+        """
+        return await _set_chat_collection(ctx, chat_id, collection, None)
 
     @combiner.tool()
     async def combiner__restart_server(server_name: str) -> str:
@@ -758,6 +879,14 @@ def register_meta_tools(
         except Exception as e:
             logger.exception("reload_config: failed to read %s", config.config_path)
             return f"Error: failed to read config '{config.config_path}': {e}"
+
+        # Explicit global toggles last until a reload (the file reapplies);
+        # what chats turned on for themselves carries over, so a server only
+        # they want is "unchanged" rather than torn down and brought back.
+        from mcp_combiner import chatcollections
+
+        RUNTIME.server_overrides.clear()
+        chatcollections.apply(new_cfg)
 
         old_servers = dict(config.servers)
         new_servers = new_cfg.servers
@@ -815,7 +944,7 @@ def register_meta_tools(
         config.shared_servers = new_cfg.shared_servers
         config.external_servers = new_cfg.external_servers
         config.oauth = new_cfg.oauth
-        config.profiles = new_cfg.profiles
+        config.collections = new_cfg.collections
 
         # 3) Mount added + changed servers that are enabled, now reading the
         #    fresh definitions from the swapped-in config.
@@ -891,6 +1020,14 @@ def register_meta_tools(
         else:
             RUNTIME.sessions.disable(ctx.session_id, server_name)
             snapshot = RUNTIME.sessions.disabled_snapshot(ctx.session_id)
+        # Off for this chat wins over an earlier explicit on; a server only
+        # this chat wanted running stops.
+        from mcp_combiner import chatcollections
+
+        ref = RUNTIME.sessions.chat_ref(ctx.session_id, chat_id)
+        if ref is not None:
+            RUNTIME.sessions.set_forced(ref, server_name, False)
+        await chatcollections.reconcile()
 
         # Notify the calling session so its tool list refreshes immediately
         # (a chat_id naming ANOTHER chat is enforced read-through on that
@@ -955,7 +1092,19 @@ def register_meta_tools(
 
         import json
 
-        if server_name not in blocked:
+        from mcp_combiner import chatcollections
+
+        # A server the chat's collections hide is turned on for it explicitly
+        # (a per-chat server toggle wins over the chat's collections).
+        ref = RUNTIME.sessions.chat_ref(ctx.session_id, chat_id)
+        hidden_by_collections = ref is not None and server_name in chatcollections.hidden_for(
+            config, RUNTIME.sessions.collections_of(ref), RUNTIME.sessions.forced_of(ref)
+        )
+        if hidden_by_collections and ref is not None:
+            RUNTIME.sessions.set_forced(ref, server_name, True)
+            await chatcollections.reconcile()
+
+        if server_name not in blocked and not hidden_by_collections:
             return json.dumps(
                 {
                     "session_id": ctx.session_id,
@@ -973,6 +1122,8 @@ def register_meta_tools(
         else:
             RUNTIME.sessions.enable(ctx.session_id, server_name)
             snapshot = RUNTIME.sessions.disabled_snapshot(ctx.session_id)
+        if server_name in blocked:
+            await chatcollections.reconcile()
 
         # Notify the calling session so its tool list refreshes immediately.
         if not chat_id or token == nvim_proxy.token_for_session(ctx.session_id):
@@ -1031,12 +1182,22 @@ def register_meta_tools(
 
         import json
 
+        from mcp_combiner import chatcollections
+
+        ref = RUNTIME.sessions.chat_ref(ctx.session_id, chat_id)
+        collections = RUNTIME.sessions.collections_of(ref)
+        forced = RUNTIME.sessions.forced_of(ref)
         return json.dumps(
             {
                 "session_id": ctx.session_id,
                 "token": token,
                 "disabled_servers": blocked,
                 "hidden_tools": sorted(hidden),
+                "collections": dict(sorted(collections.items())),
+                "enabled_servers": sorted(forced),
+                "hidden_by_collections": sorted(
+                    chatcollections.hidden_for(config, collections, forced)
+                ),
             }
         )
 

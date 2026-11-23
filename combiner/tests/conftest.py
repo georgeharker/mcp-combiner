@@ -44,7 +44,7 @@ requires_sharedserver = pytest.mark.skipif(
 os.environ["MCP_COMBINER_UI_ADVERTISE"] = "loopback"
 
 # The developer's own combiner settings (public URL, bearer, web password,
-# profiles, bind host, ...) must not leak into tests, nor into the combiners
+# collections, bind host, ...) must not leak into tests, nor into the combiners
 # they spawn, which inherit this process's environment. Tests that need one
 # set it explicitly (monkeypatch.setenv, or a spawn's env=).
 for _var in [v for v in os.environ if v.startswith("MCP_COMBINER")]:

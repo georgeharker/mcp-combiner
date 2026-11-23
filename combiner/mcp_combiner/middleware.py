@@ -558,11 +558,7 @@ class ToolProcessingMiddleware(Middleware):
                 if blocked:
                     sess_server, _ = _find_server_for_tool(str(tool_name))
                     if sess_server in blocked:
-                        raise NotFoundError(
-                            f"Tool '{tool_name}' is unavailable — server '{sess_server}' "
-                            "is disabled for this session. Use combiner__session_enable_server "
-                            "to re-enable it."
-                        )
+                        raise NotFoundError(_blocked_message(str(tool_name), sess_server, sid))
             except NotFoundError:
                 raise
             except (RuntimeError, AttributeError):
@@ -974,6 +970,25 @@ def _url_required_in(exc: BaseException) -> UrlElicitationRequiredError | None:
                 return None
         seen = seen.__cause__ or seen.__context__
     return None
+
+
+def _blocked_message(tool_name: str, server: str, session_id: str | None) -> str:
+    """Why *server* is unavailable to this chat, and what turns it back on."""
+    config = RUNTIME.config
+    sessions = RUNTIME.sessions
+    ref = sessions.chat_ref(session_id)
+    if config is not None and server not in sessions.blocked_of(ref):
+        srv = config.servers.get(server)
+        names = ", ".join(c for c in (srv.collections if srv else []) if c in config.collections)
+        return (
+            f"Tool '{tool_name}' is unavailable — server '{server}' is in collection(s) "
+            f"{names}, which are off for this chat. Use combiner__session_enable_collection "
+            "or combiner__session_enable_server to turn it on here."
+        )
+    return (
+        f"Tool '{tool_name}' is unavailable — server '{server}' is disabled for this "
+        "session. Use combiner__session_enable_server to re-enable it."
+    )
 
 
 def _url_supported(fctx: Context | None) -> bool:

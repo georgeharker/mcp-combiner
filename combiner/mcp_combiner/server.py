@@ -348,6 +348,11 @@ def create_combiner(
         # in connect_all() (below) handles the single auth flow.  If it
         # fails, ConnectionManager marks _auth_failed and the factory
         # raises AuthenticationError for all subsequent calls.
+        # Servers in a collection run if it's on, or some chat (restored by a
+        # handover) turned it on for itself.
+        from mcp_combiner import chatcollections
+
+        chatcollections.apply(config)
         enabled = config.get_enabled_servers()
         # Each upstream's protocol era (server/discover probes for protocol:
         # auto, concurrently) — decided before its connection or proxy exists.

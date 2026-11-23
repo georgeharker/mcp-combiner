@@ -194,6 +194,10 @@ class TokenRewriteMiddleware(BaseHTTPMiddleware):
             from mcp_combiner.isolated import SID_PREFIX as _sid_prefix
 
             _isolated_registry.expedite_park(_sid_prefix + request_sid)
+            # A tokenless chat's per-chat collections die with its session.
+            from mcp_combiner import chatcollections
+
+            chatcollections.forget_session(request_sid)
 
         return response
 

@@ -28,7 +28,7 @@ from starlette.responses import (
     Response,
 )
 
-from mcp_combiner import authpages, authprompt, webauth, webgate
+from mcp_combiner import authpages, authprompt, chatcollections, webauth, webgate
 from mcp_combiner.config import CombinerConfig, HealthResponse, ServerStatusInfo
 from mcp_combiner.connections import ConnectionManager
 from mcp_combiner.runtime import RUNTIME, connection_session_id
@@ -425,6 +425,75 @@ def register_routes(
         logger.debug("Token lookup: %s -> %s", token, session_id)
         return JSONResponse({"token": token, "session_id": session_id})
 
+    def _collection_state(token: str) -> dict[str, Any]:
+        """The chat's per-chat collection state, for the filter responses."""
+        ref = (True, token)
+        collections = RUNTIME.sessions.collections_of(ref)
+        forced = RUNTIME.sessions.forced_of(ref)
+        return {
+            "collections": dict(sorted(collections.items())),
+            "enabled_servers": sorted(forced),
+            "hidden_by_collections": sorted(
+                chatcollections.hidden_for(config, collections, forced)
+            ),
+        }
+
+    def _apply_collection_body(
+        token: str, body: dict[str, Any], enable_server: object
+    ) -> str | None:
+        """Apply a filter POST's collection fields to chat *token*; an error
+        message when a field is malformed or names an unknown collection.
+
+        ``collections``: {name: true|false|null} — set each (null: follow the
+        combiner again); names not given are left alone. ``collection_on`` /
+        ``collection_off`` / ``collection_unset``: one name. ``enabled_servers``:
+        replaces the servers the chat turned on over its collections. A body
+        without these fields leaves the chat's collections untouched (a
+        supervisor re-asserting disabled_servers doesn't wipe them).
+        ``enable`` of a server the chat's collections hide turns it on here."""
+        ref = (True, token)
+        changes: dict[str, bool | None] = {}
+        raw = body.get("collections")
+        if raw is not None:
+            if not isinstance(raw, dict) or not all(
+                v is None or isinstance(v, bool) for v in raw.values()
+            ):
+                return "collections must be an object of name -> true, false or null"
+            changes.update({str(k): v for k, v in raw.items()})
+        for field_name, value in (
+            ("collection_on", True),
+            ("collection_off", False),
+            ("collection_unset", None),
+        ):
+            name = body.get(field_name)
+            if name is not None:
+                if not isinstance(name, str):
+                    return f"{field_name} must be a collection name"
+                changes[name] = value
+        unknown = sorted(set(changes) - set(config.collections))
+        if unknown:
+            return f"unknown collection(s): {', '.join(unknown)}"
+        enabled = body.get("enabled_servers")
+        if enabled is not None and (
+            not isinstance(enabled, list) or not all(isinstance(v, str) for v in enabled)
+        ):
+            return "enabled_servers must be a list of server names"
+        for name, on in changes.items():
+            RUNTIME.sessions.set_collection(ref, name, on)
+        if enabled is not None:
+            for server in RUNTIME.sessions.forced_of(ref).copy():
+                RUNTIME.sessions.set_forced(ref, server, False)
+            for server in enabled:
+                RUNTIME.sessions.set_forced(ref, server, True)
+        if isinstance(enable_server, str) and enable_server in chatcollections.hidden_for(
+            config, RUNTIME.sessions.collections_of(ref), RUNTIME.sessions.forced_of(ref)
+        ):
+            RUNTIME.sessions.set_forced(ref, enable_server, True)
+        disable = body.get("disable")
+        if isinstance(disable, str):
+            RUNTIME.sessions.set_forced(ref, disable, False)
+        return None
+
     @combiner.custom_route("/sessions/token/{token}/filter", methods=["GET", "POST", "DELETE"])
     async def manage_token_filter(request: Request) -> JSONResponse:
         """Manage per-session server blocklist by token.
@@ -466,6 +535,7 @@ def register_routes(
                     "connected": session_id is not None,
                     "disabled_servers": RUNTIME.sessions.token_snapshot(token),
                     "hidden_tools": sorted(RUNTIME.sessions.token_hidden_tools.get(token, set())),
+                    **_collection_state(token),
                 }
             )
 
@@ -473,6 +543,8 @@ def register_routes(
             previously = RUNTIME.sessions.token_snapshot(token)
             RUNTIME.sessions.set_pending(token, None)
             RUNTIME.sessions.set_hidden(RUNTIME.sessions.token_hidden_tools, token, set())
+            if RUNTIME.sessions.forget_chat_collections((True, token)):
+                await chatcollections.reconcile()
             await _notify_token_sessions()
             return JSONResponse(
                 {
@@ -528,6 +600,10 @@ def register_routes(
         if isinstance(body.get("show"), str):
             hidden.discard(body["show"])
         RUNTIME.sessions.set_hidden(RUNTIME.sessions.token_hidden_tools, token, hidden)
+        problem = _apply_collection_body(token, body, enable_server)
+        if problem is not None:
+            return JSONResponse({"error": problem}, status_code=400)
+        await chatcollections.reconcile()
         await _notify_token_sessions()
         logger.info(
             "REST token filter: token=%s connected=%s disabled=%s",
@@ -542,6 +618,7 @@ def register_routes(
                 "connected": session_id is not None,
                 "disabled_servers": RUNTIME.sessions.token_snapshot(token),
                 "hidden_tools": sorted(RUNTIME.sessions.token_hidden_tools.get(token, set())),
+                **_collection_state(token),
             }
         )
 

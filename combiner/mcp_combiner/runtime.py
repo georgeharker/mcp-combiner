@@ -108,6 +108,14 @@ class SessionRegistry:
     # tokenless ones — resolved like the server filters (effective_hidden).
     token_hidden_tools: dict[str, set[str]] = field(default_factory=dict)
     hidden_tools: dict[str, set[str]] = field(default_factory=dict)
+    # Per-chat collection state (design 01M84GRGJ6): chat -> {collection: on?};
+    # a collection the chat hasn't set follows its global state. And the
+    # servers a chat turned on explicitly (a per-chat server toggle wins over
+    # the chat's collections). Token- and session-keyed, like the filters.
+    token_collections: dict[str, dict[str, bool]] = field(default_factory=dict)
+    sid_collections: dict[str, dict[str, bool]] = field(default_factory=dict)
+    token_forced: dict[str, set[str]] = field(default_factory=dict)
+    sid_forced: dict[str, set[str]] = field(default_factory=dict)
 
     # -- active sessions --------------------------------------------------
 
@@ -201,12 +209,89 @@ class SessionRegistry:
         """
         if not session_id:
             return set()
+        from mcp_combiner import chatcollections
+
+        ref = self.chat_ref(session_id)
+        blocked = self.blocked_of(ref)
+        if RUNTIME.config is None:
+            return blocked
+        hidden = chatcollections.hidden_for(
+            RUNTIME.config, self.collections_of(ref), self.forced_of(ref)
+        )
+        return blocked | hidden if hidden else blocked
+
+    # -- per-chat collections ------------------------------------------------
+
+    def chat_ref(self, session_id: str | None, chat_id: str | None = None) -> ChatRef | None:
+        """Which chat a request's per-chat state belongs to: its token (an
+        explicit *chat_id* is one) when it has one, else its session id."""
+        if chat_id:
+            return (True, chat_id)
+        if not session_id:
+            return None
         from mcp_combiner import nvim_proxy
 
         token = nvim_proxy.token_for_session(session_id)
-        if token is not None:
-            return self.pending_token_filters.get(token, set())
-        return self.disabled.get(session_id, set())
+        return (True, token) if token is not None else (False, session_id)
+
+    def collections_of(self, ref: ChatRef | None) -> dict[str, bool]:
+        if ref is None:
+            return {}
+        store = self.token_collections if ref[0] else self.sid_collections
+        return store.get(ref[1], {})
+
+    def set_collection(self, ref: ChatRef, name: str, on: bool | None) -> None:
+        """Turn *name* on/off for the chat, or back to following the global
+        state (``None``)."""
+        store = self.token_collections if ref[0] else self.sid_collections
+        state = dict(store.get(ref[1], {}))
+        if on is None:
+            state.pop(name, None)
+        else:
+            state[name] = on
+        if state:
+            store[ref[1]] = state
+        else:
+            store.pop(ref[1], None)
+
+    def forced_of(self, ref: ChatRef | None) -> set[str]:
+        if ref is None:
+            return set()
+        store = self.token_forced if ref[0] else self.sid_forced
+        return store.get(ref[1], set())
+
+    def set_forced(self, ref: ChatRef, server: str, on: bool) -> None:
+        store = self.token_forced if ref[0] else self.sid_forced
+        forced = set(store.get(ref[1], set()))
+        (forced.add if on else forced.discard)(server)
+        if forced:
+            store[ref[1]] = forced
+        else:
+            store.pop(ref[1], None)
+
+    def blocked_of(self, ref: ChatRef | None) -> set[str]:
+        """The chat's own server blocklist."""
+        if ref is None:
+            return set()
+        return (self.pending_token_filters if ref[0] else self.disabled).get(ref[1], set())
+
+    def chats_with_collection_state(self) -> list[ChatRef]:
+        """Every chat that has turned a collection or a server on or off."""
+        refs: set[ChatRef] = set()
+        for tokened, stores in (
+            (True, (self.token_collections, self.token_forced)),
+            (False, (self.sid_collections, self.sid_forced)),
+        ):
+            for store in stores:
+                refs.update((tokened, key) for key in store)
+        return sorted(refs)
+
+    def forget_chat_collections(self, ref: ChatRef) -> bool:
+        """Drop a chat's collection state and explicit server-on set (its
+        session ended); returns whether there was any."""
+        a = (self.token_collections if ref[0] else self.sid_collections).pop(ref[1], None)
+        b = (self.token_forced if ref[0] else self.sid_forced).pop(ref[1], None)
+        return bool(a or b)
 
     # -- per-chat hidden tools ---------------------------------------------
 
@@ -267,6 +352,10 @@ class SessionRegistry:
 
     def pop_pending(self, token: str) -> set[str] | None:
         return self.pending_token_filters.pop(token, None)
+
+
+#: A chat's per-chat state key: (tokened?, token or session id).
+ChatRef = tuple[bool, str]
 
 
 def tool_hidden(name: str, patterns: set[str]) -> bool:
@@ -450,6 +539,14 @@ class CombinerRuntime:
     #: The combiner__restart_server routine (registered with the meta tools);
     #: the connection monitor's automatic restarts run it too.
     restart_server: Callable[[str], Awaitable[str]] | None = None
+    #: Start / stop one server (registered with the meta tools), without
+    #: recording an explicit intent: what collection reconciling drives.
+    start_server: Callable[[str], Awaitable[str]] | None = None
+    stop_server: Callable[[str], Awaitable[str]] | None = None
+    #: Explicit global server toggles since the config was (re)loaded
+    #: (combiner__enable_server -> True, combiner__disable_server -> False):
+    #: they win over collections, and a chat's demand never overrides an off.
+    server_overrides: dict[str, bool] = field(default_factory=dict)
     #: wall-clock start, for the /status page's uptime.
     started_at: float = field(default_factory=time.time)
     # What the last boot's handover restored (or why it was refused) — the LLM's
@@ -530,6 +627,11 @@ def reset() -> None:
     r.sessions.pending_token_filters.clear()
     r.sessions.token_hidden_tools.clear()
     r.sessions.hidden_tools.clear()
+    r.sessions.token_collections.clear()
+    r.sessions.sid_collections.clear()
+    r.sessions.token_forced.clear()
+    r.sessions.sid_forced.clear()
+    r.server_overrides.clear()
     r.tools.cache = None
     r.tools.cache_time = 0.0
     r.tools.server_tools.clear()

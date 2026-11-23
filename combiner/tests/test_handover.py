@@ -54,6 +54,9 @@ class TestRoundTrip:
     async def test_write_then_load_restores_state(self, tmp_path: Path) -> None:
         RUNTIME.sessions.set_pending("tok-1", {"github", "svg-mcp"})
         RUNTIME.sessions.set_hidden(RUNTIME.sessions.token_hidden_tools, "tok-1", {"svg-mcp_add_*"})
+        RUNTIME.sessions.set_collection((True, "tok-1"), "music", True)
+        RUNTIME.sessions.set_collection((True, "tok-1"), "google", False)
+        RUNTIME.sessions.set_forced((True, "tok-1"), "github", True)
         REGISTRY.restore_parked(
             "svg-mcp",
             "tok-1",
@@ -79,6 +82,8 @@ class TestRoundTrip:
         assert not path.exists(), "consumed file must be deleted"
         assert RUNTIME.sessions.pending_token_filters == {"tok-1": {"github", "svg-mcp"}}
         assert RUNTIME.sessions.token_hidden_tools == {"tok-1": {"svg-mcp_add_*"}}
+        assert RUNTIME.sessions.token_collections == {"tok-1": {"music": True, "google": False}}
+        assert RUNTIME.sessions.token_forced == {"tok-1": {"github"}}
         parked = REGISTRY.pop_parked("svg-mcp", "tok-1")
         assert isinstance(parked, ParkedSession)
         assert parked.session_id == "sid-xyz"

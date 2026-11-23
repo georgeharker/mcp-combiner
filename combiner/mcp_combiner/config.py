@@ -384,11 +384,11 @@ def _merge_policies(
     )
 
 
-PROFILES_ENV = "MCP_COMBINER_PROFILES"
+COLLECTIONS_ENV = "MCP_COMBINER_COLLECTIONS"
 
 
-class ProfileWhen(BaseModel):
-    """Where a profile LOADS. Every given condition must match; none given
+class CollectionWhen(BaseModel):
+    """Where a collection LOADS. Every given condition must match; none given
     means everywhere."""
 
     #: ``sys.platform`` values: ``darwin``, ``linux``, ``win32``.
@@ -402,28 +402,28 @@ class ProfileWhen(BaseModel):
     PLATFORMS: ClassVar[frozenset[str]] = frozenset({"darwin", "linux", "win32"})
 
     @classmethod
-    def from_dict(cls, profile: str, data: object) -> ProfileWhen:
+    def from_dict(cls, collection: str, data: object) -> CollectionWhen:
         if not isinstance(data, dict):
-            raise ValueError(f"profile '{profile}': when must be an object")
+            raise ValueError(f"collection '{collection}': when must be an object")
         unknown = sorted(set(data) - {"platforms", "hosts", "env"})
         if unknown:
-            raise ValueError(f"profile '{profile}': unknown when key(s) {', '.join(unknown)}")
+            raise ValueError(f"collection '{collection}': unknown when key(s) {', '.join(unknown)}")
         platforms = data.get("platforms", [])
         hosts = data.get("hosts", [])
         env = data.get("env", [])
         for key, value in (("platforms", platforms), ("hosts", hosts)):
             if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
-                raise ValueError(f"profile '{profile}': when.{key} must be a list of strings")
+                raise ValueError(f"collection '{collection}': when.{key} must be a list of strings")
         bad = sorted(set(platforms) - cls.PLATFORMS)
         if bad:
             raise ValueError(
-                f"profile '{profile}': unknown platform(s) {', '.join(bad)}; "
+                f"collection '{collection}': unknown platform(s) {', '.join(bad)}; "
                 f"use {', '.join(sorted(cls.PLATFORMS))}"
             )
         if isinstance(env, dict):
             env = {str(k): str(v) for k, v in env.items()}
         elif not (isinstance(env, list) and all(isinstance(v, str) for v in env)):
-            raise ValueError(f"profile '{profile}': when.env must be a list or an object")
+            raise ValueError(f"collection '{collection}': when.env must be a list or an object")
         return cls(platforms=platforms, hosts=hosts, env=env)
 
     def matches(self) -> bool:
@@ -440,78 +440,80 @@ class ProfileWhen(BaseModel):
         return all(os.environ.get(k) for k in self.env)
 
 
-class ProfileConfig(BaseModel):
-    """A named group of servers (``"profiles": {name: {...}}``), design
-    decision 01M7E7BH8D. It LOADS where its ``when`` matches; a loaded profile
-    is on unless ``enabled: false``; a server in one or more profiles runs if
-    ANY of its loaded profiles is on."""
+class CollectionConfig(BaseModel):
+    """A named group of servers (``"collections": {name: {...}}``), design
+    decision 01M7E7BH8D. It LOADS where its ``when`` matches; a loaded collection
+    is on unless ``enabled: false``; a server in one or more collections runs if
+    ANY of its loaded collections is on."""
 
     name: str
-    when: ProfileWhen = Field(default_factory=ProfileWhen)
+    when: CollectionWhen = Field(default_factory=CollectionWhen)
     enabled: bool = True
 
     @classmethod
-    def from_dict(cls, name: str, data: object) -> ProfileConfig:
+    def from_dict(cls, name: str, data: object) -> CollectionConfig:
         if not isinstance(data, dict):
-            raise ValueError(f"profile '{name}' must be an object")
+            raise ValueError(f"collection '{name}' must be an object")
         unknown = sorted(set(data) - {"when", "enabled"})
         if unknown:
-            raise ValueError(f"profile '{name}': unknown key(s) {', '.join(unknown)}")
+            raise ValueError(f"collection '{name}': unknown key(s) {', '.join(unknown)}")
         enabled = data.get("enabled", True)
         if not isinstance(enabled, bool):
-            raise ValueError(f"profile '{name}': enabled must be true or false")
-        when = ProfileWhen.from_dict(name, data["when"]) if "when" in data else ProfileWhen()
+            raise ValueError(f"collection '{name}': enabled must be true or false")
+        when = CollectionWhen.from_dict(name, data["when"]) if "when" in data else CollectionWhen()
         return cls(name=name, when=when, enabled=enabled)
 
 
-def profile_overrides() -> dict[str, bool]:
-    """``$MCP_COMBINER_PROFILES``: comma-separated ``+name`` (on) / ``-name``
+def collection_overrides() -> dict[str, bool]:
+    """``$MCP_COMBINER_COLLECTIONS``: comma-separated ``+name`` (on) / ``-name``
     (off); a bare name means on."""
     out: dict[str, bool] = {}
-    for item in os.environ.get(PROFILES_ENV, "").split(","):
+    for item in os.environ.get(COLLECTIONS_ENV, "").split(","):
         item = item.strip()
         if item:
             out[item.lstrip("+-")] = not item.startswith("-")
     return out
 
 
-def server_runs(srv: ServerConfig, profiles: dict[str, ProfileConfig]) -> bool:
+def server_runs(srv: ServerConfig, collections: dict[str, CollectionConfig]) -> bool:
     """Whether *srv* should run: not disabled in the file, and (when governed
-    by profiles) at least one of its loaded profiles on — on-wins."""
+    by collections) at least one of its loaded collections on — on-wins."""
     if srv.disabled_in_file:
         return False
-    if not srv.profiles:
+    if not srv.collections:
         return True
-    return any(profiles[p].enabled for p in srv.profiles if p in profiles)
+    return any(collections[p].enabled for p in srv.collections if p in collections)
 
 
-def resolve_profiles(
-    defined: dict[str, ProfileConfig], servers: dict[str, ServerConfig]
-) -> tuple[dict[str, ProfileConfig], dict[str, ServerConfig]]:
-    """Apply profiles at load: the profiles that load here (with
-    ``$MCP_COMBINER_PROFILES`` applied), and the servers that remain, each
-    ``disabled`` unless :func:`server_runs`. A server whose profiles all failed
+def resolve_collections(
+    defined: dict[str, CollectionConfig], servers: dict[str, ServerConfig]
+) -> tuple[dict[str, CollectionConfig], dict[str, ServerConfig]]:
+    """Apply collections at load: the collections that load here (with
+    ``$MCP_COMBINER_COLLECTIONS`` applied), and the servers that remain, each
+    ``disabled`` unless :func:`server_runs`. A server whose collections all failed
     to load is dropped: it doesn't exist on this machine."""
     for name, srv in servers.items():
-        unknown = sorted(set(srv.profiles) - set(defined))
+        unknown = sorted(set(srv.collections) - set(defined))
         if unknown:
-            raise ValueError(f"server '{name}': unknown profile(s) {', '.join(unknown)}")
-    overrides = profile_overrides()
+            raise ValueError(f"server '{name}': unknown collection(s) {', '.join(unknown)}")
+    overrides = collection_overrides()
     unknown_env = sorted(set(overrides) - set(defined))
     if unknown_env:
-        logger.warning("%s names unknown profile(s): %s", PROFILES_ENV, ", ".join(unknown_env))
-    loaded: dict[str, ProfileConfig] = {}
-    for name, profile in defined.items():
-        if not profile.when.matches():
-            logger.info("profile '%s' doesn't apply on this machine — not loaded", name)
+        logger.warning(
+            "%s names unknown collection(s): %s", COLLECTIONS_ENV, ", ".join(unknown_env)
+        )
+    loaded: dict[str, CollectionConfig] = {}
+    for name, collection in defined.items():
+        if not collection.when.matches():
+            logger.info("collection '%s' doesn't apply on this machine — not loaded", name)
             continue
         if name in overrides:
-            profile = profile.model_copy(update={"enabled": overrides[name]})
-        loaded[name] = profile
+            collection = collection.model_copy(update={"enabled": overrides[name]})
+        loaded[name] = collection
     kept: dict[str, ServerConfig] = {}
     for name, srv in servers.items():
-        if srv.profiles and not any(p in loaded for p in srv.profiles):
-            logger.info("server '%s': none of its profiles load here — skipped", name)
+        if srv.collections and not any(p in loaded for p in srv.collections):
+            logger.info("server '%s': none of its collections load here — skipped", name)
             continue
         srv.disabled = not server_runs(srv, loaded)
         kept[name] = srv
@@ -613,16 +615,20 @@ class ServerConfig(BaseModel):
 
     See ``proxyfactory._effective_isolate``.
     """
-    #: The profiles this server belongs to (see :class:`ProfileConfig`). Empty:
-    #: not governed by profiles. Otherwise it runs only while one of them is on.
-    profiles: list[str] = Field(default_factory=list)
-    #: The server's own ``disabled`` from the file, before profiles apply
+    #: The collections this server belongs to (see :class:`CollectionConfig`). Empty:
+    #: not governed by collections. Otherwise it runs only while one of them is on.
+    collections: list[str] = Field(default_factory=list)
+    #: The server's own ``disabled`` from the file, before collections apply
     #: (``disabled`` is the effective value everything else reads).
     disabled_in_file: bool = False
 
     @classmethod
     def from_dict(cls, name: str, data: dict[str, Any]) -> ServerConfig:
         """Create ServerConfig from a config dict entry."""
+        if "profiles" in data:
+            raise ValueError(
+                f"server '{name}': \"profiles\" was renamed to \"collections\" in 0.26.0"
+            )
         _warn_unknown_keys(
             "server",
             name,
@@ -648,12 +654,14 @@ class ServerConfig(BaseModel):
                 "permissions",
                 "isolate",
                 "protocol",
-                "profiles",
+                "collections",
             },
         )
-        raw_profiles = data.get("profiles", [])
-        if not isinstance(raw_profiles, list) or not all(isinstance(p, str) for p in raw_profiles):
-            raise ValueError(f"server '{name}': profiles must be a list of profile names")
+        raw_collections = data.get("collections", [])
+        if not isinstance(raw_collections, list) or not all(
+            isinstance(p, str) for p in raw_collections
+        ):
+            raise ValueError(f"server '{name}': collections must be a list of collection names")
         transport_str = data.get("transport")
         if transport_str is None:
             transport_str = "http" if "url" in data else "stdio"
@@ -693,7 +701,7 @@ class ServerConfig(BaseModel):
             permissions=PermissionPolicy.from_dict(data.get("permissions")),
             isolate=(None if data.get("isolate") is None else bool(data["isolate"])),
             protocol=_upstream_protocol(name, data.get("protocol")),
-            profiles=list(raw_profiles),
+            collections=list(raw_collections),
             disabled_in_file=bool(data.get("disabled", False)),
         )
 
@@ -729,8 +737,8 @@ class ServerStatusInfo(BaseModel):
     """sharedServers key if this server has a managed process, else ``None``."""
     external_server: str | None = None
     """externalServers key if this server has a non-owned backing process, else ``None``."""
-    profiles: list[str] = Field(default_factory=list)
-    """The profiles this server belongs to (empty: not governed by profiles)."""
+    collections: list[str] = Field(default_factory=list)
+    """The collections this server belongs to (empty: not governed by collections)."""
     state: str = "unknown"
     """Runtime lifecycle state: ``"ready"``, ``"connected"`` (session up, tools
     warming), ``"disconnected"``, ``"auth_failed"``, or ``"disabled"``. Overlaid
@@ -1210,8 +1218,8 @@ class CombinerConfig(BaseModel):
     """Global tool-call permission policy applied to every server, unless a
     server overrides it.  ``None`` (default) means **off** — no gate, identical
     to pre-feature behavior.  See :class:`PermissionPolicy`."""
-    #: Profiles that LOADED on this machine (their ``when`` matched), by name.
-    profiles: dict[str, ProfileConfig] = Field(default_factory=dict)
+    #: Collections that LOADED on this machine (their ``when`` matched), by name.
+    collections: dict[str, CollectionConfig] = Field(default_factory=dict)
     config_path: str = ""
 
     @classmethod
@@ -1242,11 +1250,19 @@ class CombinerConfig(BaseModel):
         servers = {
             name: ServerConfig.from_dict(name, srv_data) for name, srv_data in raw_servers.items()
         }
-        raw_profiles = raw.get("profiles", {})
-        if not isinstance(raw_profiles, dict):
-            raise ValueError("profiles must be an object of profile name -> settings")
-        profiles, servers = resolve_profiles(
-            {name: ProfileConfig.from_dict(name, data) for name, data in raw_profiles.items()},
+        if "profiles" in raw:
+            raise ValueError(
+                '"profiles" was renamed to "collections" in 0.26.0 (the top-level block and '
+                "each server's list); MCP_COMBINER_PROFILES is now MCP_COMBINER_COLLECTIONS"
+            )
+        raw_collections = raw.get("collections", {})
+        if not isinstance(raw_collections, dict):
+            raise ValueError("collections must be an object of collection name -> settings")
+        collections, servers = resolve_collections(
+            {
+                name: CollectionConfig.from_dict(name, data)
+                for name, data in raw_collections.items()
+            },
             servers,
         )
 
@@ -1328,7 +1344,7 @@ class CombinerConfig(BaseModel):
             isolation=isolation,
             validation=validation,
             permissions=permissions,
-            profiles=profiles,
+            collections=collections,
             config_path=str(path),
         )
 
@@ -1432,7 +1448,7 @@ class CombinerConfig(BaseModel):
             auth_type=auth_type,
             shared_server=srv.shared_server,
             external_server=srv.external_server,
-            profiles=list(srv.profiles),
+            collections=list(srv.collections),
         )
 
 

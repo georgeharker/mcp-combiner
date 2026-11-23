@@ -806,15 +806,17 @@ async def cmd_health(args: argparse.Namespace) -> int:
     return 0 if code == 200 else 1
 
 
-async def cmd_profile(args: argparse.Namespace) -> int:
+async def cmd_collection(args: argparse.Namespace) -> int:
     if args.action == "list":
-        _emit(args, await _call_meta(args, "combiner__profiles", {}))
+        _emit(args, await _call_meta(args, "combiner__collections", {}))
         return 0
     if not args.name:
-        print(f"profile {args.action}: name a profile", file=sys.stderr)
+        print(f"collection {args.action}: name a collection", file=sys.stderr)
         return 2
-    tool = "combiner__enable_profile" if args.action == "enable" else "combiner__disable_profile"
-    _emit(args, await _call_meta(args, tool, {"profile": args.name}))
+    tool = (
+        "combiner__enable_collection" if args.action == "enable" else "combiner__disable_collection"
+    )
+    _emit(args, await _call_meta(args, tool, {"collection": args.name}))
     return 0
 
 
@@ -877,7 +879,7 @@ async def cmd_session(args: argparse.Namespace) -> int:
         return 0 if code == 200 else 1
 
     if not token:
-        print("session enable/disable/allow/clear require --token", file=sys.stderr)
+        print(f"session {args.session_op} requires --token", file=sys.stderr)
         return 2
 
     if args.session_op == "enable":
@@ -895,6 +897,18 @@ async def cmd_session(args: argparse.Namespace) -> int:
         )
     elif args.session_op == "clear":
         code, data = await _rest(args, "DELETE", f"/sessions/token/{token}/filter")
+    elif args.session_op in ("enable-collection", "disable-collection", "reset-collection"):
+        if not args.server:
+            print(f"session {args.session_op}: name a collection", file=sys.stderr)
+            return 2
+        field = {
+            "enable-collection": "collection_on",
+            "disable-collection": "collection_off",
+            "reset-collection": "collection_unset",
+        }[args.session_op]
+        code, data = await _rest(
+            args, "POST", f"/sessions/token/{token}/filter", {field: args.server}
+        )
     else:  # pragma: no cover - argparse restricts choices
         return 2
     _emit(args, data)
@@ -1089,11 +1103,11 @@ def add_ctl_parsers(subparsers: "argparse._SubParsersAction[argparse.ArgumentPar
     _common(p)
     p.set_defaults(func=cmd_authorize)
 
-    p = subparsers.add_parser("profile", help="List server profiles, or turn one on or off")
+    p = subparsers.add_parser("collection", help="List server collections, or turn one on or off")
     p.add_argument("action", choices=["list", "enable", "disable"])
-    p.add_argument("name", nargs="?", help="Profile name (enable/disable)")
+    p.add_argument("name", nargs="?", help="Collection name (enable/disable)")
     _common(p)
-    p.set_defaults(func=cmd_profile)
+    p.set_defaults(func=cmd_collection)
 
     p = subparsers.add_parser("reload", help="Re-read the config file and apply the diff")
     _common(p)
@@ -1111,16 +1125,31 @@ def add_ctl_parsers(subparsers: "argparse._SubParsersAction[argparse.ArgumentPar
 
     p = subparsers.add_parser(
         "session",
-        help="Per-chat session filters (by token) — WIP: status works; "
-        "enable/disable/allow are recorded but not yet applied (see QUESTIONS.md Q1/Q4)",
+        help="Per-chat settings, by chat token: servers and collections on or off for one chat",
     )
     p.add_argument(
         "session_op",
-        choices=("status", "enable", "disable", "allow", "clear"),
-        help="status: list sessions / one token's filter; enable/disable: one server; "
-        "allow: comma-separated allow-list; clear: drop the filter",
+        choices=(
+            "status",
+            "enable",
+            "disable",
+            "allow",
+            "clear",
+            "enable-collection",
+            "disable-collection",
+            "reset-collection",
+        ),
+        help="status: list sessions / one token's settings; enable/disable: one server; "
+        "allow: comma-separated allow-list; clear: drop all of the chat's settings; "
+        "enable-/disable-collection: a collection on/off for this chat; "
+        "reset-collection: the collection follows the combiner again",
     )
-    p.add_argument("server", nargs="?", default=None, help="Server name (enable/disable)")
+    p.add_argument(
+        "server",
+        nargs="?",
+        default=None,
+        help="Server name (enable/disable) or collection name (*-collection)",
+    )
     p.add_argument("--token", default=None, help="Chat token (UUID) naming the target session")
     p.add_argument("--servers", default=None, help="Comma-separated server names (for 'allow')")
     _common(p)
