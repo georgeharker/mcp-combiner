@@ -6,7 +6,7 @@ tagged `vX.Y.Z`. The extension runs the matching mcp-combiner release, so each
 entry also summarises the combiner's changes; the full list is in
 [the combiner's changelog](https://github.com/georgeharker/mcp-combiner/blob/main/combiner/CHANGELOG.md).
 
-## [0.26.0-dev.1] - 2026-11-23
+## [0.26.0] - 2026-11-24
 
 ### Added
 
