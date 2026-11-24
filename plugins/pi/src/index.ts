@@ -186,24 +186,6 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
             settingsUrl: settings.url,
             defaultUrl: defaultCombinerUrl(),
         })
-        // Zombie teardown: pi re-imports the extension module on /reload WITHOUT
-        // firing session_shutdown (the session persists, no unload hook exists), so
-        // the previous instance's McpClient + SSE stream would live on and compete
-        // for the token's elicit routing. A process-global registry survives module
-        // re-imports: the fresh factory closes every prior live connection first.
-        const g = globalThis as { __piMcpCombinerDispose?: Array<() => void> }
-        // The teardown closures below (from prior factory runs, orphaned by pi's
-        // reload-without-session_shutdown) know how to fully retire their instance:
-        // clear the footer timer, drop the captured UI ctx (stale-ctx reads on it
-        // are a hard pi-1.0 assertion), and close the connection.
-        for (const dispose of g.__piMcpCombinerDispose ?? []) {
-            try {
-                dispose()
-            } catch {
-                // teardown must never break the fresh instance's load
-            }
-        }
-        g.__piMcpCombinerDispose = []
         connection = new NativeCombinerConnection(connInputsFor(sessionCfg), clientLog)
         if (combinerProcess) {
             const proc = combinerProcess
@@ -267,13 +249,14 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
         let footerTimer: NodeJS.Timeout | undefined
         let uiCtx: ExtensionContext["ui"] | undefined
 
-        // Full instance teardown, callable from a LATER factory run (pi re-imports
-        // the module on /reload without firing session_shutdown): clears this
-        // instance's footer timer, drops its captured UI ctx (stale-ctx reads are
-        // a hard pi-1.0 assertion), and closes its connection. The registry lives
-        // on globalThis — the one thing that survives a module re-import.
-        const teardownGlobal = globalThis as { __piMcpCombinerDispose?: Array<() => void> }
-        ;(teardownGlobal.__piMcpCombinerDispose ??= []).push(() => {
+        // Full instance teardown: clears this instance's footer timer, drops its
+        // captured UI ctx (stale-ctx reads are a hard pi-1.0 assertion), and closes
+        // its connection. A LATER instance of the SAME session calls it (pi before
+        // 1.6 re-imported the module on /reload without session_shutdown, leaving
+        // this instance alive). Keyed by session id on globalThis — the one thing
+        // that survives a module re-import — so a subagent (a child session in the
+        // same process) or another chat never tears down this one.
+        const dispose = () => {
             if (footerTimer) clearInterval(footerTimer)
             footerTimer = undefined
             uiCtx = undefined
@@ -281,8 +264,8 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
             stopCombinerWatch?.()
             stopCombinerWatch = undefined
             nativeSurface?.dispose()
-            void conn.close("superseded by a newer extension instance (reload)")
-        })
+            void conn.close("superseded by a newer extension instance of this session (reload)")
+        }
 
         // Native registration progress (undefined when no pass is registering).
         let registering: RegisterProgress | undefined
@@ -339,6 +322,7 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
 
         pi.on("session_start", (event, ctx) => {
             try {
+                claimSession(ctx.sessionManager?.getSessionId?.(), dispose)
                 // Re-arm auto-reconnect and the process watch if a host reused this
                 // instance after a session_shutdown (idempotent; pi 1.6 doesn't reuse).
                 arm()
@@ -673,20 +657,68 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
     const proc = combinerProcess
     if (!proc) return // unreachable: combinerProcess exists exactly when manage && !hostOwned
     pi.on("session_start", async (_event, ctx) => {
+        liveSessions().add(ctx.sessionManager?.getSessionId?.() ?? PROCESS_SESSION)
         await proc.start(makeLog(ctx, notify))
     })
 
-    pi.on("session_shutdown", (event: SessionShutdownEvent) => {
-        // Only "quit" means the Pi process is actually leaving. reload/new/resume/fork
-        // keep the process alive and a fresh session_start re-attaches — releasing the
-        // refcount on those would needlessly drop (and re-take) the shared combiner.
-        if (event.reason === "quit") proc.quit()
+    pi.on("session_shutdown", (event: SessionShutdownEvent, ctx: ExtensionContext) => {
+        // Only "quit" means a session is leaving for good; reload/new/resume/fork
+        // keep the process alive and a fresh session_start re-attaches. And the
+        // combiner ref belongs to the whole pi process: a subagent's child session
+        // quitting must not release it from under its parent — only the last
+        // session to quit does. (Process exit releases it regardless.)
+        if (event.reason !== "quit") return
+        const sessions = liveSessions()
+        sessions.delete(ctx?.sessionManager?.getSessionId?.() ?? PROCESS_SESSION)
+        if (sessions.size === 0) proc.quit()
     })
 }
 
 // ── helpers ────────────────────────────────────────────────────
 
 // ── client-half helpers ──
+
+/** Sessions in this pi process that started and haven't quit (the combiner ref is
+ *  released when the last one quits). PROCESS_SESSION stands in for a session
+ *  whose id pi doesn't expose. */
+const LIVE_SESSIONS_KEY = "__piMcpCombinerLiveSessions"
+const PROCESS_SESSION = "(process)"
+function liveSessions(): Set<string> {
+    const g = globalThis as Record<string, unknown>
+    let set = g[LIVE_SESSIONS_KEY] as Set<string> | undefined
+    if (!set) {
+        set = new Set()
+        g[LIVE_SESSIONS_KEY] = set
+    }
+    return set
+}
+
+/** This extension's live instances in the pi process, by session id. */
+const INSTANCES_KEY = "__piMcpCombinerInstances"
+
+/** Record *dispose* as the live instance for *sessionId*, tearing down an earlier
+ *  instance of the SAME session (a reload that didn't shut the old one down). An
+ *  instance of another session — a subagent's child session, or another chat in
+ *  the same process — is never touched. Without a session id there is nothing to
+ *  match on: leave everything alone. */
+export function claimSession(sessionId: string | undefined, dispose: () => void): void {
+    if (!sessionId) return
+    const g = globalThis as Record<string, unknown>
+    let instances = g[INSTANCES_KEY] as Map<string, () => void> | undefined
+    if (!instances) {
+        instances = new Map()
+        g[INSTANCES_KEY] = instances
+    }
+    const previous = instances.get(sessionId)
+    instances.set(sessionId, dispose)
+    if (previous && previous !== dispose) {
+        try {
+            previous()
+        } catch {
+            // teardown must never break the fresh instance
+        }
+    }
+}
 
 /** Best-effort detection of an installed pi-mcp-adapter package (coexistence warn). */
 function adapterPackageInstalled(): boolean {

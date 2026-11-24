@@ -6,6 +6,23 @@ tagged `vX.Y.Z`. The extension runs the matching mcp-combiner release, so each
 entry also summarises the combiner's changes; the full list is in
 [the combiner's changelog](https://github.com/georgeharker/mcp-combiner/blob/main/combiner/CHANGELOG.md).
 
+## [Unreleased]
+
+### Fixed
+
+- **Starting a subagent no longer disconnects the chat that started it.** A
+  subagent runs as a child session in the same pi process and loads its own
+  copy of the extension. The guard against stale copies left behind by
+  `/reload` closed every other copy in the process, including the parent
+  chat's, so all of the parent's combiner tools then failed with "the combiner
+  connection is closed (session ended)". A new copy now closes only an earlier
+  copy of its own session.
+- **A subagent quitting no longer releases the combiner for its parent.** The
+  combiner reference belongs to the whole pi process; it is released only when
+  the last session in the process quits (or the process exits). Before, a
+  child session quitting marked the process as quitting, so the parent could
+  no longer re-attach to or respawn the combiner.
+
 ## [0.26.0] - 2026-11-24
 
 ### Added
