@@ -383,3 +383,51 @@ describe("final review fixes (connection)", () => {
         await conn.close("test done")
     })
 })
+
+describe("connect now (/mcp-combiner connect)", () => {
+    it("skips the background backoff and connects right away", async () => {
+        const combiner = new Combiner(1) // the first connect is refused
+        const conn = new NativeCombinerConnection(inputs, quiet, {
+            transportFactory: () => combiner.transport(),
+            retry: noRetry,
+            // A long background backoff: only connectNow can connect in time.
+            autoReconnect: { ...fastAuto, failMs: 60_000, failMaxMs: 60_000 },
+        })
+        conn.setToken("pi-test")
+        conn.setAutoReconnect(true)
+        await expect(conn.ensureConnected()).rejects.toThrow()
+        expect(conn.state).toBe("failed")
+        await conn.connectNow()
+        expect(conn.state).toBe("connected")
+        expect(combiner.attempts).toBe(2)
+        await conn.close("test done")
+    })
+
+    it("uses the cold-start budget even after an earlier connect", async () => {
+        const combiner = new Combiner()
+        const retry: ConnectRetry = { budgetMs: 2_000, reconnectBudgetMs: 0, firstMs: 10, maxMs: 20 }
+        const conn = connection(combiner, retry)
+        await conn.ensureConnected()
+        await conn.reset("combiner restarted")
+        combiner.refuse = 3 // still booting: refused a few times
+        await conn.connectNow() // the reconnect budget (0) would have given up
+        expect(conn.state).toBe("connected")
+        expect(combiner.attempts).toBe(5)
+    })
+
+    it("is a no-op when connected, and joins a connect in progress", async () => {
+        const combiner = new Combiner(2)
+        const conn = connection(combiner)
+        const first = conn.ensureConnected()
+        const joined = conn.connectNow()
+        expect(await joined).toBe(await first)
+        expect(await conn.connectNow()).toBe(await first)
+        expect(combiner.attempts).toBe(3)
+    })
+
+    it("refuses after close", async () => {
+        const conn = connection(new Combiner())
+        await conn.close("session ended")
+        await expect(conn.connectNow()).rejects.toThrow("closed")
+    })
+})

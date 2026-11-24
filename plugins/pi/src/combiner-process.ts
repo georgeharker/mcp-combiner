@@ -550,6 +550,15 @@ export class CombinerProcess {
         }
     }
 
+    /** The user's "connect now" (/mcp-combiner connect): like start() — lift a
+     *  respawn stop, forget earlier respawns — then attach (launching if needed)
+     *  when this pi process holds no ref. Returns whether it holds one after. */
+    async retryNow(log: LogFn): Promise<boolean> {
+        if (this.state.quitting) return false
+        await this.start(log)
+        return this.attached
+    }
+
     /** session_shutdown("quit"): release the ref; no attach after this. */
     quit(): void {
         this.state.quitting = true

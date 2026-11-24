@@ -10,6 +10,11 @@ entry also summarises the combiner's changes; the full list is in
 
 ### Added
 
+- **`/mcp-combiner connect`** connects now instead of waiting out the retry
+  backoff (up to 10 s between background attempts), with the full cold-start
+  budget. For a combiner the extension manages, it first attaches to it, or
+  launches it if it isn't running, and lifts a respawn stop. It reports the
+  tool count, or why it failed; background retrying carries on either way.
 - **`/mcp-combiner collections`** lists each server collection: on or off for
   this chat and for the combiner, and its servers.
 - **`/mcp-combiner collection on|off|reset <name>`** turns one on or off for

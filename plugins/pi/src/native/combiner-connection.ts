@@ -256,6 +256,22 @@ export class NativeCombinerConnection implements CombinerConnection {
         })
     }
 
+    /** The user's "connect now" (/mcp-combiner connect): skip any background
+     *  backoff and connect right away, with the cold-start retry budget (the user
+     *  may just have started the combiner). Connected already: a no-op. A connect
+     *  in progress: wait for it. Resolves to the client, or rejects with the
+     *  reason; a failure goes back to background retrying as usual. */
+    async connectNow(): Promise<McpClient> {
+        if (this.closed) throw new Error("the combiner connection is closed (session ended)")
+        if (this.client) return this.client
+        if (this.connecting) return this.connecting
+        this.clearReconnectTimer()
+        this.failDelayMs = 0
+        this.dropDelayMs = 0
+        this.everConnected = false // the full cold-start budget
+        return this.ensureConnected()
+    }
+
     /** Undo close() for a host that reuses the extension instance across sessions
      *  (pi 1.6 doesn't; harmless when nothing was closed). */
     reopen(): void {

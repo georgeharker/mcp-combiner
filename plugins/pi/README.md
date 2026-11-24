@@ -238,6 +238,7 @@ refreshed on connect/changes and every 30s; honest degradation when unreachable.
 | --------------------------------------------- | ------------------------------------------------------------ |
 | _(none)_ / `status`                           | Connection state, per-server glyph table, session view       |
 | `panel`                                       | Interactive panel (below)                                    |
+| `connect`                                     | Connect now: skip the retry backoff; for a combiner the extension manages, attach to it (or launch it) first |
 | `enable` / `disable` / `restart-server <srv>` | Drive the combiner's meta-tools                              |
 | `collections`                                 | Each collection: on or off for this chat and for the combiner, and its servers |
 | `collection on\|off\|reset <name>`            | A collection on or off for this chat only, or back to the combiner's setting |

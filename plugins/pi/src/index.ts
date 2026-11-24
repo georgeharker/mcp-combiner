@@ -507,7 +507,7 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
     // combiner entry — legacy pairing with pi-mcp-adapter, now also read by our ladder).
     const combinerCommandSpec: CommandSpec = {
         description:
-            "mcp-combiner — verbs: status, enable <srv>, disable <srv>, restart-server <srv>, collections, collection on|off|reset <name>, system-prompt, install-config [path]",
+            "mcp-combiner — verbs: status, connect, enable <srv>, disable <srv>, restart-server <srv>, collections, collection on|off|reset <name>, system-prompt, install-config [path]",
         getArgumentCompletions: (prefix) => completeVerbs(prefix),
         handler: (args, ctx) => {
             const [verb, ...rest] = args.trim().split(/\s+/)
@@ -560,6 +560,37 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
                     .then((t) => uiNotifySafe(t, "info"))
                     .catch((e) =>
                         uiNotifySafe(`status failed (${e instanceof Error ? e.message : String(e)})`, "error"),
+                    )
+                return
+            }
+            if (v === "connect") {
+                if (!connection) {
+                    ctx.ui?.notify?.(
+                        `mcp-combiner: client half off${adapterOffReason ? ` — ${adapterOffReason}` : ""}`,
+                        "warn",
+                    )
+                    return
+                }
+                const conn = connection
+                if (conn.state === "connected") {
+                    uiNotifySafe(`already connected to ${sessionCfg?.baseUrl ?? "the combiner"}`, "info")
+                    return
+                }
+                uiNotifySafe(`connecting to ${sessionCfg?.baseUrl ?? "the combiner"}…`, "info")
+                void (async () => {
+                    // A combiner we manage: re-attach (launching it if it isn't
+                    // running), lifting any respawn stop — the user asked for it.
+                    if (combinerProcess) await combinerProcess.retryNow(clientLog)
+                    await conn.connectNow()
+                    const tools = await conn.listTools(true).catch(() => [])
+                    return `connected — ${tools.length} tools`
+                })()
+                    .then((t) => uiNotifySafe(t, "info"))
+                    .catch((e) =>
+                        uiNotifySafe(
+                            `connect failed (${e instanceof Error ? e.message : String(e)}); still retrying in the background`,
+                            "error",
+                        ),
                     )
                 return
             }
@@ -682,6 +713,7 @@ function sessionToken(event: SessionStartEvent, ctx: ExtensionContext): string {
 // `/system-prompt` (which reports the base prompt only).
 const COMMAND_VERBS = [
     "status",
+    "connect",
     "panel",
     "enable",
     "disable",
