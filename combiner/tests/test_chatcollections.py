@@ -133,3 +133,70 @@ def test_a_server_enabled_for_everyone_is_visible_to_chats_that_follow_the_combi
     assert "ableton" not in chatcollections.hidden_for(cfg, {}, set())
     # A chat that turned the collection off still doesn't see it.
     assert "ableton" in chatcollections.hidden_for(cfg, {"music": False}, set())
+
+
+# ── expiring abandoned chats ─────────────────────────────────────────
+
+
+def test_expiry_removes_only_that_chats_vote(cfg: CombinerConfig) -> None:
+    """Two chats want 'music'; the first to go leaves the server wanted by
+    the other; once both are gone nothing wants it."""
+    RUNTIME.config = cfg
+    limit = chatcollections.expiry_seconds()
+    sessions = RUNTIME.sessions
+    sessions.set_collection(A, "music", True)
+    sessions.set_collection(B, "music", True)
+    sessions.chat_seen[A] = 0.0
+    sessions.chat_seen[B] = limit  # seen later
+    assert chatcollections.sweep_once(now=limit + 1) == [A]
+    assert chatcollections.demanded(cfg, sessions) == {"ableton": [B]}
+    assert chatcollections.sweep_once(now=2 * limit + 1) == [B]
+    assert chatcollections.demanded(cfg, sessions) == {}
+    assert sessions.chat_seen == {}
+
+
+def test_a_global_setting_survives_every_chat_expiring(cfg: CombinerConfig) -> None:
+    RUNTIME.config = cfg
+    RUNTIME.sessions.set_collection(A, "core", False)
+    RUNTIME.sessions.chat_seen[A] = 0.0
+    chatcollections.sweep_once(now=chatcollections.expiry_seconds() + 1)
+    github = cfg.servers["github"]
+    assert chatcollections.should_run(cfg, "github", github, {}, {})  # 'core' is on in the file
+
+
+def test_a_recent_or_unclocked_chat_is_kept(cfg: CombinerConfig) -> None:
+    RUNTIME.config = cfg
+    limit = chatcollections.expiry_seconds()
+    RUNTIME.sessions.set_collection(A, "music", True)
+    RUNTIME.sessions.chat_seen[A] = 10.0
+    assert chatcollections.sweep_once(now=limit) == []  # not idle long enough
+    # State restored by a handover has no clock: it starts at the first sweep.
+    RUNTIME.sessions.set_collection(B, "music", True)
+    del RUNTIME.sessions.chat_seen[B]
+    assert chatcollections.sweep_once(now=5 * limit) == [A]
+    assert RUNTIME.sessions.chat_seen[B] == 5 * limit
+
+
+def test_a_request_restarts_the_clock_only_for_chats_with_state(cfg: CombinerConfig) -> None:
+    sessions = RUNTIME.sessions
+    sessions.touch_chat(A)
+    assert A not in sessions.chat_seen
+    sessions.set_collection(A, "music", True)
+    sessions.chat_seen[A] = 0.0
+    sessions.touch_chat(A)
+    assert sessions.chat_seen[A] > 0.0
+
+
+def test_expiry_follows_the_isolation_timers(tmp_path: Path) -> None:
+    path = tmp_path / "servers.json"
+    path.write_text(
+        json.dumps(
+            {
+                "isolation": {"grace_seconds": 2.0, "park_ttl_seconds": 3.0},
+                "collections": {"music": {}},
+                "mcpServers": {},
+            }
+        )
+    )
+    RUNTIME.config = CombinerConfig.load(str(path))
+    assert chatcollections.expiry_seconds() == 5.0

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 
@@ -35,6 +36,10 @@ from mcp_combiner.runtime import RUNTIME, ChatRef, SessionRegistry
 logger = logging.getLogger("mcp-combiner")
 
 _lock = asyncio.Lock()
+_sweeper: asyncio.Task[None] | None = None
+
+#: Upper bound on how often abandoned chat state is looked for.
+SWEEP_INTERVAL_SECONDS = 60.0
 
 
 def governed(config: CombinerConfig) -> Iterator[tuple[str, ServerConfig]]:
@@ -174,7 +179,70 @@ async def reconcile() -> Outcome:
                 (outcome.failed if _went_wrong(result) else outcome.stopped).append(name)
     if outcome.started or outcome.stopped or outcome.failed:
         logger.info("collections: %s", outcome.describe())
+    ensure_sweeper()
     return outcome
+
+
+# ── expiring abandoned chats ─────────────────────────────────────────
+
+
+def expiry_seconds() -> float:
+    """How long a chat with no connection and no requests keeps its
+    collection state: the same as an isolated chat's upstream sessions
+    (isolation grace + park TTL; 300 s + 3600 s by default)."""
+    config = RUNTIME.config
+    if config is None:
+        return 3900.0
+    return config.isolation.grace_seconds + config.isolation.park_ttl_seconds
+
+
+def sweep_once(now: float | None = None) -> list[ChatRef]:
+    """Forget the collection state of chats that are gone: no live downstream
+    connection, and no request for :func:`expiry_seconds`. Only that chat's
+    vote goes — servers another chat or a global setting still wants keep
+    running. Returns the chats forgotten; the caller reconciles."""
+    now = time.monotonic() if now is None else now
+    sessions = RUNTIME.sessions
+    limit = expiry_seconds()
+    gone: list[ChatRef] = []
+    for ref in sessions.chats_with_collection_state():
+        # State restored by a handover has no clock yet: it starts now.
+        seen = sessions.chat_seen.setdefault(ref, now)
+        if sessions.chat_connected(ref):
+            sessions.chat_seen[ref] = now
+            continue
+        if now - seen > limit:
+            sessions.forget_chat_collections(ref)
+            gone.append(ref)
+    if gone:
+        logger.info(
+            "collections: forgot %d abandoned chat(s): %s",
+            len(gone),
+            ", ".join(f"{key[:8]}…" for _, key in gone),
+        )
+    return gone
+
+
+def ensure_sweeper() -> None:
+    """Start the background sweep (once per process; needs a running loop)."""
+    global _sweeper
+    if _sweeper is not None and not _sweeper.done():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    _sweeper = loop.create_task(_sweep_loop(), name="collections-sweeper")
+
+
+async def _sweep_loop() -> None:
+    while True:
+        await asyncio.sleep(min(SWEEP_INTERVAL_SECONDS, max(expiry_seconds() / 4, 0.1)))
+        try:
+            if sweep_once():
+                await reconcile()
+        except Exception:
+            logger.exception("collections: sweep failed")
 
 
 def visibility(config: CombinerConfig, ref: ChatRef | None) -> dict[str, bool]:

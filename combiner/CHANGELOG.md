@@ -37,6 +37,10 @@ tagged `vX.Y.Z`.
     restarts (they ride the handover). A tokenless chat's go with its session.
   - `combiner__collections` and `combiner__session_status` show what the
     calling chat sees.
+  - A chat that's gone (no connection and no requests for the isolation
+    grace plus park TTL, about an hour by default) has its collections
+    forgotten. Only that chat's vote goes: a server another chat or a global
+    setting still wants keeps running.
 - **Neovim plugin:** `/mcp-collection` turns a collection on or off for the
   current chat. CodeCompanion HTTP-adapter chats now take their tools from
   their own per-chat combiner client: servers only some chats see are

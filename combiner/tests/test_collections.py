@@ -335,3 +335,52 @@ class TestPerChatCollections:
         async with Client(combiner.mcp_url, mode=CLIENT_CONNECT_MODE) as c:
             listed = await _call(c, "combiner__collections")
         assert listed["extra"]["servers"]["one"]["running"] is False
+
+    async def test_an_abandoned_chats_collection_expires(
+        self, procs: ProcFactory, tmp_path: Path
+    ) -> None:
+        """Two chats turn 'extra' on and go away without a DELETE: when the
+        first one's state expires, 'one' keeps running for the second; when
+        the second's does, 'one' stops."""
+        import asyncio
+
+        import httpx2
+
+        one = await procs.start_http_mock("one")
+        two = await procs.start_http_mock("two")
+        config = tmp_path / "servers.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "isolation": {"grace_seconds": 0.5, "park_ttl_seconds": 1.5},
+                    "collections": {"extra": {"enabled": False}, "core": {}},
+                    "mcpServers": {
+                        "one": http_mock_entry(one.port) | {"collections": ["extra"]},
+                        "two": http_mock_entry(two.port) | {"collections": ["core"]},
+                    },
+                }
+            )
+        )
+        combiner = await procs.start_combiner(config)
+        await combiner.wait_server_state("two", ("ready",), timeout=60.0)
+
+        async def running() -> bool:
+            async with Client(combiner.mcp_url, mode=CLIENT_CONNECT_MODE) as c:
+                listed = await _call(c, "combiner__collections")
+            return bool(listed["extra"]["servers"]["one"]["running"])
+
+        base = f"{combiner.base_url}/sessions/token"
+        async with httpx2.AsyncClient(timeout=60.0) as http:
+            await http.post(f"{base}/chat-exp-aaaa/filter", json={"collection_on": "extra"})
+            await combiner.wait_server_state("one", ("ready",), timeout=60.0)
+            await asyncio.sleep(1.2)
+            await http.post(f"{base}/chat-exp-bbbb/filter", json={"collection_on": "extra"})
+            await asyncio.sleep(1.5)  # a's 2 s are up, b's aren't
+            assert (await http.get(f"{base}/chat-exp-aaaa/filter")).json()["collections"] == {}
+            assert (await http.get(f"{base}/chat-exp-bbbb/filter")).json()["collections"] == {
+                "extra": True
+            }
+            assert await running()
+            await asyncio.sleep(2.0)  # b's are up too
+            assert (await http.get(f"{base}/chat-exp-bbbb/filter")).json()["collections"] == {}
+        assert not await running()

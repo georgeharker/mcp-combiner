@@ -538,7 +538,11 @@ is on.
   the CLI (`mcp-combiner session enable-collection <name> --token <t>`), Pi
   (`/mcp-combiner collection on|off|reset <name>`) and Neovim (`/mcp-collection`).
   A tokened chat keeps its collections across reconnects and sanctioned
-  restarts; a tokenless one's go with its session.
+  restarts; a tokenless one's go with its session. A chat that's gone — no
+  connection and no requests for the isolation timers (`grace_seconds` +
+  `park_ttl_seconds`, about an hour by default) — has its collections
+  forgotten; only its own vote goes, so servers another chat or a global
+  setting still wants keep running.
 - **At startup** — `MCP_COMBINER_COLLECTIONS=+music,-google` turns collections
   on (`+name` or bare `name`) or off (`-name`), overriding `enabled`.
 

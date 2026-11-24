@@ -116,6 +116,9 @@ class SessionRegistry:
     sid_collections: dict[str, dict[str, bool]] = field(default_factory=dict)
     token_forced: dict[str, set[str]] = field(default_factory=dict)
     sid_forced: dict[str, set[str]] = field(default_factory=dict)
+    # When each chat with collection state last made a request (monotonic):
+    # the idle clock chatcollections.sweep_once expires abandoned state by.
+    chat_seen: dict[ChatRef, float] = field(default_factory=dict)
 
     # -- active sessions --------------------------------------------------
 
@@ -243,6 +246,7 @@ class SessionRegistry:
     def set_collection(self, ref: ChatRef, name: str, on: bool | None) -> None:
         """Turn *name* on/off for the chat, or back to following the global
         state (``None``)."""
+        self.chat_seen[ref] = time.monotonic()
         store = self.token_collections if ref[0] else self.sid_collections
         state = dict(store.get(ref[1], {}))
         if on is None:
@@ -261,6 +265,7 @@ class SessionRegistry:
         return store.get(ref[1], set())
 
     def set_forced(self, ref: ChatRef, server: str, on: bool) -> None:
+        self.chat_seen[ref] = time.monotonic()
         store = self.token_forced if ref[0] else self.sid_forced
         forced = set(store.get(ref[1], set()))
         (forced.add if on else forced.discard)(server)
@@ -291,7 +296,31 @@ class SessionRegistry:
         session ended); returns whether there was any."""
         a = (self.token_collections if ref[0] else self.sid_collections).pop(ref[1], None)
         b = (self.token_forced if ref[0] else self.sid_forced).pop(ref[1], None)
+        self.chat_seen.pop(ref, None)
         return bool(a or b)
+
+    def has_collection_state(self, ref: ChatRef) -> bool:
+        store_c = self.token_collections if ref[0] else self.sid_collections
+        store_f = self.token_forced if ref[0] else self.sid_forced
+        return ref[1] in store_c or ref[1] in store_f
+
+    def touch_chat(self, ref: ChatRef | None) -> None:
+        """A request from chat *ref*: restart its idle clock (only chats with
+        collection state are tracked)."""
+        if ref is not None and self.has_collection_state(ref):
+            self.chat_seen[ref] = time.monotonic()
+
+    def chat_connected(self, ref: ChatRef) -> bool:
+        """Whether chat *ref* has a live downstream connection right now."""
+        if ref[0]:
+            from mcp_combiner import nvim_proxy
+
+            sids = set(nvim_proxy.sessions_for_token(ref[1]))
+        else:
+            sids = {ref[1]}
+        if not sids:
+            return False
+        return any(connection_session_id(c) in sids for c in self.connections())
 
     # -- per-chat hidden tools ---------------------------------------------
 
@@ -631,6 +660,7 @@ def reset() -> None:
     r.sessions.sid_collections.clear()
     r.sessions.token_forced.clear()
     r.sessions.sid_forced.clear()
+    r.sessions.chat_seen.clear()
     r.server_overrides.clear()
     r.tools.cache = None
     r.tools.cache_time = 0.0

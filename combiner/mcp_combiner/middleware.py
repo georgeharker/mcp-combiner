@@ -204,6 +204,8 @@ class ToolProcessingMiddleware(Middleware):
                 # Build the session_id -> token reverse map used to route
                 # neovim_* calls back to the editor that owns this chat.
                 nvim_proxy.record_session_token(sid)
+                # A chat that turned collections on is still here.
+                RUNTIME.sessions.touch_chat(RUNTIME.sessions.chat_ref(sid))
 
                 if is_new and connection is not None:
                     cp = connection.client_params

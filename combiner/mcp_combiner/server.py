@@ -353,6 +353,7 @@ def create_combiner(
         from mcp_combiner import chatcollections
 
         chatcollections.apply(config)
+        chatcollections.ensure_sweeper()  # expires state of chats that are gone
         enabled = config.get_enabled_servers()
         # Each upstream's protocol era (server/discover probes for protocol:
         # auto, concurrently) — decided before its connection or proxy exists.
