@@ -109,7 +109,7 @@ function ncDbg(s: string): void {
 
 // Keep in sync with plugins/pi/package.json "version": scripts/bump-version.sh stamps
 // this line alongside the package files (the string is what this client declares).
-const CLIENT_INFO = { name: "pi-mcp-combiner", version: "0.26.0-dev.1" }
+const CLIENT_INFO = { name: "pi-mcp-combiner", version: "0.26.0" }
 const CONNECT_TIMEOUT_MS = 8_000
 
 /** Retry schedule for a REFUSED connect (nothing listening on the port yet). The
