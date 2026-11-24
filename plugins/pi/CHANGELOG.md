@@ -6,6 +6,11 @@ tagged `vX.Y.Z`. The extension runs the matching mcp-combiner release, so each
 entry also summarises the combiner's changes; the full list is in
 [the combiner's changelog](https://github.com/georgeharker/mcp-combiner/blob/main/combiner/CHANGELOG.md).
 
+## [0.26.2] - 2026-11-24
+
+No extension changes. The combiner updates three dependencies for critical
+CVEs (pyjwt, cryptography, anyio); see the combiner's changelog.
+
 ## [0.26.1] - 2026-11-24
 
 ### Fixed

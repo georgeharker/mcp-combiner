@@ -4,6 +4,15 @@ All notable changes to the combiner are documented here. The version moves in
 lockstep with the rest of the repo (`scripts/bump-version.sh`); releases are
 tagged `vX.Y.Z`.
 
+## [0.26.2] — 2026-11-24
+
+### Security
+
+- **Dependency updates for critical CVEs** (lock-only; nothing else in the
+  lock moves): pyjwt 2.12.1 → 2.14.0, cryptography 46.0.5 → 46.0.7, anyio
+  4.12.1 → 4.14.2. All three are transitive (via mcp, authlib/joserfc,
+  starlette/httpx2).
+
 ## [0.26.1] — 2026-11-24
 
 No combiner changes. This release fixes the Pi extension: starting a
