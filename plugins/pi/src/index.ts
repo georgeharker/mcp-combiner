@@ -325,7 +325,7 @@ export default function mcpCombiner(pi: ExtensionAPI): void {
         pi.on("session_start", (event, ctx) => {
             try {
                 claimedSession = ctx.sessionManager?.getSessionId?.()
-                claimSession(claimedSession, dispose)
+                claimSession(claimedSession, dispose, event.reason, clientLog)
                 // Re-arm auto-reconnect and the process watch if a host reused this
                 // instance after a session_shutdown (idempotent; pi 1.6 doesn't reuse).
                 arm()
@@ -725,7 +725,12 @@ const INSTANCES_KEY = "__piMcpCombinerInstances"
  *  the same process — is never touched. Relies on child sessions getting their own
  *  session ids (pi's subagents do: each child has its own `pi-<id>` token). Without
  *  a session id there is nothing to match on: leave everything alone. */
-export function claimSession(sessionId: string | undefined, dispose: () => void): void {
+export function claimSession(
+    sessionId: string | undefined,
+    dispose: () => void,
+    reason = "reload",
+    log?: LogFn,
+): void {
     if (!sessionId) return
     const g = globalThis as Record<string, unknown>
     let instances = g[INSTANCES_KEY] as Map<string, () => void> | undefined
@@ -734,6 +739,18 @@ export function claimSession(sessionId: string | undefined, dispose: () => void)
         g[INSTANCES_KEY] = instances
     }
     const previous = instances.get(sessionId)
+    if (previous && previous !== dispose && reason !== "reload") {
+        // A live instance already holds this id and this isn't a reload of it:
+        // another session (e.g. a subagent opened on its parent's session) shares
+        // the id. Closing the other one would disconnect a live chat — warn and
+        // leave it running; this instance doesn't take the slot.
+        log?.(
+            "warn",
+            `session ${sessionId} is already live in this pi process (session_start "${reason}"); ` +
+                "two sessions share one id, so the chat token is shared too — leaving the other one connected",
+        )
+        return
+    }
     instances.set(sessionId, dispose)
     if (previous && previous !== dispose) {
         try {

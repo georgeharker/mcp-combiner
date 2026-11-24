@@ -31,6 +31,18 @@ describe("claimSession", () => {
         expect(closed).toBe(0)
     })
 
+    it("a non-reload start on an id that's already live warns instead of disposing", () => {
+        let parentClosed = false
+        const warnings: string[] = []
+        claimSession("shared", () => (parentClosed = true), "startup")
+        claimSession("shared", () => undefined, "startup", (level, message) => {
+            if (level === "warn") warnings.push(message)
+        })
+        expect(parentClosed).toBe(false)
+        expect(warnings).toHaveLength(1)
+        expect(warnings[0]).toContain("already live")
+    })
+
     it("without a session id nothing is disposed", () => {
         let closed = false
         claimSession("chat", () => (closed = true))
