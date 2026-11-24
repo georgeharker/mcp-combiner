@@ -627,7 +627,7 @@ class ServerConfig(BaseModel):
         """Create ServerConfig from a config dict entry."""
         if "profiles" in data:
             raise ValueError(
-                f"server '{name}': \"profiles\" was renamed to \"collections\" in 0.26.0"
+                f'server \'{name}\': "profiles" was renamed to "collections" in 0.26.0'
             )
         _warn_unknown_keys(
             "server",
