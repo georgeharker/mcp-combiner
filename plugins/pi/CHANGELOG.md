@@ -6,6 +6,16 @@ tagged `vX.Y.Z`. The extension runs the matching mcp-combiner release, so each
 entry also summarises the combiner's changes; the full list is in
 [the combiner's changelog](https://github.com/georgeharker/mcp-combiner/blob/main/combiner/CHANGELOG.md).
 
+## [Unreleased]
+
+### Changed
+
+- **Reconnecting after the combiner goes away retries for 15 s instead of 3 s**
+  (the same as a cold start). A combiner restart can take several seconds to
+  listen again, and 3 s usually ran out first, so a restart that recovered on
+  its own still showed "combiner connect failed". The trade-off: a tool call
+  made while the combiner is really down waits up to 15 s before failing.
+
 ## [0.26.2] - 2026-11-24
 
 No extension changes. The combiner updates three dependencies for critical

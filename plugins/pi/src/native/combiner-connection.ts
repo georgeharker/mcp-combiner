@@ -119,11 +119,13 @@ const CONNECT_TIMEOUT_MS = 8_000
  *  this retry is what waits for the port. Backoff doubles from `firstMs` to `maxMs`
  *  within `budgetMs` until the first successful connect; after that, a refused
  *  connect means the combiner went away (a restart, or it's down), so callers (tool
- *  calls, footer refreshes) wait only `reconnectBudgetMs`: enough to ride out a
- *  restart, short enough not to stall when it's down. Other errors (timeouts, HTTP
- *  errors) are not retried here. */
+ *  calls, footer refreshes) wait `reconnectBudgetMs`: long enough to ride out a
+ *  restart (a combiner mounts every server before it listens, which can take
+ *  several seconds), so a restart doesn't surface as a failure. A call made while
+ *  the combiner is really down therefore waits that long before failing. Other
+ *  errors (timeouts, HTTP errors) are not retried here. */
 export type ConnectRetry = { budgetMs: number; reconnectBudgetMs: number; firstMs: number; maxMs: number }
-const DEFAULT_CONNECT_RETRY: ConnectRetry = { budgetMs: 15_000, reconnectBudgetMs: 3_000, firstMs: 100, maxMs: 1_000 }
+const DEFAULT_CONNECT_RETRY: ConnectRetry = { budgetMs: 15_000, reconnectBudgetMs: 15_000, firstMs: 100, maxMs: 1_000 }
 
 /** Staying connected on its own (setAutoReconnect): after a dropped connection,
  *  reconnect after `dropMs`, doubling to `dropMaxMs` while connections keep dropping
