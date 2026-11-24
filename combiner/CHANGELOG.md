@@ -4,6 +4,12 @@ All notable changes to the combiner are documented here. The version moves in
 lockstep with the rest of the repo (`scripts/bump-version.sh`); releases are
 tagged `vX.Y.Z`.
 
+## [0.26.3] — 2026-11-24
+
+No combiner changes. This release is the Pi extension: reconnecting after
+the combiner goes away retries for 15 s instead of 3 s; see
+`plugins/pi/CHANGELOG.md`.
+
 ## [0.26.2] — 2026-11-24
 
 ### Security
