@@ -6,7 +6,7 @@ tagged `vX.Y.Z`. The extension runs the matching mcp-combiner release, so each
 entry also summarises the combiner's changes; the full list is in
 [the combiner's changelog](https://github.com/georgeharker/mcp-combiner/blob/main/combiner/CHANGELOG.md).
 
-## [Unreleased]
+## [0.26.1] - 2026-11-24
 
 ### Fixed
 
@@ -22,6 +22,14 @@ entry also summarises the combiner's changes; the full list is in
   the last session in the process quits (or the process exits). Before, a
   child session quitting marked the process as quitting, so the parent could
   no longer re-attach to or respawn the combiner.
+- **Quitting after `/new`, `/resume` or `/fork` releases the combiner again.**
+  The earlier session stayed on the list of live sessions, so the last quit
+  never released the reference; process exit still did.
+- **Finished sessions no longer keep their extension instance in memory.**
+- **Two live sessions sharing one id get a warning instead of a disconnect.**
+  If a session starts with an id another live session in the process already
+  holds (other than a `/reload`), the extension warns and leaves the other
+  session connected.
 
 ## [0.26.0] - 2026-11-24
 

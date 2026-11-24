@@ -4,6 +4,13 @@ All notable changes to the combiner are documented here. The version moves in
 lockstep with the rest of the repo (`scripts/bump-version.sh`); releases are
 tagged `vX.Y.Z`.
 
+## [0.26.1] — 2026-11-24
+
+No combiner changes. This release fixes the Pi extension: starting a
+subagent disconnected the chat that started it, and a subagent quitting
+released the combiner for the whole pi process. See
+`plugins/pi/CHANGELOG.md`.
+
 ## [0.26.0] — 2026-11-24
 
 ### Changed — breaking
