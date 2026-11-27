@@ -224,7 +224,11 @@ class TestResetSilence:
         if isolate:
             servers["mockup"]["isolate"] = True
         cfg = write_servers_config(tmp_path / "servers.json", servers)
-        return await procs.start_combiner(cfg, env=FAST_TIMING_ENV)
+        combiner = await procs.start_combiner(cfg, env=FAST_TIMING_ENV)
+        # The first call needs the tools listed (a slow CI runner otherwise
+        # gets "Unknown tool" before the upstream is primed).
+        await combiner.wait_server_state("mockup", ("ready",), timeout=60.0)
+        return combiner
 
     async def test_meta_restart_resets_isolated_state(
         self, procs: ProcFactory, tmp_path: Path
