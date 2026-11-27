@@ -1196,6 +1196,6 @@ def _make_disconnected_client(
     from mcp_combiner.notifications import attach_resource_forwarding
 
     client = Client(transport, auth=auth, mode=client_mode(name))
-    use_tolerant_session(client)
+    use_tolerant_session(client, name)
     attach_resource_forwarding(client, name)
     return client

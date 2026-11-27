@@ -458,7 +458,11 @@ def create_combiner(
             "configured server and its lifecycle state. The set is not fixed either — "
             "`combiner__enable_server` (persistent) and "
             "`combiner__session_enable_server` (this chat only) bring a disabled "
-            "server's tools online."
+            "server's tools online.\n"
+            "\n"
+            "Upstream servers' own instructions are not included here. Before using a "
+            "server whose tools need context, call `combiner__server_instructions` "
+            "with its name."
         ),
         dereference_schemas=False,  # Disabled: circular $ref causes infinite recursion
         # Large aggregate lists are paged (mcp_combiner.listpaging).

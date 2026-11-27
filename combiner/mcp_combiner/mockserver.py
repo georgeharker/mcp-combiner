@@ -478,7 +478,9 @@ class MockServer:
         self.state = MockState(server_name=name, transport=transport, state_dir=state_dir)
         if state_dir is not None:
             self.state.boot_count = _bump_boot_count(state_dir, name)
-        self.mcp = FastMCP(name)
+        # MOCK_SERVER_INSTRUCTIONS: the instructions it sends at initialize
+        # (combiner__server_instructions tests).
+        self.mcp = FastMCP(name, instructions=os.environ.get("MOCK_SERVER_INSTRUCTIONS") or None)
         self.mcp.add_middleware(_SessionTrackingMiddleware(self.state))
         self._tools: dict[str, MockTool] = {}
         # Optional OAuth authorization-server capability (additive; only the

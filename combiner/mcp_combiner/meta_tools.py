@@ -694,6 +694,52 @@ def register_meta_tools(
         return await _set_collection(collection, False)
 
     @combiner.tool()
+    async def combiner__server_instructions(
+        server_name: str, ctx: Context, chat_id: str | None = None
+    ) -> str:
+        """Read an upstream server's own instructions: the guidance it sends MCP
+        clients when they connect (how to use its tools, required call order,
+        conventions). The combiner doesn't load these into every chat — fetch
+        them for a server you're about to use when its tools need context.
+
+        Args:
+            server_name: the server (the `<server>` prefix of its tools).
+            chat_id: Optional chat identifier when the calling session has no
+                     token binding of its own.
+        """
+        from mcp_combiner import instructions
+
+        if server_name not in config.servers:
+            known = ", ".join(sorted(config.servers)) or "none"
+            return f"Error: server '{server_name}' isn't configured (configured: {known})"
+        from mcp_combiner import chatcollections
+
+        sessions = RUNTIME.sessions
+        ref = sessions.chat_ref(ctx.session_id, chat_id)
+        off = sessions.blocked_of(ref) | chatcollections.hidden_for(
+            config, sessions.collections_of(ref), sessions.forced_of(ref)
+        )
+        if server_name in off:
+            return (
+                f"Server '{server_name}' is off for this chat; turn it on "
+                "(combiner__session_enable_server) to use it."
+            )
+        if config.servers[server_name].disabled:
+            return f"Server '{server_name}' is disabled; combiner__enable_server turns it on."
+        text = instructions.get(server_name)
+        if text is None:
+            return (
+                f"Server '{server_name}' hasn't connected yet, so its instructions "
+                "aren't known; try again once it is ready (combiner__status)."
+            )
+        if not text:
+            return (
+                f"Server '{server_name}' sends no instructions; "
+                "its tool descriptions are all it provides."
+            )
+        return f"Instructions from '{server_name}':\n\n{text}"
+
+    @combiner.tool()
     async def combiner__collections(ctx: Context, chat_id: str | None = None) -> str:
         """List the server collections loaded on this machine: whether each is
         on for the combiner and for this chat, and its servers (whether each is

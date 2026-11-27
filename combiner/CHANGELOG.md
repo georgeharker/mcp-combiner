@@ -4,6 +4,19 @@ All notable changes to the combiner are documented here. The version moves in
 lockstep with the rest of the repo (`scripts/bump-version.sh`); releases are
 tagged `vX.Y.Z`.
 
+## [Unreleased]
+
+### Added
+
+- **`combiner__server_instructions(server)`** returns an upstream server's own
+  instructions: the guidance it sends MCP clients at `initialize`, or in
+  `server/discover` on the 2026 revision. They're captured as each upstream
+  session connects (stdio, HTTP, isolated, either revision) and served only
+  for servers the calling chat can see. The combiner still doesn't merge them
+  into its own instructions: those are sent once at connect, before upstreams
+  are up, and every server's guidance in every chat would be large. Its own
+  instructions, and the plugins' `instructions.txt`, now point at the tool.
+
 ## [0.26.3] — 2026-11-24
 
 No combiner changes. This release is the Pi extension: reconnecting after

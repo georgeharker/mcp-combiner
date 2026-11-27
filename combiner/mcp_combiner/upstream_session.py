@@ -67,9 +67,15 @@ def repair_tool_listing(raw: dict[str, Any]) -> None:
 
 _SendRaw = Callable[[str, Mapping[str, Any] | None, CallOptions | None], Awaitable[dict[str, Any]]]
 
+#: Methods whose result carries the server's ``instructions``: the handshake's
+#: initialize, and the 2026 revision's server/discover.
+_INSTRUCTION_METHODS = ("initialize", "server/discover")
 
-def _repairing(inner: _SendRaw) -> _SendRaw:
-    """Wrap a dispatcher's ``send_raw_request`` to repair ``tools/list`` results."""
+
+def _repairing(inner: _SendRaw, server: str | None = None) -> _SendRaw:
+    """Wrap a dispatcher's ``send_raw_request`` to repair ``tools/list`` results,
+    and record *server*'s instructions as its initialize / discover result
+    passes through (mcp_combiner.instructions)."""
 
     async def send_raw_request(
         method: str, params: Mapping[str, Any] | None, opts: CallOptions | None = None
@@ -77,13 +83,22 @@ def _repairing(inner: _SendRaw) -> _SendRaw:
         raw = await inner(method, params, opts)
         if method == "tools/list":
             repair_tool_listing(raw)
+        elif server is not None and method in _INSTRUCTION_METHODS:
+            from mcp_combiner import instructions
+
+            instructions.record(server, raw.get("instructions") if isinstance(raw, dict) else None)
         return raw
 
     return send_raw_request
 
 
 class TolerantClientSession(_ForwardingClientSession):
-    """fastmcp's proxy session, with ``tools/list`` repaired before validation."""
+    """fastmcp's proxy session, with ``tools/list`` repaired before validation.
+    A per-server subclass (:func:`session_class_for`) also records the server's
+    instructions."""
+
+    #: The upstream this session talks to (set on per-server subclasses).
+    server_name: str | None = None
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -91,12 +106,38 @@ class TolerantClientSession(_ForwardingClientSession):
         # returning the raw result and parsing it; the dispatcher is this
         # session's own (built in __init__), so wrapping its one entry point
         # is the narrowest place to repair.
-        setattr(self._dispatcher, "send_raw_request", _repairing(self._dispatcher.send_raw_request))
+        setattr(
+            self._dispatcher,
+            "send_raw_request",
+            _repairing(self._dispatcher.send_raw_request, self.server_name),
+        )
 
 
-def use_tolerant_session(client: Client[Any]) -> Client[Any]:
-    """Install :class:`TolerantClientSession` on *client* (idempotent; before connect)."""
+_session_classes: dict[str, type[TolerantClientSession]] = {}
+
+
+def session_class_for(server: str | None) -> type[TolerantClientSession]:
+    """The session class for an upstream *server* (one subclass per name, cached)."""
+    if server is None:
+        return TolerantClientSession
+    cls = _session_classes.get(server)
+    if cls is None:
+        cls = type(
+            f"TolerantClientSession[{server}]", (TolerantClientSession,), {"server_name": server}
+        )
+        _session_classes[server] = cls
+    return cls
+
+
+def use_tolerant_session(client: Client[Any], server: str | None = None) -> Client[Any]:
+    """Install the combiner's session class on *client* (idempotent; before
+    connect). Naming the upstream *server* also records its instructions."""
     options = client._transport_options or TransportOptions()
-    if options.session_class is not TolerantClientSession:
-        client._transport_options = replace(options, session_class=TolerantClientSession)
+    wanted = session_class_for(server)
+    current = options.session_class
+    if current is wanted:
+        return client
+    if server is None and isinstance(current, type) and issubclass(current, TolerantClientSession):
+        return client  # already a (per-server) tolerant session: keep its name
+    client._transport_options = replace(options, session_class=wanted)
     return client

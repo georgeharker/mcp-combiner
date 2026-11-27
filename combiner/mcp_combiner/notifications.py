@@ -342,11 +342,11 @@ def attach_elicitation_forwarding(
     return client
 
 
-def _prepare_session(client: object) -> None:
+def _prepare_session(client: object, server_name: str | None = None) -> None:
     """Give a handed-out upstream client the combiner's session class (fastmcp's
     proxy factories set their own when they build or clone a client)."""
     if isinstance(client, Client):
-        use_tolerant_session(client)
+        use_tolerant_session(client, server_name)
 
 
 def forwarding_factory(factory: Any, server_name: str, *, per_chat: bool) -> Any:
@@ -402,7 +402,7 @@ def forwarding_factory(factory: Any, server_name: str, *, per_chat: bool) -> Any
 
             async def _finish() -> Any:
                 resolved = await client
-                _prepare_session(resolved)
+                _prepare_session(resolved, server_name)
                 attach_elicitation_forwarding(
                     resolved, server_name, session=elicit_session, request_id=elicit_request_id
                 )
@@ -411,7 +411,7 @@ def forwarding_factory(factory: Any, server_name: str, *, per_chat: bool) -> Any
                 )
 
             return _finish()
-        _prepare_session(client)
+        _prepare_session(client, server_name)
         attach_elicitation_forwarding(
             client, server_name, session=elicit_session, request_id=elicit_request_id
         )

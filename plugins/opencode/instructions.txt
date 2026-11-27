@@ -25,3 +25,6 @@ mcp__…mcp-combiner__ github_ search_code
   `combiner__enable_server` (persistent) or `combiner__session_enable_server` (this chat
   only) turns one on and its tools appear. A capability absent right now may be one call
   away — check `combiner__status` rather than assuming.
+- **Servers' own instructions aren't loaded here.** Before using a server whose tools
+  need context (a call order, session ids, conventions), call
+  `combiner__server_instructions` with its name for the guidance it sends clients.
